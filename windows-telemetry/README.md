@@ -7,10 +7,10 @@ This component serves as the lightweight telemetry collection agent for Windows 
 This release includes:
 - **Step 1 Foundation**: Agent Identity Management, Configuration Handling, Structured Logging, Basic Lifecycle (Runtime), Health Reporting.
 - **Step 2 Windows Event Collector**: Incremental collection of raw Windows Security logs via native `wevtutil`, stateful checkpoints, batch processing, and controlled first-run strategy.
+- **Step 3 Normalizer**: Converts raw OS telemetry directly into the project's standard normalized contract (`v1.1`), ensuring stable deterministic identifiers.
 
 ## 3. What is NOT implemented yet
 The following features are deferred to later steps and are intentionally not present:
-- Telemetry Normalization (`normalized_event_contract_v1`)
 - Detection Engines (XGBoost, Isolation Forest)
 - Important Event Filtering
 - Network Connections/SOC API integration
@@ -21,10 +21,13 @@ The following features are deferred to later steps and are intentionally not pre
 Windows Event Sources
         |
         v
-Windows Event Collector (THIS MODULE)
+Windows Event Collector (Step 2)
         |
         v
-Future Normalizer
+Windows Event Normalizer (Step 3)
+        |
+        v
+Future Detection Engine
 ```
 
 ## 5. Directory Structure
@@ -54,7 +57,15 @@ Reading the **Windows Security Log** natively requires Administrator privileges.
 - **Batch Processing:** Events are queried in chunks determined by `WINDOWS_EVENT_BATCH_SIZE`.
 - **One-Shot Testing:** The `collect_once()` interface allows fetching a single batch for testing or programmatic triggering without infinite polling loops.
 
-## 10. Running the application
+## 10. Normalizer Behavior (Step 3)
+- **Purpose**: Converts raw OS telemetry directly into the project's standard normalized contract (`v1.1`).
+- **Flow**: Collector Output -> `WindowsEventNormalizer` -> Normalized Dictionary.
+- **Contract Adherence**: Uses `normalized_event_contract_v1.schema.json`. Before detection, `detection_type` and `confidence` are strictly `null`.
+- **Event Identity**: Generates a stable deterministic SHA-256 hash using `agent_id`, `hostname`, `log_name`, and `EventRecordID`.
+- **Checkpoint Separation**: The normalizer strictly processes events; it does **not** manage or advance the collector's checkpoint.
+- **Detection Boundary**: The normalizer does **not** evaluate risk or score attacks. It strictly maps source telemetry.
+
+## 11. Running the application
 ```bash
 python main.py
 ```
