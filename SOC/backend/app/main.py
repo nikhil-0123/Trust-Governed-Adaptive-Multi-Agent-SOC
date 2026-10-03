@@ -7,32 +7,30 @@ import os
 app = FastAPI(title="TGAM-SOC Central Ingestion")
 
 API_TOKEN = os.getenv("SOC_API_TOKEN", "dev-token-123")
-DB_PATH = os.getenv("SOC_DB_PATH", "soc_central.db")
+from app.models import DetectionEvent
+from app.database import init_db, DB_PATH
+from app.worker import FusionWorker
 
-class DetectionEvent(BaseModel):
-    detection_event_id: str
-    timestamp: str
-    agent_id: str
-    hostname: str
-    os: str
-    source_event_id: str
-    detection_type: str
-    confidence: float = Field(..., ge=0.0, le=1.0)
-    severity: str
-    detector_name: str
-    evidence: Dict[str, Any]
+fusion_worker = None
+
+@app.on_event("startup")
+def startup_event():
+    init_db()
+    global fusion_worker
+    fusion_worker = FusionWorker()
+    fusion_worker.start()
+
+@app.on_event("shutdown")
+def shutdown_event():
+    global fusion_worker
+    if fusion_worker:
+        fusion_worker.stop()
+        fusion_worker.join(timeout=5.0)
 
 def get_db():
     conn = sqlite3.connect(DB_PATH)
+    conn.execute("PRAGMA foreign_keys = ON")
     try:
-        conn.execute('''
-            CREATE TABLE IF NOT EXISTS events (
-                detection_event_id TEXT PRIMARY KEY,
-                data TEXT NOT NULL,
-                ingested_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        ''')
-        conn.commit()
         yield conn
     finally:
         conn.close()

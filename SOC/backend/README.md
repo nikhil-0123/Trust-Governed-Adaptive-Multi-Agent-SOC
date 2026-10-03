@@ -34,3 +34,30 @@ See `.env.example` for details.
    python main.py
    ```
 3. Observe the outbox logs indicating successful delivery.
+
+## Step 7 Architecture (Evidence Fusion Engine)
+
+Step 7 implements deterministic Evidence Fusion. It groups related `DetectionEvent`s into unified `Incident` structures asynchronously.
+
+### Architecture & Components
+- **FusionWorker**: A background daemon thread that polls for new, un-fused events in the `events` table (tracked via `fusion_event_state`).
+- **EvidenceFusionEngine**: Applies deterministic correlation rules to link events to incidents.
+- **Database Tables**:
+  - `fusion_event_state`: Tracks processing status (`PENDING`, `PROCESSING`, `PROCESSED`, `FAILED`) and attempts.
+  - `incidents`: Contains unified incident lifecycle metadata (`max_severity`, `first_seen`, `last_seen`, `status`).
+  - `incident_evidence`: Preserves provenance by linking `incident_id` to the original `detection_event_id`.
+  - `incident_entities`: Stores extracted entities (`hostname`, `source_ip`, `username`, `agent_id`) for candidate lookup.
+
+### Correlation Rules
+Events are correlated deterministically:
+1. **Entity**: Exact match on `hostname`. If `source_ip` is present in the new event, it must also match an existing `source_ip` for that incident. (Fallback to `hostname`-only if `source_ip` is missing, which is a weaker correlation).
+2. **Temporal**: The new event's `timestamp` must be within `FUSION_TIME_WINDOW_SECONDS` of the incident's `last_seen`.
+3. **Selection**: If multiple incidents match, the engine selects the one with the most recent `last_seen`.
+
+If a match is found, evidence is **attached** and the incident's severity is escalated (LOW < MEDIUM < HIGH < CRITICAL). If no match is found, a **new incident** is created.
+
+### Configuration
+- `FUSION_TIME_WINDOW_SECONDS` (Default: 3600): The maximum time gap between related events.
+- `FUSION_POLL_INTERVAL_SECONDS` (Default: 5): Worker polling interval.
+
+*Note: These are configurable development parameters requiring future evaluation. They are not experimentally validated.*
