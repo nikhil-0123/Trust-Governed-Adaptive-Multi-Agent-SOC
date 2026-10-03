@@ -1,7 +1,7 @@
 # Normalized Security Event Contract
 
 Project: Trust-Governed Adaptive Multi-Agent SOC for IT Cyber Defense
-Version: 1.0
+Version: 1.1
 
 Every endpoint telemetry implementation must normalize important security
 events into a common event structure before forwarding them to the SOC.
@@ -52,9 +52,11 @@ Event severity such as low, medium, high, or critical.
 
 detection_type:
 Detection mechanism such as rule, xgboost, isolation_forest, or correlation.
+Must be null for raw telemetry before a detection engine processes the event. Null means "No detection assessment has occurred yet."
 
 confidence:
 Detection confidence represented as a value from 0.0 to 1.0.
+Must be null for raw telemetry before a detection engine processes the event. Null means "No detection assessment has occurred yet."
 
 evidence:
 Structured evidence supporting the detection.
