@@ -1,0 +1,2 @@
+# Step 1: No external dependencies required for the foundation.
+# We utilize the Python Standard Library to maintain a lightweight footprint.
