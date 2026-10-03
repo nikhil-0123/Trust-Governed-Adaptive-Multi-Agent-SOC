@@ -23,5 +23,9 @@ class Settings:
         # Step 5: Detection Output
         default_detection_output_dir = os.path.join(self.data_dir, "detections")
         self.detection_output_dir = os.getenv("DETECTION_OUTPUT_DIR", default_detection_output_dir)
+        # Step 6: Central SOC Transport
+        self.soc_api_url = os.getenv("SOC_API_URL", "http://127.0.0.1:8000/api/v1/detection-events")
+        self.soc_api_token = os.getenv("SOC_API_TOKEN", "dev-token-123")
+        self.outbox_db_path = os.getenv("OUTBOX_DB_PATH", os.path.join(self.data_dir, "outbox.db"))
 
 config = Settings()

@@ -89,7 +89,20 @@ Reading the **Windows Security Log** natively requires Administrator privileges.
 - **Duplicate Handling**: Step 4 naturally suppresses rapid brute-force alerts. The Step 5 ID calculation provides downstream SOC consumers a deterministic identifier for correlation without relying on a full-blown database at the endpoint.
 - **JSONL Output**: The output is appended as JSON Lines (`.jsonl`) into a configurable directory (`DETECTION_OUTPUT_DIR`), maintaining a simple, append-only, filesystem-safe interface.
 - **Checkpoint Safety**: Checkpoint progression exclusively depends on the entire required processing chain (normalization, detection, *and* output writing) completing safely. If an event fails at *any* stage, the pipeline halts batch processing and preserves the contiguous-success boundary. It does NOT skip or discard malformed events.
-- **Network Boundaries**: Step 5 strictly produces local detection-event output. **It does not transmit events to the Central SOC.** External transport is reserved for future steps.
+
+## Step 6: Central SOC Transport
+- **Important Event Filter**: Only significant events are forwarded to the Central SOC to prevent noise. The filter forwards:
+  - `high` or `critical` severity events
+  - `medium` severity events with confidence >= `MEDIUM_CONFIDENCE_THRESHOLD` (defaults to 0.8, experimental config)
+  - All other events (low severity, or low-confidence medium) remain in the local `.jsonl` output but are not forwarded.
+- **Architecture**: A discrete `transport/` module operates independently of the core telemetry pipeline. Forwarded `DetectionEvent`s are durably persisted to a local `outbox.db` (SQLite) *before* attempting network transport.
+- **Outbox**: Stores serialized events, delivery status (`pending`/`delivered`), attempt counts, and error messages. Provides persistence across endpoint restarts.
+- **Background Delivery Worker**: A daemon thread polls the local outbox and transmits events to the SOC. This ensures the main telemetry pipeline (collection, detection, local output) is entirely decoupled from network delays or Central SOC outages.
+- **Delivery Semantics**: **Central delivery acknowledgement is independent of the Windows EventRecordID collection checkpoint.**
+- **Retry Behavior**: The `DeliveryWorker` polls the outbox. Failed deliveries (e.g. network timeout, SOC 500 error) leave the event in `pending` state and increment the attempt count.
+- **Authentication**: Uses a simple Bearer token configured via `SOC_API_TOKEN`.
+- **Deduplication**: If the SOC returns `duplicate: true`, the outbox successfully marks the event as delivered locally.
+- **Network Boundaries**: External transport uses at-least-once delivery with idempotent central ingestion.
 
 ## 13. Current Limitations
 - Isolation Forest/unknown attack detection is not yet implemented.

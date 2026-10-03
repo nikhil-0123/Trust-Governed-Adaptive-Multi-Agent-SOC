@@ -236,3 +236,53 @@ class TestPipelineIntegration(unittest.TestCase):
             self.assertEqual(parsed["detection_type"], "windows_bruteforce_rule")
             expected_id = self.pipeline.normalizer._generate_event_id("104", "c", "Security")
             self.assertEqual(parsed["source_event_id"], expected_id)
+
+    def test_pipeline_soc_outage_decoupling(self):
+        import time
+        from unittest.mock import patch
+
+        # 1. Setup events that trigger a detection
+        base_time = "2026-10-03T10:00:0"
+        self.pipeline.collector.events = []
+        for i in range(5):
+            self.pipeline.collector.events.append({
+                "record_id": 100+i,
+                "event_id": 4625,
+                "timestamp": f"{base_time}{i}.000Z",
+                "provider": "p",
+                "computer": "c",
+                "username": "admin"
+            })
+
+        # 2. Mock HTTP call to block/timeout (simulating SOC outage)
+        with patch('urllib.request.urlopen') as mock_urlopen:
+            def mock_slow_request(*args, **kwargs):
+                time.sleep(2.0)
+                raise Exception("SOC Outage Timeout")
+            mock_urlopen.side_effect = mock_slow_request
+
+            self.pipeline.delivery_worker.poll_interval = 0.1
+            self.pipeline.initialize()
+
+            start_time = time.time()
+
+            # 3. Process batch
+            self.pipeline.process_batch()
+
+            end_time = time.time()
+
+            # 4. Verify batch completes instantly, NOT waiting for the 2.0s HTTP timeout
+            self.assertLess(end_time - start_time, 1.0)
+
+            # 5. Verify checkpoint advances normally
+            self.assertEqual(self.pipeline.collector.checkpoint, 104)
+
+            # 6. Verify local JSONL is written
+            output_file = os.path.join(self.temp_dir.name, "detections.jsonl")
+            self.assertTrue(os.path.exists(output_file))
+
+            # 7. Verify outbox contains pending event
+            pending = self.pipeline.outbox.get_pending_events()
+            self.assertEqual(len(pending), 1)
+
+            self.pipeline.shutdown()
