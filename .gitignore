@@ -1,0 +1,32 @@
+# Generated files
+__pycache__/
+*.pyc
+*.pyo
+
+# Python environments
+.venv/
+venv/
+env/
+
+# Node
+node_modules/
+dist/
+
+# Runtime data
+logs/
+state/
+runtime/
+evidence/
+
+# Local configuration
+.env
+.env.*
+!.env.example
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+Thumbs.db
+Desktop.ini

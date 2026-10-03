@@ -1,0 +1,27 @@
+{
+  "project_id": "TGAM-SOC",
+  "project_name": "Trust-Governed Adaptive Multi-Agent SOC for IT Cyber Defense",
+  "version": "0.1.0",
+  "environment": "development",
+  "project_root": "P:\\Trust-Governed-Adaptive-Multi-Agent-SOC",
+
+  "components": {
+    "windows_telemetry": "windows-telemetry",
+    "ubuntu_telemetry": "ubuntu-telemetry",
+    "ubuntu_server_telemetry": "ubuntu-server-telemetry",
+    "soc_backend": "SOC\\backend",
+    "soc_dashboard": "SOC\\dashboard",
+    "soc_manager": "SOC\\manager"
+  },
+
+  "development": {
+    "architecture": "Hybrid Decentralized Multi-Agent Architecture with Centralized Coordination & Governance",
+    "endpoint_detection": true,
+    "central_coordination": true,
+    "human_in_loop": true,
+    "governed_response": true,
+    "adaptive_learning": false,
+    "federated_learning": false,
+    "map_reduce_processing": false
+  }
+}
