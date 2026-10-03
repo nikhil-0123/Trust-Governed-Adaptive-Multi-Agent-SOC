@@ -9,6 +9,7 @@ This release includes:
 - **Step 2 Windows Event Collector**: Incremental collection of raw Windows Security logs via native `wevtutil`, stateful checkpoints, batch processing, and controlled first-run strategy.
 - **Step 3 Normalizer**: Converts raw OS telemetry directly into the project's standard normalized contract (`v1.1`), ensuring stable deterministic identifiers.
 - **Step 4 Detection Layer**: Framework for evaluating normalized events against deterministic rules and XGBoost models. Windows Brute Force rule is active.
+- **Step 5 Detection Output Pipeline**: An internal pipeline orchestrator integrating the above steps, creating stable local `DetectionEvent`s (JSON Lines) from positive detections without any external network transmission.
 
 ## 3. What is NOT implemented yet
 The following features are deferred to later steps and are intentionally not present:
@@ -80,11 +81,22 @@ Reading the **Windows Security Log** natively requires Administrator privileges.
 - **Note on intent**: This rule strictly analyzes telemetry. It does **not** perform authentication attacks.
 - **XGBoost Detector**: The ML detector is currently in a safe `ModelNotAvailableError` state because no compatible `.model`, `.xgb`, or `.pkl` file exists in the repository.
 - **Confidence Semantics**: Deterministic rules assign `confidence=1.0` to matches, while XGBoost uses raw model probabilities. `0.0` is never used as a proxy for "not detected."
-- **Current Limitations**: 
-    - Isolation Forest/unknown attack detection is not yet implemented.
-    - SOC Response/Governance pipelines do not yet exist.
 
-## 12. Running the application
+## 12. Detection Event Output & Pipeline (Step 5)
+- **Objective**: Establish the internal endpoint-to-SOC boundary using local files.
+- **Pipeline Flow**: `WindowsEventCollector` → `WindowsEventNormalizer` → `DetectionEngine` → `DetectionEventBuilder` → `DetectionEventWriter`.
+- **DetectionEvent Model**: A structured contract separate from the normalized telemetry contract, produced strictly upon positive detections. It includes a deterministic `detection_event_id` computed via `SHA-256(agent_id + source_event_id + detection_type + detector_name)`.
+- **Duplicate Handling**: Step 4 naturally suppresses rapid brute-force alerts. The Step 5 ID calculation provides downstream SOC consumers a deterministic identifier for correlation without relying on a full-blown database at the endpoint.
+- **JSONL Output**: The output is appended as JSON Lines (`.jsonl`) into a configurable directory (`DETECTION_OUTPUT_DIR`), maintaining a simple, append-only, filesystem-safe interface.
+- **Checkpoint Safety**: Checkpoint progression exclusively depends on the entire required processing chain (normalization, detection, *and* output writing) completing safely. If an event fails at *any* stage, the pipeline halts batch processing and preserves the contiguous-success boundary. It does NOT skip or discard malformed events.
+- **Network Boundaries**: Step 5 strictly produces local detection-event output. **It does not transmit events to the Central SOC.** External transport is reserved for future steps.
+
+## 13. Current Limitations
+- Isolation Forest/unknown attack detection is not yet implemented.
+- SOC Response/Governance pipelines do not yet exist.
+- Network transport does not yet exist.
+
+## 14. Running the application
 ```bash
 python main.py
 ```

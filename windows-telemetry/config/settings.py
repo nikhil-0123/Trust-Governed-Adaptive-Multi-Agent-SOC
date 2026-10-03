@@ -19,5 +19,9 @@ class Settings:
 
         default_checkpoint_dir = os.path.join(self.data_dir, "state")
         self.checkpoint_dir = os.getenv("WINDOWS_CHECKPOINT_DIR", default_checkpoint_dir)
+        
+        # Step 5: Detection Output
+        default_detection_output_dir = os.path.join(self.data_dir, "detections")
+        self.detection_output_dir = os.getenv("DETECTION_OUTPUT_DIR", default_detection_output_dir)
 
 config = Settings()
