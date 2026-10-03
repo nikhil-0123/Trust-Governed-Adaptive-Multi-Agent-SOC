@@ -1,1 +1,1 @@
-# Detection package
+"""Detection module for Windows Telemetry."""

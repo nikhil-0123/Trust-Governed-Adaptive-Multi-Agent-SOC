@@ -49,6 +49,9 @@ class WindowsEventNormalizer:
             "keywords": raw_event.get("keywords")
         }
         
+        if "event_id" in raw_event:
+            evidence["windows_event_id"] = raw_event["event_id"]
+        
         if "raw_xml" in raw_event:
             evidence["raw_xml"] = raw_event["raw_xml"]
             

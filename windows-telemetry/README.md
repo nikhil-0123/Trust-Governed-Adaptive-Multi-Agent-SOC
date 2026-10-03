@@ -8,10 +8,12 @@ This release includes:
 - **Step 1 Foundation**: Agent Identity Management, Configuration Handling, Structured Logging, Basic Lifecycle (Runtime), Health Reporting.
 - **Step 2 Windows Event Collector**: Incremental collection of raw Windows Security logs via native `wevtutil`, stateful checkpoints, batch processing, and controlled first-run strategy.
 - **Step 3 Normalizer**: Converts raw OS telemetry directly into the project's standard normalized contract (`v1.1`), ensuring stable deterministic identifiers.
+- **Step 4 Detection Layer**: Framework for evaluating normalized events against deterministic rules and XGBoost models. Windows Brute Force rule is active.
 
 ## 3. What is NOT implemented yet
 The following features are deferred to later steps and are intentionally not present:
-- Detection Engines (XGBoost, Isolation Forest)
+- Isolation Forest/unknown attack detection
+- SOC Response / Governance
 - Important Event Filtering
 - Network Connections/SOC API integration
 - Advanced continuous polling loops
@@ -27,7 +29,10 @@ Windows Event Collector (Step 2)
 Windows Event Normalizer (Step 3)
         |
         v
-Future Detection Engine
+Windows Detection Layer (Step 4)
+        |
+        v
+Future Detection Output
 ```
 
 ## 5. Directory Structure
@@ -53,19 +58,33 @@ Reading the **Windows Security Log** natively requires Administrator privileges.
 
 ## 9. Collector Behavior
 - **First-Run Behavior:** By default, it queries the most recent event (`/c:1 /rd:true`) to establish the initial checkpoint. This avoids flooding memory with historical logs.
-- **Checkpointing:** State is persistently stored as JSON in `WINDOWS_CHECKPOINT_DIR`. The checkpoint is updated *only* after a successful batch query to prevent event loss.
+- **Checkpointing:** State is persistently stored as JSON in `WINDOWS_CHECKPOINT_DIR`. EventRecordID is used for incremental collection and checkpoint tracking. The collector advances its checkpoint only after successful downstream processing is explicitly confirmed by the surrounding pipeline.
 - **Batch Processing:** Events are queried in chunks determined by `WINDOWS_EVENT_BATCH_SIZE`.
 - **One-Shot Testing:** The `collect_once()` interface allows fetching a single batch for testing or programmatic triggering without infinite polling loops.
+- **Identifiers:** The collector preserves both `EventRecordID` (sequential identifier for checkpoint tracking) and `EventID` (native Windows Event type, e.g. 4625).
 
 ## 10. Normalizer Behavior (Step 3)
 - **Purpose**: Converts raw OS telemetry directly into the project's standard normalized contract (`v1.1`).
 - **Flow**: Collector Output -> `WindowsEventNormalizer` -> Normalized Dictionary.
 - **Contract Adherence**: Uses `normalized_event_contract_v1.schema.json`. Before detection, `detection_type` and `confidence` are strictly `null`.
-- **Event Identity**: Generates a stable deterministic SHA-256 hash using `agent_id`, `hostname`, `log_name`, and `EventRecordID`.
+- **Event Identity**: Generates a stable deterministic SHA-256 hash using `agent_id`, `hostname`, `log_name`, and `EventRecordID`. Note: `windows_event_id` is NOT used in the hash, as the hash identifies the specific event log record, not the category.
+- **Evidence preservation**: `windows_event_id` (e.g. 4625) is preserved in `evidence.windows_event_id`. This is distinct from `record_id` (e.g. 12345), which is used for checkpointing.
 - **Checkpoint Separation**: The normalizer strictly processes events; it does **not** manage or advance the collector's checkpoint.
 - **Detection Boundary**: The normalizer does **not** evaluate risk or score attacks. It strictly maps source telemetry.
 
-## 11. Running the application
+## 11. Detection Layer Behavior (Step 4)
+- **Purpose**: A modular framework to evaluate normalized events and produce `DetectionResult` objects.
+- **Flow**: Normalized Event -> `DetectionEngine` -> [Rules, ML Models] -> DetectionResult list.
+- **State Management**: The brute-force rule uses bounded in-memory state tracking, sliding over a 60-second window. Keys combine `username` and `source_ip`.
+- **Brute Force Rule Semantics**: Triggers on 5 Windows Event 4625 (Auth Failure) occurrences within 60 seconds. Once triggered, subsequent events within the same sliding window are safely suppressed to prevent duplicate alerts.
+- **Note on intent**: This rule strictly analyzes telemetry. It does **not** perform authentication attacks.
+- **XGBoost Detector**: The ML detector is currently in a safe `ModelNotAvailableError` state because no compatible `.model`, `.xgb`, or `.pkl` file exists in the repository.
+- **Confidence Semantics**: Deterministic rules assign `confidence=1.0` to matches, while XGBoost uses raw model probabilities. `0.0` is never used as a proxy for "not detected."
+- **Current Limitations**: 
+    - Isolation Forest/unknown attack detection is not yet implemented.
+    - SOC Response/Governance pipelines do not yet exist.
+
+## 12. Running the application
 ```bash
 python main.py
 ```

@@ -32,6 +32,7 @@ class TestWindowsEventNormalizer(unittest.TestCase):
     def test_normalize_valid_event(self):
         raw_event = {
             "record_id": 12345,
+            "event_id": 4625,
             "timestamp": "2026-10-03T10:00:00.000Z",
             "provider": "Microsoft-Windows-Security-Auditing",
             "computer": "TEST-PC",
@@ -55,6 +56,7 @@ class TestWindowsEventNormalizer(unittest.TestCase):
         self.assertIsNone(normalized["source_ip"])
         self.assertIsNone(normalized["username"])
         self.assertEqual(normalized["evidence"]["record_id"], 12345)
+        self.assertEqual(normalized["evidence"]["windows_event_id"], 4625)
         
     def test_missing_required_fields(self):
         with self.assertRaises(ValueError):
@@ -100,9 +102,9 @@ class TestWindowsEventNormalizer(unittest.TestCase):
         
     def test_batch_normalization(self):
         raw_batch = [
-            {"record_id": 1, "timestamp": "T1", "computer": "PC1"},
+            {"record_id": 1, "timestamp": "T1", "computer": "PC1", "event_id": 4624},
             {"record_id": 2}, # malformed, missing timestamp
-            {"record_id": 3, "timestamp": "T3", "computer": "PC1"}
+            {"record_id": 3, "timestamp": "T3", "computer": "PC1", "event_id": 4625}
         ]
         
         normalized_batch = self.normalizer.normalize_batch(raw_batch)
@@ -113,6 +115,8 @@ class TestWindowsEventNormalizer(unittest.TestCase):
         # Check ordering is preserved
         self.assertEqual(normalized_batch[0]["evidence"]["record_id"], 1)
         self.assertEqual(normalized_batch[1]["evidence"]["record_id"], 3)
+        self.assertEqual(normalized_batch[0]["evidence"]["windows_event_id"], 4624)
+        self.assertEqual(normalized_batch[1]["evidence"]["windows_event_id"], 4625)
         
     def test_empty_batch(self):
         self.assertEqual(self.normalizer.normalize_batch([]), [])
