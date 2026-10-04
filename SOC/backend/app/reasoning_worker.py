@@ -58,8 +58,8 @@ class ReasoningWorker(threading.Thread):
             self.provider = MockLLMProvider() # Default back to mock if unknown
             
         self.evidence_validator = EvidenceValidator()
-        self.analysis_agent = AnalysisAgent(self.provider, self.config, self.evidence_validator)
-        self.verification_agent = VerificationAgent(self.provider, self.config, self.evidence_validator)
+        self.analysis_agent = AnalysisAgent(self.provider, self.evidence_validator, self.config)
+        self.verification_agent = VerificationAgent(self.provider, self.evidence_validator, self.config)
         self.synthesis_agent = SynthesisAgent(self.provider, self.config)
 
     def start_worker(self):
@@ -267,11 +267,16 @@ class ReasoningWorker(threading.Thread):
         try:
             analysis_input = AnalysisInput(
                 incident_id=incident_id,
-                incident_context=incident_context,
+                assessment_id=assessment_id,
+                incident_summary=incident_context,
                 evidence=evidence_list,
-                authoritative_mitre_context=auth_mitre
+                entities=[],
+                authoritative_mitre_context=auth_mitre,
+                assessment_snapshot=assessment_snapshot
             )
-            accepted_claims, rejected_claims = self.analysis_agent.generate_candidate_claims(analysis_input)
+            analysis_result = self.analysis_agent.generate_candidate_claims(analysis_input, conn)
+            accepted_claims = analysis_result.accepted_claims
+            rejected_claims = analysis_result.rejected_claims
         except LLMProviderError as e:
             raise Exception(f"PROVIDER_ERROR: {e}")
         except AnalysisAgentParsingError as e:

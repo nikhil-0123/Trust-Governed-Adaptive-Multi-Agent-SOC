@@ -13,16 +13,18 @@ from app.worker import FusionWorker
 from app.mitre_worker import MitreWorker
 from app.assessment_worker import AssessmentWorker
 from app.reasoning_worker import ReasoningWorker
+from app.governance_worker import GovernanceWorker
 
 fusion_worker = None
 mitre_worker = None
 assessment_worker = None
 reasoning_worker = None
+governance_worker = None
 
 @app.on_event("startup")
 def startup_event():
     database.init_db()
-    global fusion_worker, mitre_worker, assessment_worker, reasoning_worker
+    global fusion_worker, mitre_worker, assessment_worker, reasoning_worker, governance_worker
     fusion_worker = FusionWorker()
     fusion_worker.start()
     mitre_worker = MitreWorker()
@@ -31,10 +33,12 @@ def startup_event():
     assessment_worker.start()
     reasoning_worker = ReasoningWorker()
     reasoning_worker.start()
+    governance_worker = GovernanceWorker()
+    governance_worker.start()
 
 @app.on_event("shutdown")
 def shutdown_event():
-    global fusion_worker, mitre_worker, assessment_worker, reasoning_worker
+    global fusion_worker, mitre_worker, assessment_worker, reasoning_worker, governance_worker
     if fusion_worker:
         fusion_worker.stop()
         fusion_worker.join(timeout=5.0)
@@ -47,6 +51,9 @@ def shutdown_event():
     if reasoning_worker:
         reasoning_worker.stop()
         reasoning_worker.join(timeout=5.0)
+    if governance_worker:
+        governance_worker.stop()
+        governance_worker.join(timeout=5.0)
 
 def get_db():
     conn = sqlite3.connect(database.DB_PATH)

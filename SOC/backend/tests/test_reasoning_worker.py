@@ -52,7 +52,10 @@ class TestReasoningWorker(unittest.TestCase):
         database.DB_PATH = self.original_db_path
         import os
         if os.path.exists(self.temp_db_path):
-            os.remove(self.temp_db_path)
+            try:
+                os.remove(self.temp_db_path)
+            except OSError:
+                pass
 
     def _setup_incident(self, incident_id="inc1", assessment_id="ass1", assessment_status="COMPLETED"):
         with sqlite3.connect(self.temp_db_path) as conn:
@@ -134,10 +137,10 @@ class TestReasoningWorker(unittest.TestCase):
         # Hook into agent to verify input
         evidence_list = []
         original_gen = self.worker.analysis_agent.generate_candidate_claims
-        def mock_gen(analysis_input):
+        def mock_gen(analysis_input, conn=None):
             nonlocal evidence_list
             evidence_list = analysis_input.evidence
-            return original_gen(analysis_input)
+            return original_gen(analysis_input, conn)
         self.worker.analysis_agent.generate_candidate_claims = mock_gen
         
         self.worker.run_once()
@@ -246,7 +249,10 @@ class TestReasoningWorker(unittest.TestCase):
             
         # Call _process_incident directly to simulate a slow worker finishing
         with sqlite3.connect(self.temp_db_path) as conn:
-            # It will hit the integrity error on idx_analyses_completed_unique
-            with self.assertRaises(Exception) as context:
-                self.worker._process_incident(conn, "inc_uniq", "ass1")
-            self.assertIn("PERSISTENCE_ERROR", str(context.exception))
+            conn.row_factory = sqlite3.Row
+            # It will hit the integrity error on idx_analyses_completed_unique but should be gracefully swallowed
+            self.worker._process_incident(conn, "inc_uniq", "ass1")
+            
+            # Verify only 1 analysis exists
+            count = conn.execute("SELECT count(*) FROM analyses WHERE incident_id = 'inc_uniq'").fetchone()[0]
+            self.assertEqual(count, 1)

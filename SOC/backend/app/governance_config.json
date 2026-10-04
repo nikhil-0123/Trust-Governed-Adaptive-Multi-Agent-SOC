@@ -1,0 +1,45 @@
+{
+    "environment": "DEVELOPMENT / EXPERIMENTAL",
+    "policy_version": "v1.0",
+    "config_version": "v1.0",
+    "trust_policy": {
+        "global_reject_max_trust_threshold": 0.2,
+        "auto_approve_min_trust": 0.8
+    },
+    "risk_policy": {
+        "global_reject_min_risk_threshold": 0.9,
+        "auto_approve_max_risk": 0.4
+    },
+    "severity_policy": {
+        "LOW": "AUTO_APPROVE",
+        "MEDIUM": "AUTO_APPROVE",
+        "HIGH": "HUMAN_APPROVAL",
+        "CRITICAL": "HUMAN_APPROVAL"
+    },
+    "verification_policy": {
+        "VERIFIED": "AUTO_APPROVE",
+        "PARTIALLY_VERIFIED": "HUMAN_APPROVAL",
+        "UNVERIFIED": "HOLD",
+        "INSUFFICIENT_EVIDENCE": "HOLD",
+        "CONTRADICTED": "REJECT"
+    },
+    "autonomous_action_allowlist": [
+        "ISOLATE_HOST",
+        "BLOCK_SOURCE",
+        "DISABLE_ACCOUNT",
+        "NO_ACTION",
+        "COLLECT_MORE_EVIDENCE"
+    ],
+    "mitre_restrictions": {
+        "Exfiltration": ["ISOLATE_HOST", "DISABLE_ACCOUNT", "BLOCK_SOURCE"],
+        "Execution": ["ISOLATE_HOST", "DISABLE_ACCOUNT", "BLOCK_SOURCE"]
+    },
+    "confidence_threshold": {
+        "auto_approve_min_confidence": 0.8
+    },
+    "approval_timeout_seconds": 86400,
+    "worker_settings": {
+        "poll_interval_seconds": 5,
+        "stale_processing_seconds": 3600
+    }
+}

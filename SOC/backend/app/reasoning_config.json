@@ -5,8 +5,8 @@
   "max_evidence_events": 100,
   "stale_processing_timeout_seconds": 300,
   "prompt_versions": {
-    "analysis": "v1",
-    "verification": "v1",
-    "synthesis": "v1"
+    "analysis": "analysis_v1",
+    "verification": "verification_v1",
+    "synthesis": "synthesis_v1"
   }
 }

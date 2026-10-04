@@ -130,10 +130,9 @@ class SynthesisAgent:
         if isinstance(raw_recs, list):
             for raw_rec in raw_recs:
                 try:
+                    if raw_rec.get("status") and raw_rec.get("status") != "RECOMMENDED":
+                        raise SynthesisAgentParsingError(f"Model attempted to change recommendation status to {raw_rec.get('status')}")
                     r = Recommendation.model_validate(raw_rec)
-                    # Force recommendation to RECOMMENDED status
-                    if r.status != "RECOMMENDED":
-                        raise SynthesisAgentParsingError(f"Model attempted to change recommendation status to {r.status}")
                     
                     for c_id in r.supporting_claims:
                         if c_id not in allowed_claim_ids:

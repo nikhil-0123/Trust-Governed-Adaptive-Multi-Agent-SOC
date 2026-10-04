@@ -185,6 +185,56 @@ def init_db():
         conn.execute('CREATE INDEX IF NOT EXISTS idx_analyses_incident ON analyses(incident_id, created_at)')
         conn.execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_analyses_completed_unique ON analyses(incident_id, assessment_id) WHERE status = \'COMPLETED\'')
         
+        # Step 11 Tables
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS governance_state (
+                incident_id TEXT PRIMARY KEY,
+                assessment_id TEXT NOT NULL,
+                analysis_id TEXT NOT NULL,
+                status TEXT NOT NULL,
+                decision_id TEXT,
+                approval_status TEXT NOT NULL,
+                attempts INTEGER DEFAULT 0,
+                last_error TEXT,
+                updated_at TIMESTAMP,
+                FOREIGN KEY(incident_id) REFERENCES incidents(incident_id)
+            )
+        ''')
+
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS governance_decisions (
+                decision_id TEXT PRIMARY KEY,
+                incident_id TEXT NOT NULL,
+                assessment_id TEXT NOT NULL,
+                analysis_id TEXT NOT NULL,
+                decision TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                input_snapshot TEXT NOT NULL,
+                policy_version TEXT NOT NULL,
+                config_version TEXT NOT NULL,
+                created_at TIMESTAMP NOT NULL,
+                FOREIGN KEY(incident_id) REFERENCES incidents(incident_id)
+            )
+        ''')
+        conn.execute('CREATE INDEX IF NOT EXISTS idx_governance_state_status ON governance_state(status, updated_at)')
+        conn.execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_governance_decisions_identity ON governance_decisions(incident_id, assessment_id, analysis_id)')
+        
+        conn.execute('''
+            CREATE TRIGGER IF NOT EXISTS trg_gov_decisions_update_blocker
+            BEFORE UPDATE ON governance_decisions
+            BEGIN
+                SELECT RAISE(ABORT, 'governance_decisions is append-only');
+            END;
+        ''')
+        
+        conn.execute('''
+            CREATE TRIGGER IF NOT EXISTS trg_gov_decisions_delete_blocker
+            BEFORE DELETE ON governance_decisions
+            BEGIN
+                SELECT RAISE(ABORT, 'governance_decisions is append-only');
+            END;
+        ''')
+        
         conn.commit()
     finally:
         conn.close()
