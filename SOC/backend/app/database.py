@@ -40,7 +40,8 @@ def init_db():
                 last_seen TIMESTAMP NOT NULL,
                 max_severity TEXT NOT NULL,
                 status TEXT NOT NULL,
-                latest_assessment_id TEXT -- Application-maintained pointer to the newest successful assessment row, NOT a strictly enforced DB foreign key.
+                latest_assessment_id TEXT, -- Application-maintained pointer to the newest successful assessment row, NOT a strictly enforced DB foreign key.
+                latest_analysis_id TEXT    -- Application-maintained pointer to the newest successful analysis row.
             )
         ''')
         
@@ -49,6 +50,10 @@ def init_db():
         except sqlite3.OperationalError:
             pass  # Column already exists
 
+        try:
+            conn.execute("ALTER TABLE incidents ADD COLUMN latest_analysis_id TEXT")
+        except sqlite3.OperationalError:
+            pass  # Column already exists
         
         conn.execute('''
             CREATE TABLE IF NOT EXISTS incident_evidence (
@@ -146,6 +151,39 @@ def init_db():
         # Step 9 Indexes
         conn.execute('CREATE INDEX IF NOT EXISTS idx_assessment_state_status ON assessment_state(status, updated_at)')
         conn.execute('CREATE INDEX IF NOT EXISTS idx_assessments_incident ON assessments(incident_id, created_at)')
+        
+        # Step 10 Tables
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS analysis_state (
+                incident_id TEXT NOT NULL,
+                assessment_id TEXT NOT NULL,
+                status TEXT NOT NULL,
+                attempts INTEGER DEFAULT 0,
+                last_error TEXT,
+                updated_at TIMESTAMP,
+                PRIMARY KEY (incident_id, assessment_id),
+                FOREIGN KEY(incident_id) REFERENCES incidents(incident_id)
+            )
+        ''')
+        
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS analyses (
+                analysis_id TEXT PRIMARY KEY,
+                incident_id TEXT NOT NULL,
+                assessment_id TEXT NOT NULL,
+                assessment_snapshot TEXT NOT NULL,
+                status TEXT NOT NULL,
+                model_provenance TEXT NOT NULL,
+                prompt_versions TEXT NOT NULL,
+                analysis_output TEXT NOT NULL,
+                created_at TIMESTAMP NOT NULL,
+                FOREIGN KEY(incident_id) REFERENCES incidents(incident_id)
+            )
+        ''')
+        
+        conn.execute('CREATE INDEX IF NOT EXISTS idx_analysis_state_status ON analysis_state(status, updated_at)')
+        conn.execute('CREATE INDEX IF NOT EXISTS idx_analyses_incident ON analyses(incident_id, created_at)')
+        conn.execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_analyses_completed_unique ON analyses(incident_id, assessment_id) WHERE status = \'COMPLETED\'')
         
         conn.commit()
     finally:

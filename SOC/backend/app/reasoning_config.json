@@ -1,0 +1,12 @@
+{
+  "provider": "mock",
+  "model": "test-model",
+  "timeout_seconds": 30,
+  "max_evidence_events": 100,
+  "stale_processing_timeout_seconds": 300,
+  "prompt_versions": {
+    "analysis": "v1",
+    "verification": "v1",
+    "synthesis": "v1"
+  }
+}
