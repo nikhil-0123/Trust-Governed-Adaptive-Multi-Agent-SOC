@@ -142,6 +142,11 @@ class EvidenceFusionEngine:
                 INSERT OR IGNORE INTO incident_entities (incident_id, entity_type, entity_value)
                 VALUES (?, ?, ?)
             """, (incident_id, e_type, e_val))
+            
+        self.conn.execute("""
+            INSERT OR REPLACE INTO assessment_state (incident_id, status, attempts, updated_at)
+            VALUES (?, 'PENDING', 0, ?)
+        """, (incident_id, now))
 
     def _attach_evidence(self, incident_id: str, event: DetectionEvent, event_time: datetime, entities: List[Tuple[str, str]]):
         # Idempotency check: if already attached, do nothing
@@ -177,3 +182,8 @@ class EvidenceFusionEngine:
                 INSERT OR IGNORE INTO incident_entities (incident_id, entity_type, entity_value)
                 VALUES (?, ?, ?)
             """, (incident_id, e_type, e_val))
+            
+        self.conn.execute("""
+            INSERT OR REPLACE INTO assessment_state (incident_id, status, attempts, updated_at)
+            VALUES (?, 'PENDING', 0, ?)
+        """, (incident_id, now))

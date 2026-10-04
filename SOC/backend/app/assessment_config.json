@@ -1,0 +1,45 @@
+{
+  "config_version": "v1.0-experimental",
+  "formula_version": "linear_weighted_v1",
+
+  "factors": {
+    "trust": {
+      "E": 1.0,
+      "V": 1.0,
+      "R": 1.0,
+      "H": 1.0
+    },
+    "risk": {
+      "S": 1.0,
+      "A": 1.0,
+      "I": 1.0,
+      "C": 1.0
+    }
+  },
+
+  "evidence_quality": {
+    "volume_weight": 0.5,
+    "confidence_weight": 0.5,
+    "confidence_aggregation": "mean"
+  },
+
+  "categorical_normalization": {
+    "severity": {
+      "LOW": 0.25,
+      "MEDIUM": 0.50,
+      "HIGH": 0.75,
+      "CRITICAL": 1.00
+    }
+  },
+
+  "feature_normalization": {
+    "evidence_volume_k_factor": 0.1,
+    "mitre_technique_base_weight": 0.3
+  },
+
+  "worker": {
+    "poll_interval_seconds": 5,
+    "batch_size": 100,
+    "stale_processing_seconds": 3600
+  }
+}

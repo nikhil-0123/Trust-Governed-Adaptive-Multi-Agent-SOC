@@ -80,6 +80,15 @@ class MitreWorker(threading.Thread):
                 WHERE detection_event_id = ?
             """, (final_status, now, event_id))
             
+            # Step 9 Handoff
+            cursor = conn.execute("SELECT incident_id FROM incident_evidence WHERE detection_event_id = ?", (event_id,))
+            inc_row = cursor.fetchone()
+            if inc_row:
+                conn.execute("""
+                    INSERT OR REPLACE INTO assessment_state (incident_id, status, attempts, updated_at)
+                    VALUES (?, 'PENDING', 0, ?)
+                """, (inc_row["incident_id"], now))
+            
             conn.commit()
             
         except Exception as e:
@@ -94,6 +103,16 @@ class MitreWorker(threading.Thread):
                     SET status = 'FAILED', updated_at = ?, last_error = ?
                     WHERE detection_event_id = ?
                 """, (now, str(e), event_id))
+                
+                # Step 9 Handoff even on MITRE failure
+                cursor = conn.execute("SELECT incident_id FROM incident_evidence WHERE detection_event_id = ?", (event_id,))
+                inc_row = cursor.fetchone()
+                if inc_row:
+                    conn.execute("""
+                        INSERT OR REPLACE INTO assessment_state (incident_id, status, attempts, updated_at)
+                        VALUES (?, 'PENDING', 0, ?)
+                    """, (inc_row["incident_id"], now))
+                    
                 conn.commit()
             except Exception as inner_e:
                 conn.rollback()

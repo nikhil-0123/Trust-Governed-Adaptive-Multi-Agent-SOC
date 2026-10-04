@@ -39,9 +39,16 @@ def init_db():
                 first_seen TIMESTAMP NOT NULL,
                 last_seen TIMESTAMP NOT NULL,
                 max_severity TEXT NOT NULL,
-                status TEXT NOT NULL
+                status TEXT NOT NULL,
+                latest_assessment_id TEXT -- Application-maintained pointer to the newest successful assessment row, NOT a strictly enforced DB foreign key.
             )
         ''')
+        
+        try:
+            conn.execute("ALTER TABLE incidents ADD COLUMN latest_assessment_id TEXT")
+        except sqlite3.OperationalError:
+            pass  # Column already exists
+
         
         conn.execute('''
             CREATE TABLE IF NOT EXISTS incident_evidence (
@@ -106,6 +113,39 @@ def init_db():
         conn.execute('CREATE INDEX IF NOT EXISTS idx_incident_entities_lookup ON incident_entities(entity_type, entity_value, incident_id)')
         conn.execute('CREATE INDEX IF NOT EXISTS idx_threat_state_status ON threat_context_state(status, updated_at)')
         conn.execute('CREATE INDEX IF NOT EXISTS idx_threat_context_incident ON threat_context(incident_id)')
+        
+        # Step 9 Tables
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS assessment_state (
+                incident_id TEXT PRIMARY KEY,
+                status TEXT NOT NULL,
+                attempts INTEGER DEFAULT 0,
+                last_error TEXT,
+                updated_at TIMESTAMP,
+                FOREIGN KEY(incident_id) REFERENCES incidents(incident_id)
+            )
+        ''')
+        
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS assessments (
+                assessment_id TEXT PRIMARY KEY,
+                incident_id TEXT NOT NULL,
+                trust_score REAL,
+                risk_score REAL,
+                status TEXT NOT NULL,
+                formula_version TEXT NOT NULL,
+                config_version TEXT NOT NULL,
+                input_snapshot TEXT NOT NULL,
+                trust_explanation TEXT,
+                risk_explanation TEXT,
+                created_at TIMESTAMP NOT NULL,
+                FOREIGN KEY(incident_id) REFERENCES incidents(incident_id)
+            )
+        ''')
+        
+        # Step 9 Indexes
+        conn.execute('CREATE INDEX IF NOT EXISTS idx_assessment_state_status ON assessment_state(status, updated_at)')
+        conn.execute('CREATE INDEX IF NOT EXISTS idx_assessments_incident ON assessments(incident_id, created_at)')
         
         conn.commit()
     finally:
