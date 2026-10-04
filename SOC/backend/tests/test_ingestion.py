@@ -4,15 +4,24 @@ import os
 import tempfile
 import sqlite3
 
-# Set env vars before importing app
-temp_dir = tempfile.TemporaryDirectory()
-db_path = os.path.join(temp_dir.name, "test_soc.db")
-os.environ["SOC_DB_PATH"] = db_path
-os.environ["SOC_API_TOKEN"] = "test-token"
+import app.database
+import app.main
 
-from app.main import app
+@pytest.fixture(autouse=True)
+def setup_env():
+    db_fd, db_path = tempfile.mkstemp(suffix=".db")
+    app.database.DB_PATH = db_path
+    app.database.init_db()
+    
+    yield
+    
+    os.close(db_fd)
+    try:
+        os.unlink(db_path)
+    except:
+        pass
 
-client = TestClient(app)
+client = TestClient(app.main.app)
 
 valid_event = {
     "detection_event_id": "test-123",
@@ -38,14 +47,14 @@ def test_invalid_auth():
     assert response.status_code == 401
 
 def test_valid_auth_invalid_schema():
-    headers = {"Authorization": "Bearer test-token"}
+    headers = {"Authorization": "Bearer dev-token-123"}
     invalid_event = valid_event.copy()
     del invalid_event["confidence"]
     response = client.post("/api/v1/detection-events", json=invalid_event, headers=headers)
     assert response.status_code == 422 # FastAPI validation error
 
 def test_valid_ingestion():
-    headers = {"Authorization": "Bearer test-token"}
+    headers = {"Authorization": "Bearer dev-token-123"}
     response = client.post("/api/v1/detection-events", json=valid_event, headers=headers)
     assert response.status_code == 201
     data = response.json()
@@ -54,7 +63,9 @@ def test_valid_ingestion():
     assert data["detection_event_id"] == "test-123"
 
 def test_duplicate_ingestion():
-    headers = {"Authorization": "Bearer test-token"}
+    headers = {"Authorization": "Bearer dev-token-123"}
+    # Sent first time
+    client.post("/api/v1/detection-events", json=valid_event, headers=headers)
     # Sent again
     response = client.post("/api/v1/detection-events", json=valid_event, headers=headers)
     assert response.status_code == 201

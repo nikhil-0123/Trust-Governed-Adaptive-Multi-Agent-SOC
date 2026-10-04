@@ -30,3 +30,8 @@ evidence/
 # OS
 Thumbs.db
 Desktop.ini
+
+# SQLite databases
+*.db
+*.sqlite
+*.sqlite3

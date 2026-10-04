@@ -17,17 +17,22 @@ from fastapi.testclient import TestClient
 
 class TestReleaseGate(unittest.TestCase):
     def setUp(self):
-        if os.path.exists(temp_db_path):
-            os.close(temp_db_fd)
-            os.unlink(temp_db_path)
+        self.db_fd, self.db_path = tempfile.mkstemp(suffix=".db")
+        os.environ["SOC_DB_PATH"] = self.db_path
+        import app.database
+        app.database.DB_PATH = self.db_path
+        os.close(self.db_fd)
             
     def tearDown(self):
-        if os.path.exists(temp_db_path):
-            os.unlink(temp_db_path)
+        if os.path.exists(self.db_path):
+            try:
+                os.unlink(self.db_path)
+            except:
+                pass
             
     def test_database_idempotency_and_migration(self):
         # 1. Simulate Step 6 existing DB
-        conn = sqlite3.connect(temp_db_path)
+        conn = sqlite3.connect(self.db_path)
         conn.execute('''
             CREATE TABLE events (
                 detection_event_id TEXT PRIMARY KEY,
@@ -101,7 +106,7 @@ class TestReleaseGate(unittest.TestCase):
         }
         
         # Ingestion happens synchronously
-        response = client.post("/api/v1/detection-events", json=valid_event, headers={"Authorization": "Bearer test-token"})
+        response = client.post("/api/v1/detection-events", json=valid_event, headers={"Authorization": "Bearer dev-token-123"})
         self.assertEqual(response.status_code, 201)
         
         # Verify it went to events table

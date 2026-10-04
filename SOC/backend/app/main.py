@@ -8,27 +8,34 @@ app = FastAPI(title="TGAM-SOC Central Ingestion")
 
 API_TOKEN = os.getenv("SOC_API_TOKEN", "dev-token-123")
 from app.models import DetectionEvent
-from app.database import init_db, DB_PATH
+from app import database
 from app.worker import FusionWorker
+from app.mitre_worker import MitreWorker
 
 fusion_worker = None
+mitre_worker = None
 
 @app.on_event("startup")
 def startup_event():
-    init_db()
-    global fusion_worker
+    database.init_db()
+    global fusion_worker, mitre_worker
     fusion_worker = FusionWorker()
     fusion_worker.start()
+    mitre_worker = MitreWorker()
+    mitre_worker.start()
 
 @app.on_event("shutdown")
 def shutdown_event():
-    global fusion_worker
+    global fusion_worker, mitre_worker
     if fusion_worker:
         fusion_worker.stop()
         fusion_worker.join(timeout=5.0)
+    if mitre_worker:
+        mitre_worker.stop()
+        mitre_worker.join(timeout=5.0)
 
 def get_db():
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(database.DB_PATH)
     conn.execute("PRAGMA foreign_keys = ON")
     try:
         yield conn

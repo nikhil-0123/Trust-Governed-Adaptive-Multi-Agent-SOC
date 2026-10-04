@@ -60,20 +60,23 @@ class FusionWorker(threading.Thread):
 
     def _process_single_event(self, conn, event_id: str):
         try:
-            # Transaction starts for this single event
-            conn.execute("BEGIN TRANSACTION")
-            
             now = datetime.now(timezone.utc).isoformat()
             
-            # Update state to processing (though in-memory it's fast)
+            # 1. Update state to processing and commit immediately
             conn.execute("""
                 UPDATE fusion_event_state 
                 SET status = 'PROCESSING', updated_at = ?, attempts = attempts + 1 
                 WHERE detection_event_id = ?
             """, (now, event_id))
+            conn.commit()
+
+            # 2. Transaction for actual fusion work
+            conn.execute("BEGIN TRANSACTION")
             
             engine = EvidenceFusionEngine(conn)
             engine.process_event(event_id)
+            
+            now = datetime.now(timezone.utc).isoformat()
             
             # Mark processed
             conn.execute("""
@@ -81,6 +84,12 @@ class FusionWorker(threading.Thread):
                 SET status = 'PROCESSED', updated_at = ?, last_error = NULL
                 WHERE detection_event_id = ?
             """, (now, event_id))
+            
+            # Step 8 handoff
+            conn.execute("""
+                INSERT OR IGNORE INTO threat_context_state (detection_event_id, status, updated_at)
+                VALUES (?, 'PENDING', ?)
+            """, (event_id, now))
             
             conn.commit()
             

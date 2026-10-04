@@ -1,0 +1,62 @@
+{
+  "catalog_version": "1.0",
+  "mitre_version": "v15.0",
+  "mappings": [
+    {
+      "mapping_rule_id": "rule_bruteforce_windows",
+      "detection_type": "windows_bruteforce_rule",
+      "technique_id": "T1110",
+      "technique_name": "Brute Force",
+      "tactic": "Credential Access"
+    },
+    {
+      "mapping_rule_id": "rule_bruteforce",
+      "detection_type": "brute_force",
+      "technique_id": "T1110",
+      "technique_name": "Brute Force",
+      "tactic": "Credential Access"
+    },
+    {
+      "mapping_rule_id": "rule_phishing",
+      "detection_type": "phishing",
+      "technique_id": "T1566",
+      "technique_name": "Phishing",
+      "tactic": "Initial Access"
+    },
+    {
+      "mapping_rule_id": "rule_malware",
+      "detection_type": "malware",
+      "technique_id": "T1204",
+      "technique_name": "User Execution",
+      "tactic": "Execution"
+    },
+    {
+      "mapping_rule_id": "rule_ransomware",
+      "detection_type": "ransomware",
+      "technique_id": "T1486",
+      "technique_name": "Data Encrypted for Impact",
+      "tactic": "Impact"
+    },
+    {
+      "mapping_rule_id": "rule_dos",
+      "detection_type": "dos",
+      "technique_id": "T1498",
+      "technique_name": "Network Denial of Service",
+      "tactic": "Impact"
+    },
+    {
+      "mapping_rule_id": "rule_sqli",
+      "detection_type": "sql_injection",
+      "technique_id": "T1190",
+      "technique_name": "Exploit Public-Facing Application",
+      "tactic": "Initial Access"
+    },
+    {
+      "mapping_rule_id": "rule_dns",
+      "detection_type": "dns_tunneling",
+      "technique_id": "T1071.004",
+      "technique_name": "Application Layer Protocol: DNS",
+      "tactic": "Command and Control"
+    }
+  ]
+}

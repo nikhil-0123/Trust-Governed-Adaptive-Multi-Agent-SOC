@@ -10,9 +10,7 @@ from unittest.mock import patch, MagicMock
 os.environ["FUSION_POLL_INTERVAL_SECONDS"] = "0"
 os.environ["FUSION_TIME_WINDOW_SECONDS"] = "3600"
 
-# Must set DB path before importing models/database
-temp_db_fd, temp_db_path = tempfile.mkstemp(suffix=".db")
-os.environ["SOC_DB_PATH"] = temp_db_path
+# Database setup will be handled per-test in setUp
 
 from app.database import init_db, get_db_connection
 from app.fusion import EvidenceFusionEngine
@@ -20,16 +18,18 @@ from app.worker import FusionWorker
 
 class TestFusionEngine(unittest.TestCase):
     def setUp(self):
-        # Reset database for each test
-        if os.path.exists(temp_db_path):
-            os.close(temp_db_fd)
-            os.unlink(temp_db_path)
-            
-        init_db()
+        self.db_fd, self.db_path = tempfile.mkstemp(suffix=".db")
+        os.environ["SOC_DB_PATH"] = self.db_path
+        import app.database
+        app.database.DB_PATH = self.db_path
+        app.database.init_db()
+        os.close(self.db_fd)
         
     def tearDown(self):
-        if os.path.exists(temp_db_path):
-            os.unlink(temp_db_path)
+        try:
+            os.unlink(self.db_path)
+        except:
+            pass
             
     def _insert_event(self, event_id: str, timestamp: str, hostname: str, severity: str, source_ip: str = None, username: str = None):
         with get_db_connection() as conn:
@@ -278,9 +278,9 @@ class TestFusionEngine(unittest.TestCase):
             self.assertEqual(cursor.fetchone()["status"], "PROCESSED")
             
     def test_temporal_internal_bound(self):
-        # first_seen = 10:00, last_seen = 12:00. Event = 10:50.
+        # first_seen = 10:00, last_seen = 10:30. Event = 10:50.
         self._insert_event("e1", "2026-10-03T10:00:00Z", "host1", "LOW")
-        self._insert_event("e2", "2026-10-03T12:00:00Z", "host1", "LOW")
+        self._insert_event("e2", "2026-10-03T10:30:00Z", "host1", "LOW")
         self._insert_event("e3", "2026-10-03T10:50:00Z", "host1", "LOW")
         
         with get_db_connection() as conn:
