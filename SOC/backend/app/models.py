@@ -1,5 +1,5 @@
 from pydantic import BaseModel, Field
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 from datetime import datetime
 
 class DetectionEvent(BaseModel):
@@ -32,3 +32,58 @@ class Incident(BaseModel):
     last_seen: datetime
     max_severity: str
     status: str
+    latest_assessment_id: Optional[str] = None
+    latest_analysis_id: Optional[str] = None
+
+class ThreatContext(BaseModel):
+    context_id: str
+    incident_id: str
+    technique_id: str
+    technique_name: str
+    tactic: str
+    mitre_version: str
+    mapping_method: str
+
+class Assessment(BaseModel):
+    assessment_id: str
+    incident_id: str
+    trust_score: Optional[float]
+    risk_score: Optional[float]
+    status: str
+    formula_version: str
+    config_version: str
+    input_snapshot: str
+    trust_explanation: Optional[str]
+    risk_explanation: Optional[str]
+    created_at: str
+
+class Analysis(BaseModel):
+    analysis_id: str
+    incident_id: str
+    assessment_id: str
+    status: str
+    model_provenance: str
+    analysis_output: str
+    created_at: str
+
+class GovernanceDecision(BaseModel):
+    decision_id: str
+    incident_id: str
+    assessment_id: str
+    analysis_id: str
+    decision: str
+    reason: str
+    policy_version: str
+    config_version: str
+    created_at: str
+
+class ProvenanceHistory(BaseModel):
+    incident: Incident
+    assessment: Optional[Assessment] = None
+    analysis: Optional[Analysis] = None
+    decision: Optional[GovernanceDecision] = None
+    historical_decisions: List[GovernanceDecision] = []
+
+class AnalystOverrideRequest(BaseModel):
+    action: str
+    reason: str
