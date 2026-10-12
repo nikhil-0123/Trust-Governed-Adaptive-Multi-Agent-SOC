@@ -122,7 +122,6 @@ class MockCollector:
     def shutdown(self): pass
     def collect_once(self): return self.events
     def update_checkpoint(self, rec_id): self.checkpoint = rec_id
-
 class TestPipelineIntegration(unittest.TestCase):
     def setUp(self):
         import logging
@@ -130,15 +129,22 @@ class TestPipelineIntegration(unittest.TestCase):
         self.logger.setLevel(logging.CRITICAL)
         self.temp_dir = tempfile.TemporaryDirectory()
         
-        # Override config output dir for safety
+        # Override config output dir and outbox db path for complete test isolation
         import config.settings
+        self._orig_output_dir = config.settings.config.detection_output_dir
+        self._orig_outbox_db_path = config.settings.config.outbox_db_path
+
         config.settings.config.detection_output_dir = self.temp_dir.name
+        config.settings.config.outbox_db_path = os.path.join(self.temp_dir.name, "test_outbox.db")
         
         self.pipeline = WindowsDetectionPipeline(self.logger)
         # Mock collector to inject custom raw events
         self.pipeline.collector = MockCollector()
 
     def tearDown(self):
+        import config.settings
+        config.settings.config.detection_output_dir = self._orig_output_dir
+        config.settings.config.outbox_db_path = self._orig_outbox_db_path
         self.temp_dir.cleanup()
 
     def test_pipeline_flow_valid_non_detection(self):
@@ -286,3 +292,51 @@ class TestPipelineIntegration(unittest.TestCase):
             self.assertEqual(len(pending), 1)
 
             self.pipeline.shutdown()
+
+    def test_pipeline_real_xml_parsing_triggers_bruteforce_detection(self):
+        from collectors.windows_event_collector import WindowsEventCollector
+        real_collector = WindowsEventCollector(self.logger)
+
+        xml_batch = ""
+        for i in range(5):
+            xml_batch += f"""
+<Event xmlns='http://schemas.microsoft.com/win/2004/08/events/event'>
+  <System>
+    <Provider Name='Microsoft-Windows-Security-Auditing'/>
+    <EventID>4625</EventID>
+    <EventRecordID>{500 + i}</EventRecordID>
+    <TimeCreated SystemTime='2026-10-12T15:00:0{i}.000Z'/>
+    <Computer>WIN-CORP-PC</Computer>
+    <Level>0</Level>
+  </System>
+  <EventData>
+    <Data Name='SubjectUserName'>-</Data>
+    <Data Name='TargetUserName'>security_admin</Data>
+    <Data Name='IpAddress'>192.168.1.200</Data>
+    <Data Name='LogonType'>3</Data>
+  </EventData>
+</Event>"""
+
+        # 1. Parse through the actual XML parser
+        parsed_events = real_collector._parse_wevtutil_xml(xml_batch)
+        self.assertEqual(len(parsed_events), 5)
+        self.assertEqual(parsed_events[0]["username"], "security_admin")
+        self.assertEqual(parsed_events[0]["source_ip"], "192.168.1.200")
+        self.assertEqual(parsed_events[0]["logon_type"], 3)
+
+        # 2. Inject the real-parsed events into the pipeline
+        self.pipeline.collector.events = parsed_events
+        self.pipeline.process_batch()
+
+        # 3. Verify detection output file contains the high-severity alert
+        output_file = os.path.join(self.temp_dir.name, "detections.jsonl")
+        self.assertTrue(os.path.exists(output_file))
+        with open(output_file, 'r', encoding='utf-8') as f:
+            lines = f.readlines()
+            self.assertEqual(len(lines), 1)
+            det = json.loads(lines[0])
+            self.assertEqual(det["detection_type"], "windows_bruteforce_rule")
+            self.assertEqual(det["severity"], "high")
+            self.assertEqual(det["confidence"], 1.0)
+            self.assertEqual(det["evidence"]["username"], "security_admin")
+            self.assertEqual(det["evidence"]["source_ip"], "192.168.1.200")

@@ -135,7 +135,33 @@ class WindowsEventCollector:
                 keywords_elem = system.find(f"{namespace}Keywords")
                 if keywords_elem is not None and keywords_elem.text:
                     event_data["keywords"] = keywords_elem.text
-                    
+
+                event_data_elem = event.find(f"{namespace}EventData")
+                if event_data_elem is not None:
+                    data_dict = {}
+                    for data_elem in event_data_elem.findall(f"{namespace}Data"):
+                        name = data_elem.get("Name")
+                        if name:
+                            data_dict[name] = data_elem.text
+
+                    target_user = data_dict.get("TargetUserName")
+                    if target_user and target_user.strip() and target_user.strip() != "-":
+                        event_data["username"] = target_user.strip()
+                    elif data_dict.get("SubjectUserName") and data_dict["SubjectUserName"].strip() and data_dict["SubjectUserName"].strip() != "-":
+                        event_data["username"] = data_dict["SubjectUserName"].strip()
+
+                    ip_addr = data_dict.get("IpAddress")
+                    if ip_addr and ip_addr.strip() and ip_addr.strip() != "-":
+                        event_data["source_ip"] = ip_addr.strip()
+
+                    logon_type = data_dict.get("LogonType")
+                    if logon_type and logon_type.strip() and logon_type.strip() != "-":
+                        raw_lt = logon_type.strip()
+                        try:
+                            event_data["logon_type"] = int(raw_lt)
+                        except ValueError:
+                            event_data["logon_type"] = raw_lt
+
                 if "record_id" in event_data:
                     parsed_events.append(event_data)
                     
