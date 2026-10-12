@@ -1,0 +1,2 @@
+# TGAM-SOC Ubuntu Telemetry Endpoint
+# Uses the Python Standard Library (Python 3.10+) to maintain a zero-dependency, lightweight, least-privilege footprint.
