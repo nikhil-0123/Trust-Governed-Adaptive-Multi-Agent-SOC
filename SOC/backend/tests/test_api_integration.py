@@ -205,5 +205,15 @@ class TestAPIIntegration(unittest.TestCase):
         self.assertEqual(resp.status_code, 501)
         self.assertIn("does not support append-only analyst overrides", resp.json()["detail"])
 
+    def test_cors_preflight_options(self):
+        headers = {
+            "Origin": "http://localhost:5173",
+            "Access-Control-Request-Method": "GET",
+            "Access-Control-Request-Headers": "authorization",
+        }
+        resp = self.client.options("/api/v1/incidents", headers=headers)
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.headers.get("access-control-allow-origin"), "http://localhost:5173")
+
 if __name__ == "__main__":
     unittest.main()

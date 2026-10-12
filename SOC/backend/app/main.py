@@ -1,10 +1,25 @@
 from fastapi import FastAPI, Depends, HTTPException, Header, status
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from typing import Dict, Any, Optional, List
 import sqlite3
 import os
 
 app = FastAPI(title="TGAM-SOC Central Ingestion")
+
+cors_origins_env = os.getenv(
+    "SOC_CORS_ORIGINS",
+    "http://localhost:5173,http://127.0.0.1:5173,http://localhost:4173,http://127.0.0.1:4173,http://localhost:3000,http://127.0.0.1:3000"
+)
+cors_origins = [o.strip() for o in cors_origins_env.split(",") if o.strip()]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=cors_origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 API_TOKEN = os.getenv("SOC_API_TOKEN", "dev-token-123")
 from app.models import (
