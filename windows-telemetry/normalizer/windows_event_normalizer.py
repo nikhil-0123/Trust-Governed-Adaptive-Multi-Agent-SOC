@@ -55,8 +55,21 @@ class WindowsEventNormalizer:
         if "logon_type" in raw_event and raw_event["logon_type"] is not None:
             evidence["logon_type"] = raw_event["logon_type"]
 
+        if "process_name" in raw_event and raw_event["process_name"]:
+            evidence["process_name"] = raw_event["process_name"]
+
+        if "command_line" in raw_event and raw_event["command_line"]:
+            evidence["command_line"] = raw_event["command_line"]
+
+        if "parent_process_name" in raw_event and raw_event["parent_process_name"]:
+            evidence["parent_process_name"] = raw_event["parent_process_name"]
+
+        if "process_id" in raw_event and raw_event["process_id"]:
+            evidence["process_id"] = raw_event["process_id"]
+
         if "raw_xml" in raw_event:
             evidence["raw_xml"] = raw_event["raw_xml"]
+
             
         return {
             "event_id": event_id,

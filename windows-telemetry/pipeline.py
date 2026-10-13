@@ -11,6 +11,7 @@ from transport.client import TransportClient
 from transport.delivery import DeliveryManager
 from transport.filter import ImportantEventFilter
 from transport.worker import DeliveryWorker
+from transport.heartbeat import HeartbeatWorker
 import dataclasses
 
 class WindowsDetectionPipeline:
@@ -31,10 +32,21 @@ class WindowsDetectionPipeline:
         self.delivery_manager = DeliveryManager(self.outbox, self.client, logger)
         # Daemon delivery worker
         self.delivery_worker = DeliveryWorker(self.delivery_manager, logger, poll_interval=1.0)
+        # Daemon heartbeat worker
+        self.heartbeat_worker = HeartbeatWorker(
+            agent_id=self.identity.agent_id,
+            os_type="windows",
+            soc_api_url=config.soc_api_url,
+            api_token=config.soc_api_token,
+            logger=logger,
+            capabilities=["EventLog_4625", "EventLog_4688"],
+            heartbeat_interval=15.0
+        )
 
     def initialize(self):
         self.collector.initialize()
         self.delivery_worker.start()
+        self.heartbeat_worker.start()
         
     def process_batch(self):
         raw_events = self.collector.collect_once()
@@ -77,5 +89,12 @@ class WindowsDetectionPipeline:
             self.collector.update_checkpoint(last_successful_record_id)
 
     def shutdown(self):
+        """Gracefully terminates delivery worker and flushes pending outbox events."""
+        try:
+            self.delivery_manager.process_outbox()
+        except Exception:
+            pass
         self.delivery_worker.stop()
-        self.collector.shutdown()
+        self.heartbeat_worker.stop()
+        if hasattr(self.collector, "shutdown"):
+            self.collector.shutdown()

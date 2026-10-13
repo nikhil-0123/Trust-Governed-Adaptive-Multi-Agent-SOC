@@ -25,4 +25,5 @@ class DeliveryWorker(threading.Thread):
 
     def stop(self):
         self._stop_event.set()
-        self.join(timeout=10.0)
+        if self.is_alive():
+            self.join(timeout=10.0)

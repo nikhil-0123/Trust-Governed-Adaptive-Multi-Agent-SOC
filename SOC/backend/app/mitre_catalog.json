@@ -57,6 +57,35 @@
       "technique_id": "T1071.004",
       "technique_name": "Application Layer Protocol: DNS",
       "tactic": "Command and Control"
+    },
+    {
+      "mapping_rule_id": "rule_powershell_windows",
+      "detection_type": "windows_powershell_execution",
+      "technique_id": "T1059.001",
+      "technique_name": "Command and Scripting Interpreter: PowerShell",
+      "tactic": "Execution"
+    },
+    {
+      "mapping_rule_id": "rule_lolbin_windows",
+      "detection_type": "windows_lolbin_download",
+      "technique_id": "T1105",
+      "technique_name": "Ingress Tool Transfer",
+      "tactic": "Command and Control"
+    },
+    {
+      "mapping_rule_id": "rule_recon_windows",
+      "detection_type": "windows_reconnaissance",
+      "technique_id": "T1082",
+      "technique_name": "System Information Discovery",
+      "tactic": "Discovery"
+    },
+    {
+      "mapping_rule_id": "rule_evasion_windows",
+      "detection_type": "windows_defense_evasion",
+      "technique_id": "T1562.001",
+      "technique_name": "Impair Defenses: Disable or Modify Tools",
+      "tactic": "Defense Evasion"
     }
   ]
 }
+

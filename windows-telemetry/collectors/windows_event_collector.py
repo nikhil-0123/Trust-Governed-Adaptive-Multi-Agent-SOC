@@ -1,3 +1,4 @@
+import os
 import subprocess
 import xml.etree.ElementTree as ET
 import logging
@@ -8,6 +9,7 @@ from .checkpoint import CheckpointManager
 class WindowsEventCollector:
     """
     Collects raw Windows events incrementally using native wevtutil.
+    Supports live wevtutil queries or simulation event queue files.
     Does NOT normalize or analyze events.
     """
     def __init__(self, logger: logging.Logger):
@@ -16,9 +18,12 @@ class WindowsEventCollector:
         self.batch_size = config.windows_event_batch_size
         self.checkpoint_manager = CheckpointManager(config.checkpoint_dir, self.log_name, logger)
         self.current_checkpoint = 0
+        self._warned_permission = False
+        self.simulated_events_dir = os.path.join(config.data_dir, "simulated_events")
         
     def initialize(self):
         self.logger.info(f"Initializing WindowsEventCollector for log: {self.log_name}")
+        os.makedirs(self.simulated_events_dir, exist_ok=True)
         self.current_checkpoint = self.checkpoint_manager.load_checkpoint()
         if self.current_checkpoint == 0:
             self.logger.info("No checkpoint found. Applying conservative first-run behavior.")
@@ -43,16 +48,51 @@ class WindowsEventCollector:
                     self.logger.info(f"First-run checkpoint set to latest event ID: {self.current_checkpoint}")
                     return
         except subprocess.CalledProcessError as e:
-            self.logger.error(f"Permission or system error retrieving first-run event. Run as Administrator? stderr: {e.stderr.strip()}")
-            raise PermissionError(f"wevtutil failed. Do you have Administrator rights? Stderr: {e.stderr.strip()}")
+            self.logger.warning(
+                f"Permission notice: wevtutil query on '{self.log_name}' returned exit code {e.returncode}. "
+                "Administrator privileges required for live Windows Security log. "
+                "Agent ready for elevated collection or simulated event injection."
+            )
+            self.current_checkpoint = 1
+            self.checkpoint_manager.save_checkpoint(self.current_checkpoint)
+            return
         except Exception as e:
             self.logger.error(f"Failed to determine first-run checkpoint: {e}")
             raise RuntimeError(f"First-run checkpoint failure: {e}")
 
+    def _collect_simulated_events(self) -> List[Dict[str, Any]]:
+        """Collects simulated event XML files placed in simulated_events_dir."""
+        if not os.path.isdir(self.simulated_events_dir):
+            return []
+        events = []
+        try:
+            files = sorted([f for f in os.listdir(self.simulated_events_dir) if f.endswith(".xml")])
+            for filename in files[:self.batch_size]:
+                filepath = os.path.join(self.simulated_events_dir, filename)
+                try:
+                    with open(filepath, "r", encoding="utf-8") as f:
+                        content = f.read()
+                    parsed = self._parse_wevtutil_xml(content)
+                    events.extend(parsed)
+                    os.remove(filepath)
+                except Exception as e:
+                    self.logger.error(f"Error reading simulated event file {filepath}: {e}")
+        except Exception as e:
+            self.logger.error(f"Error accessing simulated events directory: {e}")
+        return events
+
     def collect_once(self) -> List[Dict[str, Any]]:
         """
         Performs a single batch retrieval of events newer than the checkpoint.
+        Checks simulated event queue first, then queries live wevtutil.
         """
+        # 1. Check for simulated events
+        sim_events = self._collect_simulated_events()
+        if sim_events:
+            self.logger.info(f"Retrieved {len(sim_events)} event(s) from simulation queue.")
+            return sim_events
+
+        # 2. Query live wevtutil
         if self.current_checkpoint == 0:
             query = "*[System[(EventRecordID > 0)]]"
         else:
@@ -63,8 +103,13 @@ class WindowsEventCollector:
         try:
             result = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=30)
         except subprocess.CalledProcessError as e:
-            self.logger.error(f"Failed to query {self.log_name}. Code: {e.returncode}. Stderr: {e.stderr.strip()}")
-            raise PermissionError(f"wevtutil query failed. Stderr: {e.stderr.strip()}")
+            if not self._warned_permission:
+                self.logger.warning(
+                    f"Live wevtutil query on '{self.log_name}' requires Administrator rights (Exit code {e.returncode}). "
+                    "Running in waiting mode. Drop XML files into simulated_events for offline/lab simulation."
+                )
+                self._warned_permission = True
+            return []
         except subprocess.TimeoutExpired as e:
             self.logger.error(f"Timeout querying {self.log_name}: {e}")
             raise RuntimeError(f"wevtutil timeout: {e}")
@@ -162,7 +207,25 @@ class WindowsEventCollector:
                         except ValueError:
                             event_data["logon_type"] = raw_lt
 
+                    # Extract Process Creation attributes (Event 4688 / Sysmon 1 / PowerShell 4104)
+                    cmd_line = data_dict.get("CommandLine") or data_dict.get("ScriptBlockText")
+                    if cmd_line and cmd_line.strip() and cmd_line.strip() != "-":
+                        event_data["command_line"] = cmd_line.strip()
+
+                    proc_name = data_dict.get("NewProcessName") or data_dict.get("Image")
+                    if proc_name and proc_name.strip() and proc_name.strip() != "-":
+                        event_data["process_name"] = proc_name.strip()
+
+                    parent_proc = data_dict.get("ParentProcessName") or data_dict.get("ParentImage")
+                    if parent_proc and parent_proc.strip() and parent_proc.strip() != "-":
+                        event_data["parent_process_name"] = parent_proc.strip()
+
+                    proc_id = data_dict.get("ProcessId")
+                    if proc_id and proc_id.strip() and proc_id.strip() != "-":
+                        event_data["process_id"] = proc_id.strip()
+
                 if "record_id" in event_data:
+
                     parsed_events.append(event_data)
                     
         except ET.ParseError as e:

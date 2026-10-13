@@ -1,6 +1,12 @@
 from typing import List, Dict, Any
 from .models import DetectionResult
-from .rules import BruteForceRule
+from .rules import (
+    BruteForceRule,
+    SuspiciousPowerShellRule,
+    SuspiciousLolbinsDownloadRule,
+    ReconnaissanceCommandsRule,
+    DefenseEvasionRule
+)
 from .xgboost_detector import XGBoostDetector, ModelNotAvailableError
 import logging
 
@@ -8,8 +14,15 @@ class DetectionEngine:
     def __init__(self, logger: logging.Logger):
         self.logger = logger
         # Rules and models initialized here
-        self.rules = [BruteForceRule()]
+        self.rules = [
+            BruteForceRule(),
+            SuspiciousPowerShellRule(),
+            SuspiciousLolbinsDownloadRule(),
+            ReconnaissanceCommandsRule(),
+            DefenseEvasionRule()
+        ]
         self.ml_detector = XGBoostDetector(logger)
+
 
     def process_event(self, normalized_event: Dict[str, Any]) -> List[DetectionResult]:
         """

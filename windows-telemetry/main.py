@@ -1,15 +1,50 @@
 import sys
+import time
+import signal
 from core.runtime import TelemetryRuntime
+from pipeline import WindowsDetectionPipeline
+from config.settings import config
 
 def main():
     runtime = TelemetryRuntime()
+    pipeline = None
     try:
         runtime.start()
-        # For Step 1 foundation, we just initialize, report health, and exit cleanly.
-        # Future collectors will loop or block here.
-        runtime.stop()
-        sys.exit(0)
+        pipeline = WindowsDetectionPipeline(runtime.logger)
+        pipeline.initialize()
+
+        def handle_signal(sig, frame):
+            runtime.logger.info("Signal received. Stopping Windows telemetry pipeline...")
+            if pipeline:
+                pipeline.shutdown()
+            runtime.stop()
+            sys.exit(0)
+
+        try:
+            signal.signal(signal.SIGINT, handle_signal)
+            signal.signal(signal.SIGTERM, handle_signal)
+        except (ValueError, AttributeError):
+            pass
+
+        runtime.logger.info(f"Windows Telemetry agent running. Polling interval: {config.windows_event_poll_interval}s.")
+
+        if "--once" in sys.argv:
+            pipeline.process_batch()
+            pipeline.shutdown()
+            runtime.stop()
+            sys.exit(0)
+
+        while True:
+            pipeline.process_batch()
+            time.sleep(config.windows_event_poll_interval)
+
     except KeyboardInterrupt:
+        runtime.logger.info("Keyboard interrupt received.")
+        if pipeline:
+            try:
+                pipeline.shutdown()
+            except Exception:
+                pass
         runtime.stop()
         sys.exit(0)
     except SystemExit as e:
