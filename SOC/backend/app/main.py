@@ -4,6 +4,8 @@ from pydantic import BaseModel, Field
 from typing import Dict, Any, Optional, List
 import sqlite3
 import os
+import uuid
+from datetime import datetime, timezone
 
 app = FastAPI(title="TGAM-SOC Central Ingestion")
 
@@ -24,7 +26,8 @@ app.add_middleware(
 API_TOKEN = os.getenv("SOC_API_TOKEN", "dev-token-123")
 from app.models import (
     DetectionEvent, Incident, IncidentEntity, ThreatContext,
-    Assessment, Analysis, GovernanceDecision, ProvenanceHistory, AnalystOverrideRequest
+    Assessment, Analysis, GovernanceDecision, ProvenanceHistory, AnalystOverrideRequest,
+    EndpointHeartbeat, EndpointCommandCreate, EndpointCommand, EndpointCommandResult, EndpointInfo
 )
 from app import database
 from app.worker import FusionWorker
@@ -149,7 +152,26 @@ def get_incident_mitre(incident_id: str, token: str = Depends(verify_token), db:
     cursor = db.execute("SELECT * FROM threat_context WHERE incident_id = ?", (incident_id,))
     return [ThreatContext(**dict(row)) for row in cursor.fetchall()]
 
+@app.get("/api/v1/mitre/matrix")
+def get_mitre_matrix(token: str = Depends(verify_token), db: sqlite3.Connection = Depends(get_db)):
+    cursor = db.execute("""
+        SELECT tc.technique_id, tc.technique_name, tc.tactic, tc.mitre_version,
+               COUNT(DISTINCT tc.incident_id) as incident_count,
+               COUNT(tce.detection_event_id) as event_count,
+               GROUP_CONCAT(DISTINCT tc.incident_id) as incident_ids
+        FROM threat_context tc
+        LEFT JOIN threat_context_evidence tce ON tc.context_id = tce.context_id
+        GROUP BY tc.technique_id, tc.technique_name, tc.tactic, tc.mitre_version
+    """)
+    matrix = []
+    for row in cursor.fetchall():
+        d = dict(row)
+        d["incident_ids"] = [i.strip() for i in d["incident_ids"].split(",") if i.strip()] if d.get("incident_ids") else []
+        matrix.append(d)
+    return matrix
+
 @app.get("/api/v1/incidents/{incident_id}/assessment", response_model=Assessment)
+
 def get_incident_assessment(incident_id: str, token: str = Depends(verify_token), db: sqlite3.Connection = Depends(get_db)):
     cursor = db.execute("SELECT latest_assessment_id FROM incidents WHERE incident_id = ?", (incident_id,))
     row = cursor.fetchone()
@@ -231,3 +253,182 @@ def override_decision(incident_id: str, req: AnalystOverrideRequest, token: str 
         status_code=501,
         detail="Current architecture enforces unique (incident, assessment, analysis) decisions and does not support append-only analyst overrides."
     )
+
+
+# ---------------------------------------------------------
+# Telemetry Device Management & Remote Commands
+# ---------------------------------------------------------
+
+@app.post("/api/v1/endpoints/heartbeat")
+def receive_heartbeat(
+    payload: EndpointHeartbeat,
+    token: str = Depends(verify_token),
+    db: sqlite3.Connection = Depends(get_db)
+):
+    now_str = datetime.now(timezone.utc).isoformat()
+    caps_json = json.dumps(payload.capabilities or [])
+
+    # Upsert endpoint registry
+    db.execute("""
+        INSERT INTO endpoints (agent_id, hostname, os, ip_address, status, last_heartbeat, agent_version, capabilities)
+        VALUES (?, ?, ?, ?, 'ONLINE', ?, ?, ?)
+        ON CONFLICT(agent_id) DO UPDATE SET
+            hostname = excluded.hostname,
+            os = excluded.os,
+            ip_address = excluded.ip_address,
+            status = 'ONLINE',
+            last_heartbeat = excluded.last_heartbeat,
+            agent_version = excluded.agent_version,
+            capabilities = excluded.capabilities
+    """, (payload.agent_id, payload.hostname, payload.os, payload.ip_address, now_str, payload.agent_version, caps_json))
+
+    # Retrieve pending commands for this agent
+    cursor = db.execute("""
+        SELECT * FROM endpoint_commands
+        WHERE agent_id = ? AND status = 'PENDING'
+        ORDER BY created_at ASC
+    """, (payload.agent_id,))
+
+    pending_commands = []
+    cmd_ids_to_send = []
+    for row in cursor.fetchall():
+        d = dict(row)
+        if d.get("parameters"):
+            try:
+                d["parameters"] = json.loads(d["parameters"])
+            except Exception:
+                pass
+        if d.get("result"):
+            try:
+                d["result"] = json.loads(d["result"])
+            except Exception:
+                pass
+        pending_commands.append(d)
+        cmd_ids_to_send.append(d["command_id"])
+
+    # Mark dispatched commands as SENT
+    for cid in cmd_ids_to_send:
+        db.execute("UPDATE endpoint_commands SET status = 'SENT', updated_at = ? WHERE command_id = ?", (now_str, cid))
+
+    db.commit()
+    return {"acknowledged": True, "agent_id": payload.agent_id, "commands": pending_commands}
+
+
+@app.get("/api/v1/endpoints", response_model=List[EndpointInfo])
+def list_endpoints(
+    token: str = Depends(verify_token),
+    db: sqlite3.Connection = Depends(get_db)
+):
+    cursor = db.execute("SELECT * FROM endpoints ORDER BY last_heartbeat DESC")
+    endpoints = []
+    now = datetime.now(timezone.utc)
+    for row in cursor.fetchall():
+        d = dict(row)
+        try:
+            d["capabilities"] = json.loads(d["capabilities"]) if d.get("capabilities") else []
+        except Exception:
+            d["capabilities"] = []
+
+        try:
+            hb_str = d["last_heartbeat"].replace("Z", "+00:00")
+            hb_time = datetime.fromisoformat(hb_str)
+            if hb_time.tzinfo is None:
+                hb_time = hb_time.replace(tzinfo=timezone.utc)
+            delta_sec = (now - hb_time).total_seconds()
+            if delta_sec > 60:
+                d["status"] = "OFFLINE"
+            else:
+                d["status"] = "ONLINE"
+        except Exception:
+            d["status"] = "OFFLINE"
+
+        endpoints.append(EndpointInfo(**d))
+    return endpoints
+
+
+@app.post("/api/v1/endpoints/{agent_id}/commands", response_model=EndpointCommand, status_code=status.HTTP_201_CREATED)
+def dispatch_command(
+    agent_id: str,
+    cmd_in: EndpointCommandCreate,
+    token: str = Depends(verify_token),
+    db: sqlite3.Connection = Depends(get_db)
+):
+    ep = db.execute("SELECT 1 FROM endpoints WHERE agent_id = ?", (agent_id,)).fetchone()
+    if not ep:
+        raise HTTPException(status_code=404, detail="Endpoint agent not found")
+
+    cmd_id = str(uuid.uuid4())
+    now_str = datetime.now(timezone.utc).isoformat()
+    params_json = json.dumps(cmd_in.parameters or {})
+
+    db.execute("""
+        INSERT INTO endpoint_commands (command_id, agent_id, command_type, parameters, status, result, created_at, updated_at)
+        VALUES (?, ?, ?, ?, 'PENDING', NULL, ?, ?)
+    """, (cmd_id, agent_id, cmd_in.command_type.upper(), params_json, now_str, now_str))
+    db.commit()
+
+    return EndpointCommand(
+        command_id=cmd_id,
+        agent_id=agent_id,
+        command_type=cmd_in.command_type.upper(),
+        parameters=cmd_in.parameters,
+        status="PENDING",
+        result=None,
+        created_at=now_str,
+        updated_at=now_str
+    )
+
+
+@app.post("/api/v1/endpoints/{agent_id}/commands/{command_id}/result")
+def submit_command_result(
+    agent_id: str,
+    command_id: str,
+    res: EndpointCommandResult,
+    token: str = Depends(verify_token),
+    db: sqlite3.Connection = Depends(get_db)
+):
+    now_str = datetime.now(timezone.utc).isoformat()
+    result_json = json.dumps(res.result or {})
+
+    cursor = db.execute("""
+        UPDATE endpoint_commands
+        SET status = ?, result = ?, updated_at = ?
+        WHERE command_id = ? AND agent_id = ?
+    """, (res.status.upper(), result_json, now_str, command_id, agent_id))
+
+    if cursor.rowcount == 0:
+        raise HTTPException(status_code=404, detail="Command not found for this agent")
+
+    db.commit()
+    return {"acknowledged": True, "command_id": command_id, "status": res.status.upper()}
+
+
+@app.get("/api/v1/endpoints/{agent_id}/commands", response_model=List[EndpointCommand])
+def get_endpoint_commands(
+    agent_id: str,
+    limit: int = 20,
+    token: str = Depends(verify_token),
+    db: sqlite3.Connection = Depends(get_db)
+):
+    cursor = db.execute("""
+        SELECT * FROM endpoint_commands
+        WHERE agent_id = ?
+        ORDER BY created_at DESC
+        LIMIT ?
+    """, (agent_id, limit))
+
+    commands = []
+    for row in cursor.fetchall():
+        d = dict(row)
+        if d.get("parameters"):
+            try:
+                d["parameters"] = json.loads(d["parameters"])
+            except Exception:
+                pass
+        if d.get("result"):
+            try:
+                d["result"] = json.loads(d["result"])
+            except Exception:
+                pass
+        commands.append(EndpointCommand(**d))
+    return commands

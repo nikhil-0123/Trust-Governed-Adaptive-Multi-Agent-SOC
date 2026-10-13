@@ -14,6 +14,7 @@ from transport.client import TransportClient
 from transport.delivery import DeliveryManager
 from transport.filter import ImportantEventFilter
 from transport.worker import DeliveryWorker
+from transport.heartbeat import HeartbeatWorker
 
 class UbuntuDetectionPipeline:
     """
@@ -32,11 +33,21 @@ class UbuntuDetectionPipeline:
         self.client = TransportClient(config.soc_api_url, config.soc_api_token, self.logger)
         self.delivery_manager = DeliveryManager(self.outbox, self.client, self.logger)
         self.delivery_worker = DeliveryWorker(self.delivery_manager, self.logger, poll_interval=1.0)
+        self.heartbeat_worker = HeartbeatWorker(
+            agent_id=self.identity.agent_id,
+            os_type="linux",
+            soc_api_url=config.soc_api_url,
+            api_token=config.soc_api_token,
+            logger=self.logger,
+            capabilities=["AuthLog_SSH"],
+            heartbeat_interval=15.0
+        )
 
     def initialize(self):
         """Initializes collectors and starts the background delivery worker."""
         self.collector.initialize()
         self.delivery_worker.start()
+        self.heartbeat_worker.start()
 
     def process_batch(self):
         """Processes a single batch of log events through the pipeline."""
@@ -83,5 +94,10 @@ class UbuntuDetectionPipeline:
             self.collector.update_checkpoint(last_successful_record_id, last_successful_offset)
 
     def shutdown(self):
-        """Gracefully terminates background delivery worker."""
+        """Gracefully terminates background delivery worker and flushes pending outbox events."""
+        try:
+            self.delivery_manager.process_outbox()
+        except Exception:
+            pass
         self.delivery_worker.stop()
+        self.heartbeat_worker.stop()

@@ -87,3 +87,40 @@ class ProvenanceHistory(BaseModel):
 class AnalystOverrideRequest(BaseModel):
     action: str
     reason: str
+
+class EndpointHeartbeat(BaseModel):
+    agent_id: str
+    hostname: str
+    os: str
+    ip_address: Optional[str] = None
+    agent_version: Optional[str] = "1.0.0"
+    capabilities: Optional[List[str]] = Field(default_factory=list)
+
+class EndpointCommandCreate(BaseModel):
+    command_type: str  # PING, GET_HEALTH, GET_STATUS
+    parameters: Optional[Dict[str, Any]] = Field(default_factory=dict)
+
+class EndpointCommand(BaseModel):
+    command_id: str
+    agent_id: str
+    command_type: str
+    parameters: Optional[Dict[str, Any]] = None
+    status: str  # PENDING, SENT, EXECUTED, FAILED
+    result: Optional[Dict[str, Any]] = None
+    created_at: str
+    updated_at: str
+
+class EndpointCommandResult(BaseModel):
+    status: str = "EXECUTED"  # EXECUTED or FAILED
+    result: Dict[str, Any] = Field(default_factory=dict)
+
+class EndpointInfo(BaseModel):
+    agent_id: str
+    hostname: str
+    os: str
+    ip_address: Optional[str] = None
+    status: str  # ONLINE, OFFLINE
+    last_heartbeat: str
+    agent_version: Optional[str] = None
+    capabilities: List[str] = Field(default_factory=list)
+

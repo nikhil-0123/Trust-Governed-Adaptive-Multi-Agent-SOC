@@ -35,3 +35,8 @@ Desktop.ini
 *.db
 *.sqlite
 *.sqlite3
+
+# Agent runtime logs and pid files
+*.log
+.agent.pid
+agent_identity.json

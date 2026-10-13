@@ -26,11 +26,16 @@ def main():
             pass
 
         runtime.logger.info(f"Ubuntu Telemetry agent running. Polling interval: {config.ubuntu_event_poll_interval}s.")
-        # Single iteration for non-daemon run, or loop when deployed
-        pipeline.process_batch()
-        pipeline.shutdown()
-        runtime.stop()
-        sys.exit(0)
+
+        if "--once" in sys.argv:
+            pipeline.process_batch()
+            pipeline.shutdown()
+            runtime.stop()
+            sys.exit(0)
+
+        while True:
+            pipeline.process_batch()
+            time.sleep(config.ubuntu_event_poll_interval)
 
     except KeyboardInterrupt:
         runtime.logger.info("Keyboard interrupt received.")

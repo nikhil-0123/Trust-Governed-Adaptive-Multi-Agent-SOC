@@ -234,8 +234,38 @@ def init_db():
                 SELECT RAISE(ABORT, 'governance_decisions is append-only');
             END;
         ''')
-        
+
+        # Endpoint Device Management & Heartbeat Tables
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS endpoints (
+                agent_id TEXT PRIMARY KEY,
+                hostname TEXT NOT NULL,
+                os TEXT NOT NULL,
+                ip_address TEXT,
+                status TEXT NOT NULL DEFAULT 'ONLINE',
+                last_heartbeat TIMESTAMP NOT NULL,
+                agent_version TEXT,
+                capabilities TEXT
+            )
+        ''')
+
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS endpoint_commands (
+                command_id TEXT PRIMARY KEY,
+                agent_id TEXT NOT NULL,
+                command_type TEXT NOT NULL,
+                parameters TEXT,
+                status TEXT NOT NULL,
+                result TEXT,
+                created_at TIMESTAMP NOT NULL,
+                updated_at TIMESTAMP NOT NULL,
+                FOREIGN KEY(agent_id) REFERENCES endpoints(agent_id)
+            )
+        ''')
+        conn.execute('CREATE INDEX IF NOT EXISTS idx_endpoint_commands_agent ON endpoint_commands(agent_id, status)')
+
         conn.commit()
+
     finally:
         conn.close()
 
