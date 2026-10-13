@@ -29,11 +29,9 @@ export function GovernancePage({
     setError(null);
     setOverrideTestResult(null);
     try {
-      const [assRes, decRes, histRes] = await Promise.all([
-        api.getIncidentAssessment(incidentId),
-        api.getIncidentDecision(incidentId),
-        api.getIncidentHistory(incidentId),
-      ]);
+      const assRes = await api.getIncidentAssessment(incidentId);
+      const decRes = await api.getIncidentDecision(incidentId);
+      const histRes = await api.getIncidentHistory(incidentId);
       setAssessment(assRes);
       setDecision(decRes);
       setHistory(histRes);
@@ -45,9 +43,9 @@ export function GovernancePage({
   }, []);
 
   useEffect(() => {
-    if (!activeIncident) return;
+    if (!activeIncident?.incident_id) return;
     loadGovernanceData(activeIncident.incident_id);
-  }, [activeIncident, loadGovernanceData]);
+  }, [activeIncident?.incident_id, loadGovernanceData]);
 
   const handleTestOverrideRejection = async () => {
     if (!activeIncident) return;

@@ -40,49 +40,60 @@ async function request(endpoint, options = {}) {
     ...options.headers,
   };
 
-  try {
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), options.timeout || 12000);
+  const maxAttempts = options.retries !== undefined ? options.retries : 2;
+  let lastError = null;
 
-    const response = await fetch(url, {
-      ...options,
-      headers,
-      signal: controller.signal,
-    });
-    clearTimeout(timeoutId);
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), options.timeout || 12000);
 
-    if (response.status === 401) {
-      throw new ApiError('Unauthorized: Invalid or missing API Bearer token.', 401);
-    }
+      const response = await fetch(url, {
+        ...options,
+        headers,
+        signal: controller.signal,
+      });
+      clearTimeout(timeoutId);
 
-    if (response.status === 404) {
-      return null;
-    }
-
-    if (!response.ok) {
-      let errorDetail = `HTTP ${response.status} ${response.statusText}`;
-      try {
-        const errorJson = await response.json();
-        if (errorJson && errorJson.detail) {
-          errorDetail = errorJson.detail;
-        }
-      } catch {
-        // use default error detail
+      if (response.status === 401) {
+        throw new ApiError('Unauthorized: Invalid or missing API Bearer token.', 401);
       }
-      throw new ApiError(errorDetail, response.status);
-    }
 
-    return await response.json();
-  } catch (err) {
-    if (err instanceof ApiError) throw err;
-    if (err.name === 'AbortError') {
-      throw new ApiError('Request timed out while connecting to SOC backend.', 408);
+      if (response.status === 404) {
+        return null;
+      }
+
+      if (!response.ok) {
+        let errorDetail = `HTTP ${response.status} ${response.statusText}`;
+        try {
+          const errorJson = await response.json();
+          if (errorJson && errorJson.detail) {
+            errorDetail = errorJson.detail;
+          }
+        } catch {
+          // use default error detail
+        }
+        throw new ApiError(errorDetail, response.status);
+      }
+
+      return await response.json();
+    } catch (err) {
+      if (err instanceof ApiError) throw err;
+      lastError = err;
+      if (attempt < maxAttempts) {
+        await new Promise((resolve) => setTimeout(resolve, 150));
+        continue;
+      }
     }
-    throw new ApiError(
-      `Cannot connect to SOC backend at ${baseUrl}. Ensure backend is running. (${err.message})`,
-      0
-    );
   }
+
+  if (lastError?.name === 'AbortError') {
+    throw new ApiError('Request timed out while connecting to SOC backend.', 408);
+  }
+  throw new ApiError(
+    `Cannot connect to SOC backend at ${baseUrl}. Ensure backend is running. (${lastError?.message || 'Network error'})`,
+    0
+  );
 }
 
 export const api = {
@@ -139,5 +150,31 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ action, reason }),
     });
+  },
+
+  // Telemetry Device Management & Remote Commands
+  async getEndpoints() {
+    const res = await request('/api/v1/endpoints');
+    return res || [];
+  },
+
+  async sendEndpointCommand(agentId, commandType, parameters = {}) {
+    return await request(`/api/v1/endpoints/${encodeURIComponent(agentId)}/commands`, {
+      method: 'POST',
+      body: JSON.stringify({ command_type: commandType, parameters }),
+    });
+  },
+
+  async getEndpointCommands(agentId) {
+    const res = await request(`/api/v1/endpoints/${encodeURIComponent(agentId)}/commands`);
+    return res || [];
+  },
+
+  // MITRE ATT&CK Matrix Heatmap Fleet Overview
+  async getMitreMatrix() {
+    const res = await request('/api/v1/mitre/matrix');
+    return res || [];
   }
 };
+
+

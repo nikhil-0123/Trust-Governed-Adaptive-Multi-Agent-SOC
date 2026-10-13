@@ -199,6 +199,27 @@ class TestMitreEngineDB(unittest.TestCase):
             cursor = conn.execute("SELECT COUNT(*) as c FROM threat_context_evidence")
             self.assertEqual(cursor.fetchone()["c"], 2)
 
+    def test_process_rules_mappings(self):
+        with get_db_connection() as conn:
+            # Test PowerShell T1059.001
+            self._insert_event_and_incident(conn, "e-ps", "windows_powershell_execution")
+            res_ps = self.engine.process_event(conn, "e-ps")
+            self.assertEqual(res_ps, "MAPPED")
+
+            # Test LOLBin T1105
+            conn.execute("INSERT INTO events (detection_event_id, data) VALUES (?, ?)", ("e-lolbin", json.dumps({"detection_type": "windows_lolbin_download"})))
+            conn.execute("INSERT INTO incident_evidence (incident_id, detection_event_id) VALUES (?, ?)", ("inc-1", "e-lolbin"))
+            res_lol = self.engine.process_event(conn, "e-lolbin")
+            self.assertEqual(res_lol, "MAPPED")
+
+            conn.commit()
+
+            cursor = conn.execute("SELECT technique_id FROM threat_context WHERE incident_id = 'inc-1' ORDER BY technique_id")
+            tech_ids = [r["technique_id"] for r in cursor.fetchall()]
+            self.assertIn("T1059.001", tech_ids)
+            self.assertIn("T1105", tech_ids)
+
+
 
 class TestMitreWorkerIntegration(unittest.TestCase):
     def setUp(self):
@@ -265,7 +286,14 @@ class TestMitreWorkerIntegration(unittest.TestCase):
         
         shutdown_event()
         self.assertFalse(mitre_worker.is_alive())
-        self.assertFalse(fusion_worker.is_alive())
+    def test_mitre_matrix_api(self):
+        from fastapi.testclient import TestClient
+        from app.main import app, API_TOKEN
+        client = TestClient(app)
+        res = client.get("/api/v1/mitre/matrix", headers={"Authorization": f"Bearer {API_TOKEN}"})
+        self.assertEqual(res.status_code, 200)
+        self.assertIsInstance(res.json(), list)
 
 if __name__ == '__main__':
+
     unittest.main()

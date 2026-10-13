@@ -26,11 +26,9 @@ export function InvestigationPage({
     setIsLoading(true);
     setError(null);
     try {
-      const [evRes, entRes, mitRes] = await Promise.all([
-        api.getIncidentEvidence(incidentId),
-        api.getIncidentEntities(incidentId),
-        api.getIncidentMitre(incidentId),
-      ]);
+      const evRes = await api.getIncidentEvidence(incidentId);
+      const entRes = await api.getIncidentEntities(incidentId);
+      const mitRes = await api.getIncidentMitre(incidentId);
       setEvidenceList(evRes || []);
       setEntitiesList(entRes || []);
       setMitreList(mitRes || []);
@@ -42,9 +40,9 @@ export function InvestigationPage({
   }, []);
 
   useEffect(() => {
-    if (!activeIncident) return;
+    if (!activeIncident?.incident_id) return;
     loadInvestigationData(activeIncident.incident_id);
-  }, [activeIncident, loadInvestigationData]);
+  }, [activeIncident?.incident_id, loadInvestigationData]);
 
   if (!activeIncident) {
     return (

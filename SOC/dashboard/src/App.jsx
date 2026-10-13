@@ -8,6 +8,7 @@ import { InvestigationPage } from './pages/InvestigationPage';
 import { AnalysisPage } from './pages/AnalysisPage';
 import { GovernancePage } from './pages/GovernancePage';
 import { EndpointsPage } from './pages/EndpointsPage';
+import { MitrePage } from './pages/MitrePage';
 import { api } from './api/client';
 
 export function App() {
@@ -136,6 +137,14 @@ export function App() {
             incidents={incidents}
             selectedIncidentId={selectedIncidentId}
             onSelectIncident={handleSelectIncident}
+            onOpenSettings={() => setIsSettingsOpen(true)}
+          />
+        )}
+
+        {activeTab === 'mitre' && (
+          <MitrePage
+            onSelectIncident={handleSelectIncident}
+            onNavigate={handleNavigate}
             onOpenSettings={() => setIsSettingsOpen(true)}
           />
         )}

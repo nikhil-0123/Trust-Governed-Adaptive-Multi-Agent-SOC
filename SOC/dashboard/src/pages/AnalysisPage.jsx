@@ -34,9 +34,9 @@ export function AnalysisPage({
   }, []);
 
   useEffect(() => {
-    if (!activeIncident) return;
+    if (!activeIncident?.incident_id) return;
     loadAnalysis(activeIncident.incident_id);
-  }, [activeIncident, loadAnalysis]);
+  }, [activeIncident?.incident_id, loadAnalysis]);
 
 
   if (!activeIncident) {

@@ -1,5 +1,5 @@
 import React from 'react';
-import { LayoutDashboard, AlertOctagon, Search, BrainCircuit, Scale, Radio } from 'lucide-react';
+import { LayoutDashboard, AlertOctagon, Search, BrainCircuit, Scale, Radio, ShieldAlert } from 'lucide-react';
 
 export function Navigation({ activeTab, setActiveTab, incidentCount, selectedIncidentId }) {
   const tabs = [
@@ -8,8 +8,10 @@ export function Navigation({ activeTab, setActiveTab, incidentCount, selectedInc
     { id: 'investigation', label: 'Investigation', icon: Search, subLabel: selectedIncidentId ? selectedIncidentId.slice(0, 12) + '...' : null },
     { id: 'analysis', label: 'AI Analysis', icon: BrainCircuit },
     { id: 'governance', label: 'Trust & Governance', icon: Scale },
+    { id: 'mitre', label: 'MITRE ATT&CK', icon: ShieldAlert },
     { id: 'endpoints', label: 'Endpoints', icon: Radio },
   ];
+
 
   return (
     <nav className="border-b border-soc-border bg-soc-surface/50">
