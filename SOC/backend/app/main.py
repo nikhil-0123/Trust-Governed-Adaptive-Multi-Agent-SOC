@@ -27,7 +27,8 @@ API_TOKEN = os.getenv("SOC_API_TOKEN", "dev-token-123")
 from app.models import (
     DetectionEvent, Incident, IncidentEntity, ThreatContext,
     Assessment, Analysis, GovernanceDecision, ProvenanceHistory, AnalystOverrideRequest,
-    EndpointHeartbeat, EndpointCommandCreate, EndpointCommand, EndpointCommandResult, EndpointInfo
+    EndpointHeartbeat, EndpointCommandCreate, EndpointCommand, EndpointCommandResult, EndpointInfo,
+    GovernanceApprovalRequest, GovernanceRejectionRequest, IncidentGovernanceStatus
 )
 from app import database
 from app.worker import FusionWorker
@@ -253,6 +254,164 @@ def override_decision(incident_id: str, req: AnalystOverrideRequest, token: str 
         status_code=501,
         detail="Current architecture enforces unique (incident, assessment, analysis) decisions and does not support append-only analyst overrides."
     )
+
+@app.get("/api/v1/incidents/{incident_id}/governance", response_model=IncidentGovernanceStatus)
+def get_incident_governance_status(
+    incident_id: str,
+    token: str = Depends(verify_token),
+    db: sqlite3.Connection = Depends(get_db)
+):
+    inc = db.execute("SELECT incident_id, latest_analysis_id FROM incidents WHERE incident_id = ?", (incident_id,)).fetchone()
+    if not inc:
+        raise HTTPException(status_code=404, detail="Incident not found")
+
+    gs = db.execute("SELECT * FROM governance_state WHERE incident_id = ?", (incident_id,)).fetchone()
+    if not gs:
+        raise HTTPException(status_code=404, detail="Governance state not found for incident")
+
+    decision = None
+    reason = None
+    if gs["decision_id"]:
+        gd = db.execute("SELECT decision, reason FROM governance_decisions WHERE decision_id = ?", (gs["decision_id"],)).fetchone()
+        if gd:
+            decision = gd["decision"]
+            reason = gd["reason"]
+
+    # Recommendations from latest analysis
+    recs = []
+    if inc["latest_analysis_id"]:
+        an_row = db.execute("SELECT analysis_output FROM analyses WHERE analysis_id = ?", (inc["latest_analysis_id"],)).fetchone()
+        if an_row:
+            try:
+                an_data = json.loads(an_row["analysis_output"])
+                recs = an_data.get("recommendations", [])
+            except Exception:
+                pass
+
+    # Dispatched commands associated with this incident
+    cmds = []
+    cmd_cursor = db.execute("""
+        SELECT * FROM endpoint_commands 
+        WHERE parameters LIKE ?
+        ORDER BY created_at DESC
+    """, (f'%"{incident_id}"%',))
+    for row in cmd_cursor.fetchall():
+        d = dict(row)
+        if d.get("parameters"):
+            try:
+                d["parameters"] = json.loads(d["parameters"])
+            except Exception:
+                pass
+        if d.get("result"):
+            try:
+                d["result"] = json.loads(d["result"])
+            except Exception:
+                pass
+        cmds.append(EndpointCommand(**d))
+
+    return IncidentGovernanceStatus(
+        incident_id=incident_id,
+        decision_id=gs["decision_id"],
+        decision=decision,
+        approval_status=gs["approval_status"],
+        reason=reason,
+        recommendations=recs,
+        dispatched_commands=cmds,
+        updated_at=gs["updated_at"]
+    )
+
+@app.post("/api/v1/incidents/{incident_id}/governance/approve")
+def approve_governance_mitigation(
+    incident_id: str,
+    req: GovernanceApprovalRequest = GovernanceApprovalRequest(),
+    token: str = Depends(verify_token),
+    db: sqlite3.Connection = Depends(get_db)
+):
+    inc = db.execute("SELECT incident_id, latest_analysis_id FROM incidents WHERE incident_id = ?", (incident_id,)).fetchone()
+    if not inc:
+        raise HTTPException(status_code=404, detail="Incident not found")
+
+    gs = db.execute("SELECT * FROM governance_state WHERE incident_id = ?", (incident_id,)).fetchone()
+    if not gs or gs["status"] != "DECIDED":
+        raise HTTPException(status_code=400, detail="Incident has not completed governance evaluation")
+
+    if gs["approval_status"] == "APPROVED":
+        return {
+            "acknowledged": True,
+            "incident_id": incident_id,
+            "approval_status": "APPROVED",
+            "message": "Mitigation already approved",
+            "dispatched_count": 0,
+            "dispatched_commands": []
+        }
+
+    recommendations = []
+    if inc["latest_analysis_id"]:
+        an_row = db.execute("SELECT analysis_output FROM analyses WHERE analysis_id = ?", (inc["latest_analysis_id"],)).fetchone()
+        if an_row:
+            try:
+                an_data = json.loads(an_row["analysis_output"])
+                recommendations = an_data.get("recommendations", [])
+            except Exception:
+                pass
+
+    from app.response_bridge import dispatch_governed_response
+    dispatched = dispatch_governed_response(
+        db,
+        incident_id,
+        recommendations=recommendations,
+        approved_by=req.analyst_name or "soc_analyst",
+        target_action=req.action,
+        custom_params=req.custom_params
+    )
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+    db.execute("""
+        UPDATE governance_state
+        SET approval_status = 'APPROVED', updated_at = ?
+        WHERE incident_id = ?
+    """, (now_iso, incident_id))
+    db.commit()
+
+    return {
+        "acknowledged": True,
+        "incident_id": incident_id,
+        "approval_status": "APPROVED",
+        "approved_by": req.analyst_name or "soc_analyst",
+        "dispatched_count": len(dispatched),
+        "dispatched_commands": dispatched
+    }
+
+@app.post("/api/v1/incidents/{incident_id}/governance/reject")
+def reject_governance_mitigation(
+    incident_id: str,
+    req: GovernanceRejectionRequest,
+    token: str = Depends(verify_token),
+    db: sqlite3.Connection = Depends(get_db)
+):
+    inc = db.execute("SELECT incident_id FROM incidents WHERE incident_id = ?", (incident_id,)).fetchone()
+    if not inc:
+        raise HTTPException(status_code=404, detail="Incident not found")
+
+    gs = db.execute("SELECT * FROM governance_state WHERE incident_id = ?", (incident_id,)).fetchone()
+    if not gs or gs["status"] != "DECIDED":
+        raise HTTPException(status_code=400, detail="Incident has not completed governance evaluation")
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+    db.execute("""
+        UPDATE governance_state
+        SET approval_status = 'REJECTED', updated_at = ?
+        WHERE incident_id = ?
+    """, (now_iso, incident_id))
+    db.commit()
+
+    return {
+        "acknowledged": True,
+        "incident_id": incident_id,
+        "approval_status": "REJECTED",
+        "rejected_by": req.analyst_name or "soc_analyst",
+        "reason": req.reason
+    }
 
 
 # ---------------------------------------------------------

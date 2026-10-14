@@ -247,6 +247,15 @@ class GovernanceWorker(threading.Thread):
                     SET status = 'DECIDED', decision_id = ?, approval_status = ?, updated_at = ?
                     WHERE incident_id = ? AND assessment_id = ? AND analysis_id = ?
                 """, (decision_id, approval_status, now_iso, incident_id, assessment_id, analysis_id))
+
+                # If AUTO_APPROVE, automatically dispatch mitigation commands to endpoints
+                if decision_obj.decision == "AUTO_APPROVE":
+                    try:
+                        from app.response_bridge import dispatch_governed_response
+                        recs = analysis_dict.get("recommendations", [])
+                        dispatch_governed_response(conn, incident_id, recs, approved_by="AUTONOMOUS_GOVERNANCE")
+                    except Exception as bridge_err:
+                        logger.error(f"Failed to auto-dispatch governed response for {incident_id}: {bridge_err}")
             
             conn.commit()
         except sqlite3.IntegrityError:

@@ -124,3 +124,23 @@ class EndpointInfo(BaseModel):
     agent_version: Optional[str] = None
     capabilities: List[str] = Field(default_factory=list)
 
+class GovernanceApprovalRequest(BaseModel):
+    action: Optional[str] = None  # Specific action to approve (e.g. ISOLATE_HOST or BLOCK_SOURCE), or None for all
+    analyst_name: Optional[str] = "soc_analyst"
+    reason: Optional[str] = "Analyst approved recommended mitigation"
+    custom_params: Optional[Dict[str, Any]] = None
+
+class GovernanceRejectionRequest(BaseModel):
+    analyst_name: Optional[str] = "soc_analyst"
+    reason: str = "Analyst rejected recommended mitigation"
+
+class IncidentGovernanceStatus(BaseModel):
+    incident_id: str
+    decision_id: Optional[str] = None
+    decision: Optional[str] = None
+    approval_status: str  # PENDING, AUTO_APPROVED, APPROVED, REJECTED, NOT_REQUIRED
+    reason: Optional[str] = None
+    recommendations: List[Dict[str, Any]] = Field(default_factory=list)
+    dispatched_commands: List[EndpointCommand] = Field(default_factory=list)
+    updated_at: Optional[str] = None
+
