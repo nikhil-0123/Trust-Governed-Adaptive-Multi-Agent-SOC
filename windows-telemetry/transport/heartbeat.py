@@ -8,10 +8,17 @@ import urllib.error
 from datetime import datetime, timezone
 from typing import Optional, List, Dict, Any
 
+from response.executor import WindowsResponseExecutor
+
+DEFAULT_WINDOWS_CAPABILITIES = [
+    "EventLog_4625", "EventLog_4688",
+    "BLOCK_SOURCE", "KILL_PROCESS", "ISOLATE_HOST", "DISABLE_ACCOUNT"
+]
+
 class HeartbeatWorker(threading.Thread):
     """
     Background worker that sends periodic heartbeats to Central SOC
-    and polls/executes management commands (PING, GET_HEALTH, GET_STATUS).
+    and polls/executes management and mitigation commands.
     """
     def __init__(
         self,
@@ -32,10 +39,11 @@ class HeartbeatWorker(threading.Thread):
             self.base_url = soc_api_url.rstrip("/")
         self.api_token = api_token
         self.logger = logger
-        self.capabilities = capabilities or ["EventLog_4625", "EventLog_4688"]
+        self.capabilities = capabilities or list(DEFAULT_WINDOWS_CAPABILITIES)
         self.heartbeat_interval = heartbeat_interval
         self._stop_event = threading.Event()
         self._start_time = time.time()
+        self.executor = WindowsResponseExecutor(soc_base_url=self.base_url, logger=self.logger)
 
     def run(self):
         self.logger.info(f"HeartbeatWorker started for agent {self.agent_id} (interval={self.heartbeat_interval}s).")
@@ -124,6 +132,22 @@ class HeartbeatWorker(threading.Thread):
                     "capabilities": self.capabilities,
                     "agent_version": "1.0.0"
                 }
+            elif cmd_type in (
+                "BLOCK_SOURCE", "BLOCK_SOURCE_IP", "UNBLOCK_SOURCE",
+                "KILL_PROCESS", "ISOLATE_HOST", "RESTORE_HOST", "DISABLE_ACCOUNT"
+            ):
+                raw_params = cmd.get("parameters") or {}
+                if isinstance(raw_params, str):
+                    try:
+                        raw_params = json.loads(raw_params)
+                    except Exception:
+                        raw_params = {}
+                result = self.executor.execute(cmd_type, raw_params)
+                if (result.get("applied") is False or
+                    result.get("terminated") is False or
+                    result.get("disabled") is False or
+                    "error" in result):
+                    status = "FAILED"
             else:
                 status = "FAILED"
                 result = {"error": f"Unknown command type: {cmd_type}"}

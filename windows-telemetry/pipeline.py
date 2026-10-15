@@ -39,7 +39,10 @@ class WindowsDetectionPipeline:
             soc_api_url=config.soc_api_url,
             api_token=config.soc_api_token,
             logger=logger,
-            capabilities=["EventLog_4625", "EventLog_4688"],
+            capabilities=[
+                "EventLog_4625", "EventLog_4688",
+                "BLOCK_SOURCE", "KILL_PROCESS", "ISOLATE_HOST", "DISABLE_ACCOUNT"
+            ],
             heartbeat_interval=15.0
         )
 

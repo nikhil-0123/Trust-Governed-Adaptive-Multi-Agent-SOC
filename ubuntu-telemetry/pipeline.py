@@ -39,7 +39,10 @@ class UbuntuDetectionPipeline:
             soc_api_url=config.soc_api_url,
             api_token=config.soc_api_token,
             logger=self.logger,
-            capabilities=["AuthLog_SSH"],
+            capabilities=[
+                "AuthLog_SSH",
+                "BLOCK_SOURCE", "KILL_PROCESS", "ISOLATE_HOST", "DISABLE_ACCOUNT"
+            ],
             heartbeat_interval=15.0
         )
 
