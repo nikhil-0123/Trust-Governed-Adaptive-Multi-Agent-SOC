@@ -335,7 +335,22 @@ def approve_governance_mitigation(
     if not gs or gs["status"] != "DECIDED":
         raise HTTPException(status_code=400, detail="Incident has not completed governance evaluation")
 
-    if gs["approval_status"] == "APPROVED":
+    if req.action:
+        cmds = db.execute(
+            "SELECT command_type FROM endpoint_commands WHERE parameters LIKE ?",
+            (f'%"{incident_id}"%',)
+        ).fetchall()
+        dispatched_types = [c["command_type"].upper() for c in cmds]
+        if req.action.upper() in dispatched_types:
+            return {
+                "acknowledged": True,
+                "incident_id": incident_id,
+                "approval_status": gs["approval_status"],
+                "message": f"Action '{req.action}' already dispatched for this incident",
+                "dispatched_count": 0,
+                "dispatched_commands": []
+            }
+    elif gs["approval_status"] == "APPROVED":
         return {
             "acknowledged": True,
             "incident_id": incident_id,
