@@ -78,7 +78,7 @@ def shutdown_event():
         governance_worker.join(timeout=5.0)
 
 def get_db():
-    conn = sqlite3.connect(database.DB_PATH)
+    conn = sqlite3.connect(database.DB_PATH, check_same_thread=False)
     conn.execute("PRAGMA foreign_keys = ON")
     conn.row_factory = sqlite3.Row
     try:
