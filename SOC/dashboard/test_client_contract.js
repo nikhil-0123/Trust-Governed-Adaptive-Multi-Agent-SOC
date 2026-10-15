@@ -36,4 +36,11 @@ assert.strictEqual(reset.baseUrl, 'http://localhost:8000', 'Reset should restore
 assert.strictEqual(reset.token, 'dev-token-123', 'Reset should restore default token');
 console.log('[PASS] Reset API configuration verified.');
 
+// 4. Governance API Contract
+const { api } = await import('./src/api/client.js');
+assert.strictEqual(typeof api.getIncidentGovernance, 'function', 'api.getIncidentGovernance must be a function');
+assert.strictEqual(typeof api.approveGovernanceMitigation, 'function', 'api.approveGovernanceMitigation must be a function');
+assert.strictEqual(typeof api.rejectGovernanceMitigation, 'function', 'api.rejectGovernanceMitigation must be a function');
+console.log('[PASS] Governance API method contracts verified.');
+
 console.log('=== ALL CLIENT CONFIGURATION TESTS PASSED ===');

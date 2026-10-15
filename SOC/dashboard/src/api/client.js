@@ -143,6 +143,25 @@ export const api = {
     return await request(`/api/v1/incidents/${encodeURIComponent(incidentId)}/history`);
   },
 
+  // Governed Response & Mitigation APIs
+  async getIncidentGovernance(incidentId) {
+    return await request(`/api/v1/incidents/${encodeURIComponent(incidentId)}/governance`);
+  },
+
+  async approveGovernanceMitigation(incidentId, payload = {}) {
+    return await request(`/api/v1/incidents/${encodeURIComponent(incidentId)}/governance/approve`, {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    });
+  },
+
+  async rejectGovernanceMitigation(incidentId, payload = {}) {
+    return await request(`/api/v1/incidents/${encodeURIComponent(incidentId)}/governance/reject`, {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    });
+  },
+
   // Governance override endpoint is documented as 501 Not Implemented by backend architecture.
   // We expose this helper solely to test/verify the backend's 501 rejection policy.
   async submitOverrideAttempt(incidentId, action, reason) {

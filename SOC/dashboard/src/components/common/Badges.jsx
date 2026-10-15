@@ -132,3 +132,61 @@ export function MitreBadge({ techniqueId, tactic, techniqueName }) {
     </div>
   );
 }
+
+export function ApprovalStatusBadge({ status }) {
+  const st = (status || 'NOT_REQUIRED').toUpperCase();
+  const config = {
+    PENDING: {
+      bg: 'bg-amber-950/70 text-amber-300 border-amber-500/60 animate-pulse',
+      icon: Clock,
+      label: 'APPROVAL PENDING'
+    },
+    APPROVED: {
+      bg: 'bg-emerald-950/70 text-emerald-300 border-emerald-500/60 shadow-lg shadow-emerald-950/50',
+      icon: CheckCircle,
+      label: 'MITIGATION APPROVED'
+    },
+    AUTO_APPROVED: {
+      bg: 'bg-cyan-950/70 text-cyan-300 border-cyan-500/60 shadow-lg shadow-cyan-950/50',
+      icon: CheckCircle,
+      label: 'AUTO-APPROVED & DISPATCHED'
+    },
+    REJECTED: {
+      bg: 'bg-rose-950/70 text-rose-300 border-rose-500/60',
+      icon: Ban,
+      label: 'MITIGATION REJECTED'
+    },
+    NOT_REQUIRED: {
+      bg: 'bg-slate-800/80 text-slate-400 border-slate-700',
+      icon: CheckCircle,
+      label: 'AUTONOMOUS / NOT REQUIRED'
+    }
+  };
+  const current = config[st] || config.NOT_REQUIRED;
+  const Icon = current.icon;
+  return (
+    <span className={`inline-flex items-center gap-1.5 px-2.5 py-1 text-xs font-mono font-semibold rounded-md border ${current.bg}`}>
+      <Icon className="w-3.5 h-3.5" />
+      {current.label}
+    </span>
+  );
+}
+
+export function ActionBadge({ action }) {
+  const act = (action || '').toUpperCase();
+  const styles = {
+    BLOCK_SOURCE: 'bg-rose-950/70 text-rose-300 border-rose-600/60',
+    BLOCK_SOURCE_IP: 'bg-rose-950/70 text-rose-300 border-rose-600/60',
+    KILL_PROCESS: 'bg-red-950/70 text-red-300 border-red-600/60',
+    ISOLATE_HOST: 'bg-purple-950/70 text-purple-300 border-purple-600/60',
+    DISABLE_ACCOUNT: 'bg-amber-950/70 text-amber-300 border-amber-600/60',
+    UNBLOCK_SOURCE: 'bg-slate-800 text-slate-300 border-slate-600',
+    RESTORE_HOST: 'bg-slate-800 text-slate-300 border-slate-600'
+  };
+  const current = styles[act] || 'bg-slate-800 text-slate-300 border-slate-700';
+  return (
+    <span className={`inline-flex items-center px-2 py-0.5 text-[11px] font-mono font-bold rounded border ${current}`}>
+      {act}
+    </span>
+  );
+}
