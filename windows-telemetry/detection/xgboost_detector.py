@@ -13,9 +13,8 @@ class XGBoostDetector:
         self.model = self._load_model()
 
     def _load_model(self):
-        # Determine whether a trained XGBoost model exists inside the NEW repository.
-        # Searching P:\Trust-Governed-Adaptive-Multi-Agent-SOC revealed no 
-        # .model, .xgb, or .pkl files. 
+        # Determine whether a trained XGBoost model exists inside the repository.
+        # Searching the repository revealed no .model, .xgb, or .pkl files. 
         # Model loading is safely bypassed until a model is deliberately trained/imported.
         return None
 

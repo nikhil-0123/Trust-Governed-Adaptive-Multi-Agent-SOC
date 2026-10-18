@@ -3,7 +3,7 @@
   "project_name": "Trust-Governed Adaptive Multi-Agent SOC for IT Cyber Defense",
   "version": "0.1.0",
   "environment": "development",
-  "project_root": "P:\\Trust-Governed-Adaptive-Multi-Agent-SOC",
+  "project_root": ".",
 
   "components": {
     "windows_telemetry": "windows-telemetry",

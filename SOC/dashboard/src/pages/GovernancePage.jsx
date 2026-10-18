@@ -2,7 +2,7 @@ import React, { useState, useEffect, useCallback } from 'react';
 import { 
   Scale, ShieldCheck, ShieldAlert, History, Lock, 
   CheckCircle2, XCircle, RefreshCw, Terminal, AlertTriangle, 
-  Zap, Check, X, Clock, FileCode
+  Zap, Check, X, Clock
 } from 'lucide-react';
 import { api } from '../api/client';
 import { DecisionBadge, SeverityBadge, ApprovalStatusBadge, ActionBadge } from '../components/common/Badges';

@@ -37,9 +37,13 @@ The SOC dashboard interfaces directly with the central FastAPI backend (`SOC/bac
    - Live architectural guardrail verification test demonstrating that manual write overrides are rejected by the backend (`HTTP 501 Not Implemented`).
 
 6. **Endpoints (`endpoints`):**
-   - Endpoint telemetry inventory for Windows Employee and Ubuntu Employee endpoint nodes.
+   - Endpoint telemetry inventory for Windows Employee, Ubuntu Employee, and Ubuntu Server endpoint nodes.
    - Operating system identification, first/last seen timestamps, and active detector rules.
-   - Documented boundary clarifying that live ping daemons are deferred for later phases and presence is derived faithfully from ingested telemetry.
+   - Remote command execution and command audit logs.
+
+7. **MITRE ATT&CK Matrix (`mitre`):**
+   - Fleet-wide MITRE ATT&CK Matrix heatmap displaying Tactics and Techniques coverage.
+   - Real-time aggregation of observed technique frequencies across all incidents with direct incident navigation.
 
 ---
 
@@ -57,7 +61,12 @@ The SOC dashboard interfaces directly with the central FastAPI backend (`SOC/bac
 | AI Reasoning Analysis | `/api/v1/incidents/{incident_id}/analysis` | `GET` | Bearer Token |
 | Governance Decision | `/api/v1/incidents/{incident_id}/decision` | `GET` | Bearer Token |
 | Provenance History | `/api/v1/incidents/{incident_id}/history` | `GET` | Bearer Token |
+| Governed Mitigation Approve | `/api/v1/incidents/{incident_id}/governance/approve` | `POST` | Bearer Token |
+| Governed Mitigation Reject | `/api/v1/incidents/{incident_id}/governance/reject` | `POST` | Bearer Token |
 | Override Blocker Test | `/api/v1/incidents/{incident_id}/governance/override` | `POST` | Bearer Token (Returns 501) |
+| Endpoints Inventory | `/api/v1/endpoints` | `GET` | Bearer Token |
+| Endpoint Remote Commands | `/api/v1/endpoints/{agent_id}/commands` | `GET`, `POST` | Bearer Token |
+| MITRE Fleet Heatmap | `/api/v1/mitre/matrix` | `GET` | Bearer Token |
 
 ---
 

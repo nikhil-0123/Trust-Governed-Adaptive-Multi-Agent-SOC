@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useCallback } from 'react';
-import { Radio, Monitor, Terminal, Info, RefreshCw, Zap, Activity, ShieldCheck, Clock, CheckCircle2, AlertCircle } from 'lucide-react';
+import { Radio, Monitor, Terminal, Info, RefreshCw, Zap, Activity, ShieldCheck, CheckCircle2, AlertCircle } from 'lucide-react';
 import { api } from '../api/client';
 import { OsBadge } from '../components/common/Badges';
 import { LoadingSkeleton } from '../components/common/LoadingSkeleton';

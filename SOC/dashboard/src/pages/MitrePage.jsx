@@ -4,8 +4,6 @@ import {
   ExternalLink, 
   AlertTriangle, 
   Flame, 
-  Crosshair, 
-  Layers, 
   Search, 
   RefreshCw, 
   ArrowRight, 

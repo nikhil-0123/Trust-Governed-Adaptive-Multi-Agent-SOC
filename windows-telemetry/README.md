@@ -104,24 +104,23 @@ Reading the **Windows Security Log** natively requires Administrator privileges.
 - **Deduplication**: If the SOC returns `duplicate: true`, the outbox successfully marks the event as delivered locally.
 - **Network Boundaries**: External transport uses at-least-once delivery with idempotent central ingestion.
 
-## 13. Current Limitations
-- Isolation Forest/unknown attack detection is not yet implemented.
-- SOC Response/Governance pipelines do not yet exist.
-- Network transport does not yet exist.
-
-## 14. Running the application
+## 13. Running the Agent
 ```bash
 python main.py
 ```
-
-## 11. Running tests
-Tests are written using the standard `unittest` framework. Run them via:
-```bash
-python -m unittest discover -s tests
+Or via the PowerShell helper script:
+```powershell
+.\agent.ps1 -Action start
 ```
 
-## 12. Expected health output
-Upon execution, the log will output a health status JSON:
+## 14. Running Tests
+Run the complete test suite (unit, normalizer, rules, transport, executor):
+```bash
+python -m pytest tests/
+```
+
+## 15. Expected Health Output
+Upon execution, the agent outputs health status:
 ```json
 {
     "status": "healthy",
@@ -133,8 +132,8 @@ Upon execution, the log will output a health status JSON:
 }
 ```
 
-## 13. Security boundaries
-This application currently operates entirely locally. It does not scan external networks, attack other systems, modify security settings, or transmit any data externally. Event payloads are treated as untrusted strings.
-
-## 14. Next implementation step
-The next immediate step will be to implement the **normalizer** to align raw Windows events with the `normalized_event_contract_v1` specification.
+## 16. Security Boundaries & Response Safety
+- The agent ingests telemetry strictly from local security channels.
+- Event payloads are treated as untrusted data.
+- The `WindowsResponseExecutor` enforces protected system processes and administrative accounts preventing accidental self-lockouts.
+- Firewall isolation preserves inbound/outbound communication with the Central SOC backend.
