@@ -140,11 +140,11 @@ class LinuxResponseExecutor:
         """
         Terminates a malicious process by PID or name on Linux with safety checks.
         """
-        raw_pid = parameters.get("process_id") or parameters.get("pid")
+        raw_pid = parameters.get("process_id") if parameters.get("process_id") is not None else parameters.get("pid")
         process_name = parameters.get("process_name")
         simulate = parameters.get("simulate", False)
 
-        if not raw_pid and not process_name:
+        if raw_pid is None and not process_name:
             raise ValueError("Either 'process_id' or 'process_name' is required for KILL_PROCESS")
 
         # 1. PID-based termination
