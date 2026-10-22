@@ -177,6 +177,12 @@ export const api = {
     return res || [];
   },
 
+  async deleteEndpoint(agentId) {
+    return await request(`/api/v1/endpoints/${encodeURIComponent(agentId)}`, {
+      method: 'DELETE',
+    });
+  },
+
   async sendEndpointCommand(agentId, commandType, parameters = {}) {
     return await request(`/api/v1/endpoints/${encodeURIComponent(agentId)}/commands`, {
       method: 'POST',

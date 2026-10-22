@@ -1,5 +1,9 @@
 import React, { useState, useEffect, useCallback } from 'react';
-import { Radio, Monitor, Terminal, Info, RefreshCw, Zap, Activity, ShieldCheck, CheckCircle2, AlertCircle } from 'lucide-react';
+import { 
+  Radio, Monitor, Terminal, Info, RefreshCw, Zap, Activity, 
+  ShieldCheck, CheckCircle2, AlertCircle, Trash2, ShieldAlert, 
+  Skull, WifiOff, Wifi, UserX, AlertTriangle, Send 
+} from 'lucide-react';
 import { api } from '../api/client';
 import { OsBadge } from '../components/common/Badges';
 import { LoadingSkeleton } from '../components/common/LoadingSkeleton';
@@ -15,6 +19,19 @@ export function EndpointsPage({ incidents, onOpenSettings }) {
   const [activeModalAgent, setActiveModalAgent] = useState(null);
   const [commandHistory, setCommandHistory] = useState([]);
   const [isLoadingCommands, setIsLoadingCommands] = useState(false);
+
+  // Active Remediation State
+  const [remediateModalEndpoint, setRemediateModalEndpoint] = useState(null);
+  const [remediateAction, setRemediateAction] = useState('BLOCK_SOURCE');
+  const [remediateForm, setRemediateForm] = useState({
+    ip: '',
+    process_name: '',
+    process_id: '',
+    username: '',
+    simulate: true,
+    reason: 'Manual analyst containment via TGAM-SOC remediation console.'
+  });
+  const [isSubmittingRemediation, setIsSubmittingRemediation] = useState(false);
 
   const loadEndpoints = useCallback(async () => {
     setIsLoading(true);
@@ -120,6 +137,106 @@ export function EndpointsPage({ incidents, onOpenSettings }) {
     fetchCommandHistory(agentId);
   };
 
+  const openRemediateModal = (endpoint, initialAction = 'BLOCK_SOURCE', initialParams = {}) => {
+    setRemediateModalEndpoint(endpoint);
+    setRemediateAction(initialAction);
+    setRemediateForm({
+      ip: initialParams.ip || (endpoint.ip_address && endpoint.ip_address !== '127.0.0.1' ? endpoint.ip_address : ''),
+      process_name: initialParams.process_name || '',
+      process_id: initialParams.process_id || '',
+      username: initialParams.username || '',
+      simulate: initialParams.simulate !== undefined ? initialParams.simulate : true,
+      reason: initialParams.reason || 'Manual analyst containment via TGAM-SOC remediation console.'
+    });
+  };
+
+  const handleExecuteRemediation = async (e) => {
+    if (e && e.preventDefault) e.preventDefault();
+    if (!remediateModalEndpoint) return;
+    setIsSubmittingRemediation(true);
+    try {
+      const params = {
+        simulate: Boolean(remediateForm.simulate),
+        reason: remediateForm.reason
+      };
+
+      if (remediateAction === 'BLOCK_SOURCE' || remediateAction === 'UNBLOCK_SOURCE') {
+        if (!remediateForm.ip || !remediateForm.ip.trim()) {
+          throw new Error('Target IP address is required for BLOCK_SOURCE.');
+        }
+        params.ip = remediateForm.ip.trim();
+      } else if (remediateAction === 'KILL_PROCESS') {
+        if (!remediateForm.process_name && !remediateForm.process_id) {
+          throw new Error('Either Process Name or Process ID (PID) is required for KILL_PROCESS.');
+        }
+        if (remediateForm.process_id) params.process_id = parseInt(remediateForm.process_id, 10);
+        if (remediateForm.process_name) params.process_name = remediateForm.process_name.trim();
+      } else if (remediateAction === 'ISOLATE_HOST') {
+        params.preserve_soc_communication = true;
+      } else if (remediateAction === 'DISABLE_ACCOUNT') {
+        if (!remediateForm.username || !remediateForm.username.trim()) {
+          throw new Error('Target username is required for DISABLE_ACCOUNT.');
+        }
+        params.username = remediateForm.username.trim();
+      }
+
+      const agentId = remediateModalEndpoint.agent_id;
+      const res = await api.sendEndpointCommand(agentId, remediateAction, params);
+      setActionStatus({
+        type: 'success',
+        message: `Containment action [${remediateAction}] dispatched to ${agentId} (Command ID: ${res.command_id.slice(0, 8)}). Executing on next heartbeat!`
+      });
+      setRemediateModalEndpoint(null);
+      openCommandAuditModal(agentId);
+    } catch (err) {
+      setActionStatus({
+        type: 'error',
+        message: `Remediation dispatch failed: ${err.message}`
+      });
+    } finally {
+      setIsSubmittingRemediation(false);
+    }
+  };
+
+  const handleDeleteEndpoint = async (agentId) => {
+    try {
+      await api.deleteEndpoint(agentId);
+      setActionStatus({
+        type: 'success',
+        message: `Endpoint ${agentId} removed from registry.`
+      });
+      loadEndpoints();
+    } catch (err) {
+      setActionStatus({
+        type: 'error',
+        message: `Failed to remove endpoint: ${err.message}`
+      });
+    }
+  };
+
+  const handlePruneOffline = async () => {
+    const offline = endpoints.filter(ep => ep.status !== 'ONLINE');
+    if (offline.length === 0) return;
+    try {
+      setActionStatus({ type: 'info', message: `Pruning ${offline.length} offline test endpoint(s)...` });
+      for (const ep of offline) {
+        await api.deleteEndpoint(ep.agent_id);
+      }
+      setActionStatus({
+        type: 'success',
+        message: `Successfully pruned ${offline.length} stale endpoint(s). Fleet consolidated.`
+      });
+      loadEndpoints();
+    } catch (err) {
+      setActionStatus({
+        type: 'error',
+        message: `Pruning failed: ${err.message}`
+      });
+    }
+  };
+
+  const offlineCount = endpoints.filter(ep => ep.status !== 'ONLINE').length;
+
   return (
     <div className="space-y-6">
       {/* Scope and Boundary Notice */}
@@ -154,14 +271,27 @@ export function EndpointsPage({ incidents, onOpenSettings }) {
           </p>
         </div>
 
-        <button
-          onClick={loadEndpoints}
-          disabled={isLoading}
-          className="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-xs font-mono text-slate-200 border border-slate-600 flex items-center gap-1.5 transition"
-        >
-          <RefreshCw className={`w-3.5 h-3.5 ${isLoading ? 'animate-spin text-cyan-400' : ''}`} />
-          <span>Refresh Fleet</span>
-        </button>
+        <div className="flex items-center gap-2">
+          {offlineCount > 0 && (
+            <button
+              onClick={handlePruneOffline}
+              title="Remove inactive or old simulation test endpoints"
+              className="px-3 py-1.5 rounded-lg bg-rose-950/60 hover:bg-rose-900/80 text-xs font-mono text-rose-300 border border-rose-800/80 flex items-center gap-1.5 transition"
+            >
+              <Trash2 className="w-3.5 h-3.5 text-rose-400" />
+              <span>Prune Inactive ({offlineCount})</span>
+            </button>
+          )}
+
+          <button
+            onClick={loadEndpoints}
+            disabled={isLoading}
+            className="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-xs font-mono text-slate-200 border border-slate-600 flex items-center gap-1.5 transition"
+          >
+            <RefreshCw className={`w-3.5 h-3.5 ${isLoading ? 'animate-spin text-cyan-400' : ''}`} />
+            <span>Refresh Fleet</span>
+          </button>
+        </div>
       </div>
 
       {/* Architecture Scope Overview */}
@@ -272,40 +402,62 @@ export function EndpointsPage({ incidents, onOpenSettings }) {
                 )}
 
                 {/* Remote Management Action Buttons */}
-                <div className="pt-3 border-t border-slate-800 flex items-center justify-between gap-2">
-                  <div className="flex items-center gap-1.5">
-                    <button
-                      onClick={() => handleSendCommand(ep.agent_id, 'PING')}
-                      title="Send PING to verify latency"
-                      className="px-2 py-1 bg-slate-800 hover:bg-cyan-900/60 hover:text-cyan-300 text-[11px] font-mono text-slate-300 rounded border border-slate-700 flex items-center gap-1 transition"
-                    >
-                      <Zap className="w-3 h-3 text-cyan-400" />
-                      Ping
-                    </button>
-                    <button
-                      onClick={() => handleSendCommand(ep.agent_id, 'GET_HEALTH')}
-                      title="Query remote host resource health"
-                      className="px-2 py-1 bg-slate-800 hover:bg-emerald-900/60 hover:text-emerald-300 text-[11px] font-mono text-slate-300 rounded border border-slate-700 flex items-center gap-1 transition"
-                    >
-                      <Activity className="w-3 h-3 text-emerald-400" />
-                      Health
-                    </button>
-                    <button
-                      onClick={() => handleSendCommand(ep.agent_id, 'GET_STATUS')}
-                      title="Fetch agent runtime status"
-                      className="px-2 py-1 bg-slate-800 hover:bg-purple-900/60 hover:text-purple-300 text-[11px] font-mono text-slate-300 rounded border border-slate-700 flex items-center gap-1 transition"
-                    >
-                      <ShieldCheck className="w-3 h-3 text-purple-400" />
-                      Status
-                    </button>
+                <div className="pt-3 border-t border-slate-800 space-y-2">
+                  <div className="flex items-center justify-between gap-1.5">
+                    <div className="flex items-center gap-1">
+                      <button
+                        onClick={() => handleSendCommand(ep.agent_id, 'PING')}
+                        title="Send PING to verify latency"
+                        className="px-2 py-1 bg-slate-800 hover:bg-cyan-900/60 hover:text-cyan-300 text-[11px] font-mono text-slate-300 rounded border border-slate-700 flex items-center gap-1 transition"
+                      >
+                        <Zap className="w-3 h-3 text-cyan-400" />
+                        Ping
+                      </button>
+                      <button
+                        onClick={() => handleSendCommand(ep.agent_id, 'GET_HEALTH')}
+                        title="Query remote host resource health"
+                        className="px-2 py-1 bg-slate-800 hover:bg-emerald-900/60 hover:text-emerald-300 text-[11px] font-mono text-slate-300 rounded border border-slate-700 flex items-center gap-1 transition"
+                      >
+                        <Activity className="w-3 h-3 text-emerald-400" />
+                        Health
+                      </button>
+                      <button
+                        onClick={() => handleSendCommand(ep.agent_id, 'GET_STATUS')}
+                        title="Fetch agent runtime status"
+                        className="px-2 py-1 bg-slate-800 hover:bg-purple-900/60 hover:text-purple-300 text-[11px] font-mono text-slate-300 rounded border border-slate-700 flex items-center gap-1 transition"
+                      >
+                        <ShieldCheck className="w-3 h-3 text-purple-400" />
+                        Status
+                      </button>
+                    </div>
+
+                    <div className="flex items-center gap-1">
+                      <button
+                        onClick={() => openCommandAuditModal(ep.agent_id)}
+                        title="View command audit trail"
+                        className="px-2 py-1 hover:bg-slate-800 text-slate-400 hover:text-white rounded transition text-xs font-mono"
+                      >
+                        History
+                      </button>
+                      {!isOnline && (
+                        <button
+                          onClick={() => handleDeleteEndpoint(ep.agent_id)}
+                          title="Delete inactive test endpoint"
+                          className="p-1 hover:bg-rose-950/60 text-slate-500 hover:text-rose-400 rounded transition"
+                        >
+                          <Trash2 className="w-3.5 h-3.5" />
+                        </button>
+                      )}
+                    </div>
                   </div>
 
+                  {/* Active Analyst Remediation Trigger */}
                   <button
-                    onClick={() => openCommandAuditModal(ep.agent_id)}
-                    title="View command audit trail"
-                    className="p-1 hover:bg-slate-800 text-slate-400 hover:text-white rounded transition text-xs font-mono"
+                    onClick={() => openRemediateModal(ep)}
+                    className="w-full py-1.5 px-3 rounded-lg bg-rose-950/60 hover:bg-rose-900/80 border border-rose-800/70 hover:border-rose-600 text-rose-300 hover:text-white font-mono text-xs font-bold flex items-center justify-center gap-2 shadow-sm transition"
                   >
-                    History
+                    <ShieldAlert className="w-3.5 h-3.5 text-rose-400" />
+                    <span>Remediate Endpoint (Active Defense)</span>
                   </button>
                 </div>
               </div>
@@ -388,6 +540,221 @@ export function EndpointsPage({ incidents, onOpenSettings }) {
                 ))
               )}
             </div>
+          </div>
+        </div>
+      )}
+
+      {/* Active Defense Endpoint Containment Modal */}
+      {remediateModalEndpoint && (
+        <div className="fixed inset-0 bg-black/80 backdrop-blur-md z-50 flex items-center justify-center p-4">
+          <div className="bg-slate-900 border border-slate-700 rounded-xl w-full max-w-2xl max-h-[90vh] flex flex-col shadow-2xl overflow-hidden">
+            {/* Modal Header */}
+            <div className="p-4 border-b border-slate-800 bg-slate-950/80 flex items-center justify-between">
+              <div className="flex items-center gap-3">
+                <div className="p-2 rounded-lg bg-rose-950/80 border border-rose-800/80 text-rose-400">
+                  <ShieldAlert className="w-5 h-5" />
+                </div>
+                <div>
+                  <h3 className="text-sm font-bold text-white flex items-center gap-2">
+                    Active Endpoint Containment Console
+                  </h3>
+                  <p className="text-xs text-slate-400 font-mono">
+                    Host: <span className="text-cyan-300 font-bold">{remediateModalEndpoint.hostname}</span> • Agent ID: <span className="text-slate-300">{remediateModalEndpoint.agent_id}</span> • OS: <span className="text-amber-300">{remediateModalEndpoint.os}</span>
+                  </p>
+                </div>
+              </div>
+              <button
+                onClick={() => setRemediateModalEndpoint(null)}
+                className="text-slate-400 hover:text-white p-1 rounded"
+              >
+                ✕
+              </button>
+            </div>
+
+            {/* Modal Form Content */}
+            <form onSubmit={handleExecuteRemediation} className="p-5 overflow-y-auto space-y-5 flex-1 text-xs">
+              {/* Containment Action Selector */}
+              <div>
+                <label className="text-slate-300 font-semibold uppercase tracking-wider block mb-2 font-mono text-[11px]">
+                  Select Containment Action
+                </label>
+                <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
+                  {[
+                    { id: 'BLOCK_SOURCE', label: 'Block Attacker IP', icon: ShieldAlert, desc: 'Firewall drop rule' },
+                    { id: 'KILL_PROCESS', label: 'Kill Process', icon: Skull, desc: 'Terminate task by name/PID' },
+                    { id: 'ISOLATE_HOST', label: 'Isolate Host', icon: WifiOff, desc: 'Drop all traffic except SOC' },
+                    { id: 'RESTORE_HOST', label: 'Restore Network', icon: Wifi, desc: 'Remove isolation rules' },
+                    { id: 'DISABLE_ACCOUNT', label: 'Disable Account', icon: UserX, desc: 'Lock compromised user' },
+                    { id: 'UNBLOCK_SOURCE', label: 'Unblock IP', icon: CheckCircle2, desc: 'Remove firewall drop rule' },
+                  ].map((act) => {
+                    const IconComp = act.icon;
+                    const isSelected = remediateAction === act.id;
+                    return (
+                      <button
+                        type="button"
+                        key={act.id}
+                        onClick={() => setRemediateAction(act.id)}
+                        className={`p-3 rounded-lg border text-left flex flex-col justify-between transition ${
+                          isSelected
+                            ? 'bg-rose-950/60 border-rose-500 text-white shadow-md shadow-rose-950/50'
+                            : 'bg-slate-950/60 border-slate-800 text-slate-400 hover:border-slate-700 hover:text-slate-200'
+                        }`}
+                      >
+                        <div className="flex items-center gap-2 mb-1">
+                          <IconComp className={`w-4 h-4 ${isSelected ? 'text-rose-400' : 'text-slate-500'}`} />
+                          <span className="font-bold text-xs">{act.label}</span>
+                        </div>
+                        <span className="text-[10px] text-slate-500 leading-tight">{act.desc}</span>
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+
+              {/* Action Parameter Inputs */}
+              <div className="p-4 rounded-lg bg-slate-950 border border-slate-800 space-y-3 font-mono">
+                <span className="text-[11px] font-bold text-cyan-400 block uppercase">
+                  Action Parameters — {remediateAction}
+                </span>
+
+                {(remediateAction === 'BLOCK_SOURCE' || remediateAction === 'UNBLOCK_SOURCE') && (
+                  <div>
+                    <label className="block text-slate-300 text-[11px] mb-1">Target IP Address to Block *</label>
+                    <input
+                      type="text"
+                      required
+                      placeholder="e.g. 192.168.1.100 or 10.0.0.50"
+                      value={remediateForm.ip}
+                      onChange={(e) => setRemediateForm({ ...remediateForm, ip: e.target.value })}
+                      className="w-full px-3 py-2 bg-slate-900 border border-slate-700 rounded text-slate-200 focus:outline-none focus:border-rose-500 text-xs"
+                    />
+                    <p className="text-[10px] text-slate-500 mt-1">
+                      Windows Advanced Firewall will create an inbound rule TGAM-SOC-Block-[IP] dropping all packets.
+                    </p>
+                  </div>
+                )}
+
+                {remediateAction === 'KILL_PROCESS' && (
+                  <div className="space-y-3">
+                    <div>
+                      <label className="block text-slate-300 text-[11px] mb-1">Target Process Image Name</label>
+                      <input
+                        type="text"
+                        placeholder="e.g. mimikatz.exe, malware.exe, nc.exe"
+                        value={remediateForm.process_name}
+                        onChange={(e) => setRemediateForm({ ...remediateForm, process_name: e.target.value })}
+                        className="w-full px-3 py-2 bg-slate-900 border border-slate-700 rounded text-slate-200 focus:outline-none focus:border-rose-500 text-xs"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-slate-300 text-[11px] mb-1">OR Process ID (PID)</label>
+                      <input
+                        type="number"
+                        placeholder="e.g. 4832"
+                        value={remediateForm.process_id}
+                        onChange={(e) => setRemediateForm({ ...remediateForm, process_id: e.target.value })}
+                        className="w-full px-3 py-2 bg-slate-900 border border-slate-700 rounded text-slate-200 focus:outline-none focus:border-rose-500 text-xs"
+                      />
+                    </div>
+                    <div className="p-2.5 rounded bg-amber-950/30 border border-amber-800/40 text-[10px] text-amber-300 flex items-start gap-2">
+                      <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
+                      <span>Safety Guardrail: Protected OS processes (csrss.exe, lsass.exe, svchost.exe, PID &le; 4) are automatically blocked from termination.</span>
+                    </div>
+                  </div>
+                )}
+
+                {remediateAction === 'ISOLATE_HOST' && (
+                  <div className="p-3 rounded bg-blue-950/30 border border-blue-800/40 text-blue-200 text-xs space-y-1">
+                    <span className="font-bold flex items-center gap-1 text-cyan-300">
+                      <WifiOff className="w-4 h-4 text-cyan-400" /> Host Network Isolation Policy
+                    </span>
+                    <p className="text-[11px] text-slate-300">
+                      This command will configure endpoint firewalls to block all external network communications except outbound connections to the Central SOC Ingestion Server ({typeof window !== 'undefined' ? window.location.hostname : '127.0.0.1'}).
+                    </p>
+                  </div>
+                )}
+
+                {remediateAction === 'RESTORE_HOST' && (
+                  <div className="p-3 rounded bg-emerald-950/30 border border-emerald-800/40 text-emerald-200 text-xs space-y-1">
+                    <span className="font-bold flex items-center gap-1 text-emerald-300">
+                      <Wifi className="w-4 h-4 text-emerald-400" /> Host Network Restoration
+                    </span>
+                    <p className="text-[11px] text-slate-300">
+                      Removes isolation rules and restores normal inbound and outbound connectivity to this endpoint.
+                    </p>
+                  </div>
+                )}
+
+                {remediateAction === 'DISABLE_ACCOUNT' && (
+                  <div>
+                    <label className="block text-slate-300 text-[11px] mb-1">Target Account Username *</label>
+                    <input
+                      type="text"
+                      required
+                      placeholder="e.g. compromised_employee"
+                      value={remediateForm.username}
+                      onChange={(e) => setRemediateForm({ ...remediateForm, username: e.target.value })}
+                      className="w-full px-3 py-2 bg-slate-900 border border-slate-700 rounded text-slate-200 focus:outline-none focus:border-rose-500 text-xs"
+                    />
+                    <p className="text-[10px] text-slate-500 mt-1">
+                      Disables the specified user via net user &lt;username&gt; /active:no. Protected accounts (Administrator, Guest) are guarded.
+                    </p>
+                  </div>
+                )}
+              </div>
+
+              {/* Analyst Justification */}
+              <div>
+                <label className="block text-slate-300 font-semibold uppercase tracking-wider mb-1 font-mono text-[11px]">
+                  Analyst Rationale / Justification
+                </label>
+                <input
+                  type="text"
+                  value={remediateForm.reason}
+                  onChange={(e) => setRemediateForm({ ...remediateForm, reason: e.target.value })}
+                  placeholder="Reason for manual containment intervention..."
+                  className="w-full px-3 py-2 bg-slate-950 border border-slate-800 rounded text-slate-200 focus:outline-none focus:border-rose-500 font-mono text-xs"
+                />
+              </div>
+
+              {/* Simulation Mode Toggle */}
+              <div className="p-3 rounded-lg bg-slate-950 border border-slate-800 flex items-center justify-between">
+                <div>
+                  <span className="font-bold text-white block">Safe Simulation Mode (Dry Run)</span>
+                  <p className="text-[11px] text-slate-400">
+                    Agent calculates and logs the mitigation command without making destructive OS changes.
+                  </p>
+                </div>
+                <label className="relative inline-flex items-center cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={remediateForm.simulate}
+                    onChange={(e) => setRemediateForm({ ...remediateForm, simulate: e.target.checked })}
+                    className="sr-only peer"
+                  />
+                  <div className="w-11 h-6 bg-slate-700 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-rose-600"></div>
+                </label>
+              </div>
+
+              {/* Submit / Cancel Footer */}
+              <div className="pt-2 flex items-center justify-end gap-3 border-t border-slate-800">
+                <button
+                  type="button"
+                  onClick={() => setRemediateModalEndpoint(null)}
+                  className="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-slate-300 font-mono text-xs rounded-lg transition"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  disabled={isSubmittingRemediation}
+                  className="px-5 py-2 bg-gradient-to-r from-rose-600 to-rose-700 hover:from-rose-500 hover:to-rose-600 disabled:opacity-50 text-white font-mono text-xs font-bold rounded-lg shadow-lg shadow-rose-950/60 flex items-center gap-2 transition"
+                >
+                  <Send className="w-4 h-4" />
+                  {isSubmittingRemediation ? 'Dispatching...' : `Dispatch ${remediateAction} to Endpoint`}
+                </button>
+              </div>
+            </form>
           </div>
         </div>
       )}

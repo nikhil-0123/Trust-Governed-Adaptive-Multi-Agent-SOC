@@ -2,7 +2,7 @@ import React, { useState, useEffect, useCallback } from 'react';
 import { 
   Scale, ShieldCheck, ShieldAlert, History, Lock, 
   CheckCircle2, XCircle, RefreshCw, Terminal, AlertTriangle, 
-  Zap, Check, X, Clock
+  Zap, Check, X, Clock, Sliders, Send, Edit3
 } from 'lucide-react';
 import { api } from '../api/client';
 import { DecisionBadge, SeverityBadge, ApprovalStatusBadge, ActionBadge } from '../components/common/Badges';
@@ -36,6 +36,17 @@ export function GovernancePage({
     'Analyst determined recommended mitigation is not warranted for this incident.'
   );
 
+  // Parameter Customization Modal State
+  const [customizeModalRec, setCustomizeModalRec] = useState(null);
+  const [customizeForm, setCustomizeForm] = useState({
+    ip: '',
+    process_name: '',
+    process_id: '',
+    username: '',
+    simulate: true,
+    reason: ''
+  });
+
   const activeIncident = incidents.find(i => i.incident_id === selectedIncidentId) || incidents[0] || null;
 
   const loadGovernanceData = useCallback(async (incidentId) => {
@@ -67,22 +78,27 @@ export function GovernancePage({
   }, [activeIncident?.incident_id, loadGovernanceData]);
 
   // Handle mitigation approval (Human-in-the-Loop)
-  const handleApproveMitigation = async (specificAction = null) => {
+  const handleApproveMitigation = async (specificAction = null, customParams = null) => {
     if (!activeIncident) return;
     setIsApproving(true);
     setApprovalMessage(null);
     try {
-      const res = await api.approveGovernanceMitigation(activeIncident.incident_id, {
+      const payload = {
         action: specificAction,
         analyst_name: 'Lead SOC Analyst',
-        reason: specificAction 
+        reason: customParams?.reason || (specificAction 
           ? `Analyst approved specific action: ${specificAction}`
-          : 'Analyst authorized recommended containment action via TGAM-SOC console.'
-      });
+          : 'Analyst authorized recommended containment action via TGAM-SOC console.')
+      };
+      if (customParams) {
+        payload.custom_params = customParams;
+      }
+      const res = await api.approveGovernanceMitigation(activeIncident.incident_id, payload);
       setApprovalMessage({
         type: 'success',
         text: `Mitigation approved! Dispatched ${res.dispatched_count ?? (res.dispatched_commands?.length || 0)} command(s) to endpoint agent.`
       });
+      setCustomizeModalRec(null);
       // Refresh status
       const updatedGov = await api.getIncidentGovernance(activeIncident.incident_id);
       setGovernanceStatus(updatedGov);
@@ -94,6 +110,38 @@ export function GovernancePage({
     } finally {
       setIsApproving(false);
     }
+  };
+
+  const openCustomizeModal = (rec) => {
+    const actionType = rec.type || rec.action || 'CONTAINMENT';
+    setCustomizeModalRec(rec);
+    setCustomizeForm({
+      ip: rec.parameters?.ip || rec.ip || '',
+      process_name: rec.parameters?.process_name || rec.process_name || '',
+      process_id: rec.parameters?.process_id || rec.process_id || '',
+      username: rec.parameters?.username || rec.username || '',
+      simulate: true,
+      reason: `Analyst-authorized mitigation of ${actionType} with verified parameters.`
+    });
+  };
+
+  const handleExecuteCustomizedApproval = async (e) => {
+    if (e && e.preventDefault) e.preventDefault();
+    if (!customizeModalRec) return;
+    const actionType = customizeModalRec.type || customizeModalRec.action || 'CONTAINMENT';
+    const params = {
+      simulate: Boolean(customizeForm.simulate),
+      reason: customizeForm.reason
+    };
+    if (actionType.includes('BLOCK')) {
+      if (customizeForm.ip) params.ip = customizeForm.ip.trim();
+    } else if (actionType.includes('PROCESS')) {
+      if (customizeForm.process_id) params.process_id = parseInt(customizeForm.process_id, 10);
+      if (customizeForm.process_name) params.process_name = customizeForm.process_name.trim();
+    } else if (actionType.includes('ACCOUNT')) {
+      if (customizeForm.username) params.username = customizeForm.username.trim();
+    }
+    await handleApproveMitigation(actionType, params);
   };
 
   // Handle mitigation rejection
@@ -427,11 +475,26 @@ export function GovernancePage({
             )}
 
             {approvalStatus === 'AUTO_APPROVED' && (
-              <div className="p-4 rounded-xl bg-cyan-950/20 border border-cyan-600/30 flex items-center gap-3">
-                <Zap className="w-5 h-5 text-cyan-400 shrink-0" />
-                <div className="text-xs font-mono text-cyan-200">
-                  <span className="font-bold text-white block">Autonomous Execution (Zero Latency)</span>
-                  High trust / low risk threshold satisfied. Commands were automatically dispatched to endpoints without delay.
+              <div className="p-4 rounded-xl bg-gradient-to-r from-cyan-950/40 via-teal-950/30 to-slate-900 border border-cyan-500/50 shadow-lg shadow-cyan-950/50 space-y-2">
+                <div className="flex items-center justify-between">
+                  <div className="flex items-center gap-2">
+                    <span className="p-1 rounded bg-cyan-950 border border-cyan-500/60 text-cyan-400 animate-pulse">
+                      <Zap className="w-4 h-4" />
+                    </span>
+                    <span className="text-xs font-mono font-bold text-white tracking-wide uppercase">
+                      Zero-Latency Autonomous Closed-Loop Response Executed
+                    </span>
+                  </div>
+                  <span className="px-2 py-0.5 rounded text-[10px] font-mono font-bold bg-cyan-950 text-cyan-300 border border-cyan-500/60">
+                    ⚡ AUTONOMOUS POLICY SATISFIED
+                  </span>
+                </div>
+                <p className="text-xs text-slate-300 leading-relaxed font-mono">
+                  Trust Score &ge; 80%, Risk &le; 40%, and Severity &le; Medium. In accordance with TGAM-SOC policy, containment was automatically authorized and dispatched to endpoint heartbeat queues with 0ms analyst delay.
+                </p>
+                <div className="text-[11px] font-mono text-cyan-300 pt-1 border-t border-cyan-900/50 flex items-center justify-between">
+                  <span>Dispatched Actions: {dispatchedCommands.length} command(s) active</span>
+                  <span>Execution Target: Agent Heartbeat Beacon (every 15s)</span>
                 </div>
               </div>
             )}
@@ -461,14 +524,24 @@ export function GovernancePage({
                         <div className="flex items-center justify-between">
                           <ActionBadge action={actionType} />
                           {approvalStatus === 'PENDING' && (
-                            <button
-                              onClick={() => handleApproveMitigation(actionType)}
-                              disabled={isApproving}
-                              className="px-2 py-1 text-[11px] font-mono text-emerald-300 hover:text-white bg-emerald-950/60 hover:bg-emerald-900/60 border border-emerald-800/60 rounded transition flex items-center gap-1"
-                            >
-                              <Check className="w-3 h-3" />
-                              Approve Only
-                            </button>
+                            <div className="flex items-center gap-1.5">
+                              <button
+                                onClick={() => openCustomizeModal(rec)}
+                                disabled={isApproving}
+                                className="px-2 py-1 text-[11px] font-mono text-cyan-300 hover:text-white bg-cyan-950/60 hover:bg-cyan-900/60 border border-cyan-800/60 rounded transition flex items-center gap-1"
+                              >
+                                <Sliders className="w-3 h-3 text-cyan-400" />
+                                Customize
+                              </button>
+                              <button
+                                onClick={() => handleApproveMitigation(actionType)}
+                                disabled={isApproving}
+                                className="px-2 py-1 text-[11px] font-mono text-emerald-300 hover:text-white bg-emerald-950/60 hover:bg-emerald-900/60 border border-emerald-800/60 rounded transition flex items-center gap-1"
+                              >
+                                <Check className="w-3 h-3 text-emerald-400" />
+                                Approve
+                              </button>
+                            </div>
                           )}
                         </div>
                         <p className="text-xs text-slate-300 font-mono leading-relaxed">
@@ -688,6 +761,157 @@ export function GovernancePage({
                 {isRejecting ? 'Rejecting...' : 'Confirm Rejection'}
               </button>
             </div>
+          </div>
+        </div>
+      )}
+
+      {/* Customize Mitigation Parameters Modal */}
+      {customizeModalRec && (
+        <div className="fixed inset-0 bg-black/80 backdrop-blur-md z-50 flex items-center justify-center p-4">
+          <div className="bg-slate-900 border border-slate-700 rounded-xl w-full max-w-lg shadow-2xl overflow-hidden">
+            <div className="p-4 border-b border-slate-800 bg-slate-950 flex items-center justify-between">
+              <div className="flex items-center gap-2.5">
+                <Sliders className="w-5 h-5 text-cyan-400" />
+                <div>
+                  <h3 className="text-sm font-bold text-white">
+                    Customize Mitigation Parameters
+                  </h3>
+                  <p className="text-[11px] text-slate-400 font-mono">
+                    Tailor containment arguments before human authorization dispatch
+                  </p>
+                </div>
+              </div>
+              <button
+                onClick={() => setCustomizeModalRec(null)}
+                className="text-slate-400 hover:text-white text-xs p-1"
+              >
+                ✕
+              </button>
+            </div>
+
+            <form onSubmit={handleExecuteCustomizedApproval} className="p-5 space-y-4 text-xs font-mono">
+              <div className="p-3 rounded-lg bg-slate-950 border border-slate-800 space-y-1">
+                <div className="flex justify-between items-center">
+                  <span className="text-slate-500 uppercase text-[10px]">RECOMMENDED STRATEGY:</span>
+                  <ActionBadge action={customizeModalRec.type || customizeModalRec.action || 'CONTAINMENT'} />
+                </div>
+                <p className="text-[11px] text-slate-300 pt-1">
+                  {customizeModalRec.reason || 'Reasoning engine proposed this containment.'}
+                </p>
+              </div>
+
+              {/* Parameter Inputs Based on Action Type */}
+              <div className="space-y-3">
+                {(customizeModalRec.type || customizeModalRec.action || '').toUpperCase().includes('BLOCK') && (
+                  <div>
+                    <label className="block text-slate-300 font-semibold mb-1 text-[11px]">
+                      Target Attacker IP Address *
+                    </label>
+                    <input
+                      type="text"
+                      required
+                      value={customizeForm.ip}
+                      onChange={(e) => setCustomizeForm({ ...customizeForm, ip: e.target.value })}
+                      placeholder="e.g. 192.168.1.100"
+                      className="w-full px-3 py-2 bg-slate-950 border border-slate-700 rounded text-slate-200 focus:outline-none focus:border-cyan-500 text-xs"
+                    />
+                  </div>
+                )}
+
+                {(customizeModalRec.type || customizeModalRec.action || '').toUpperCase().includes('PROCESS') && (
+                  <div className="space-y-2">
+                    <div>
+                      <label className="block text-slate-300 font-semibold mb-1 text-[11px]">
+                        Target Process Name
+                      </label>
+                      <input
+                        type="text"
+                        value={customizeForm.process_name}
+                        onChange={(e) => setCustomizeForm({ ...customizeForm, process_name: e.target.value })}
+                        placeholder="e.g. mimikatz.exe"
+                        className="w-full px-3 py-2 bg-slate-950 border border-slate-700 rounded text-slate-200 focus:outline-none focus:border-cyan-500 text-xs"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-slate-300 font-semibold mb-1 text-[11px]">
+                        OR Target Process PID
+                      </label>
+                      <input
+                        type="number"
+                        value={customizeForm.process_id}
+                        onChange={(e) => setCustomizeForm({ ...customizeForm, process_id: e.target.value })}
+                        placeholder="e.g. 4832"
+                        className="w-full px-3 py-2 bg-slate-950 border border-slate-700 rounded text-slate-200 focus:outline-none focus:border-cyan-500 text-xs"
+                      />
+                    </div>
+                  </div>
+                )}
+
+                {(customizeModalRec.type || customizeModalRec.action || '').toUpperCase().includes('ACCOUNT') && (
+                  <div>
+                    <label className="block text-slate-300 font-semibold mb-1 text-[11px]">
+                      Target Account Username *
+                    </label>
+                    <input
+                      type="text"
+                      required
+                      value={customizeForm.username}
+                      onChange={(e) => setCustomizeForm({ ...customizeForm, username: e.target.value })}
+                      placeholder="e.g. compromised_user"
+                      className="w-full px-3 py-2 bg-slate-950 border border-slate-700 rounded text-slate-200 focus:outline-none focus:border-cyan-500 text-xs"
+                    />
+                  </div>
+                )}
+
+                <div>
+                  <label className="block text-slate-300 font-semibold mb-1 text-[11px]">
+                    Analyst Authorization Note
+                  </label>
+                  <input
+                    type="text"
+                    required
+                    value={customizeForm.reason}
+                    onChange={(e) => setCustomizeForm({ ...customizeForm, reason: e.target.value })}
+                    className="w-full px-3 py-2 bg-slate-950 border border-slate-700 rounded text-slate-200 focus:outline-none focus:border-cyan-500 text-xs"
+                  />
+                </div>
+
+                {/* Safe Simulation Mode Toggle */}
+                <div className="p-3 rounded-lg bg-slate-950 border border-slate-800 flex items-center justify-between">
+                  <div>
+                    <span className="font-bold text-white block">Safe Simulation Mode</span>
+                    <span className="text-[10px] text-slate-400">Validate mitigation in telemetry audit log without modifying OS</span>
+                  </div>
+                  <label className="relative inline-flex items-center cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={customizeForm.simulate}
+                      onChange={(e) => setCustomizeForm({ ...customizeForm, simulate: e.target.checked })}
+                      className="sr-only peer"
+                    />
+                    <div className="w-11 h-6 bg-slate-700 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-cyan-600"></div>
+                  </label>
+                </div>
+              </div>
+
+              <div className="pt-2 flex items-center justify-end gap-2 border-t border-slate-800">
+                <button
+                  type="button"
+                  onClick={() => setCustomizeModalRec(null)}
+                  className="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded text-xs transition"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  disabled={isApproving}
+                  className="px-4 py-1.5 bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 hover:to-teal-500 disabled:opacity-50 text-white font-bold rounded text-xs flex items-center gap-1.5 transition"
+                >
+                  <Check className="w-3.5 h-3.5" />
+                  {isApproving ? 'Authorizing...' : 'Authorize & Dispatch'}
+                </button>
+              </div>
+            </form>
           </div>
         </div>
       )}

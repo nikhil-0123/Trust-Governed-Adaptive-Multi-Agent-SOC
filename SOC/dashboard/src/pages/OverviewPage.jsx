@@ -1,5 +1,5 @@
 import React from 'react';
-import { AlertOctagon, ShieldCheck, AlertTriangle, Activity, ArrowRight, ExternalLink, Shield } from 'lucide-react';
+import { AlertOctagon, ShieldCheck, AlertTriangle, Activity, ArrowRight, ExternalLink, Shield, Zap, Clock, CheckCircle2 } from 'lucide-react';
 import { MetricCard } from '../components/common/MetricCard';
 import { SeverityBadge, StatusBadge } from '../components/common/Badges';
 import { SeverityPieChart } from '../components/charts/SeverityPieChart';
@@ -37,6 +37,8 @@ export function OverviewPage({
   const openCount = incidents.filter(i => (i.status || '').toUpperCase() === 'OPEN').length;
   const assessedCount = incidents.filter(i => Boolean(i.latest_assessment_id)).length;
   const analyzedCount = incidents.filter(i => Boolean(i.latest_analysis_id)).length;
+  const autoMitigatedCount = incidents.filter(i => (i.approval_status || '').toUpperCase() === 'AUTO_APPROVED').length;
+  const pendingHumanCount = incidents.filter(i => (i.approval_status || '').toUpperCase() === 'PENDING').length;
 
   const recentIncidents = [...incidents].slice(0, 6);
 
@@ -46,7 +48,7 @@ export function OverviewPage({
       <ResponseSafetyNotice />
 
       {/* KPI Cards Row */}
-      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-4">
         <MetricCard
           title="Total Incidents"
           value={totalCount}
@@ -74,6 +76,13 @@ export function OverviewPage({
           subtitle={`${assessedCount} assessed with Trust/Risk`}
           icon={ShieldCheck}
           color="emerald"
+        />
+        <MetricCard
+          title="Autonomous Mitigations"
+          value={autoMitigatedCount}
+          subtitle={`${pendingHumanCount} awaiting human review`}
+          icon={Zap}
+          color="cyan"
         />
       </div>
 
@@ -142,12 +151,29 @@ export function OverviewPage({
                     className="py-3 px-2 flex items-center justify-between hover:bg-slate-800/40 rounded-lg cursor-pointer transition group"
                   >
                     <div className="space-y-1">
-                      <div className="flex items-center gap-2.5">
+                      <div className="flex flex-wrap items-center gap-2">
                         <span className="font-mono text-xs font-semibold text-cyan-300 group-hover:text-cyan-200">
                           {inc.incident_id}
                         </span>
                         <SeverityBadge severity={inc.max_severity} />
                         <StatusBadge status={inc.status} />
+
+                        {inc.approval_status === 'AUTO_APPROVED' ? (
+                          <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-mono font-bold bg-cyan-950/80 text-cyan-300 border border-cyan-500/50 shadow-sm shadow-cyan-500/20">
+                            <Zap className="w-3 h-3 text-cyan-400" />
+                            <span>⚡ AUTO-MITIGATED{inc.dispatched_command_types?.length ? `: ${inc.dispatched_command_types[0]}` : ''}</span>
+                          </span>
+                        ) : inc.approval_status === 'PENDING' ? (
+                          <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-mono font-bold bg-amber-950/80 text-amber-300 border border-amber-500/50 shadow-sm shadow-amber-500/20 animate-pulse">
+                            <Clock className="w-3 h-3 text-amber-400" />
+                            <span>⏳ PENDING HUMAN REVIEW</span>
+                          </span>
+                        ) : inc.approval_status === 'APPROVED' ? (
+                          <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-mono font-bold bg-emerald-950/80 text-emerald-300 border border-emerald-500/50">
+                            <CheckCircle2 className="w-3 h-3 text-emerald-400" />
+                            <span>✓ ANALYST MITIGATED</span>
+                          </span>
+                        ) : null}
                       </div>
                       <div className="text-[11px] text-slate-400 font-mono flex items-center gap-3">
                         <span>First: {new Date(inc.first_seen).toLocaleString()}</span>
