@@ -289,11 +289,14 @@ class ReasoningWorker(threading.Thread):
         for claim in accepted_claims:
             try:
                 v_input = VerificationInput(
-                    claim=claim,
                     incident_id=incident_id,
-                    evidence=evidence_list
+                    assessment_id=assessment_id,
+                    claim=claim,
+                    evidence=evidence_list,
+                    authoritative_mitre_context=auth_mitre,
+                    assessment_snapshot=assessment_snapshot
                 )
-                res = self.verification_agent.verify_claim(v_input)
+                res = self.verification_agent.verify_claim(v_input, conn)
                 verification_results.append(res)
             except VerificationAgentParsingError:
                 # Per-claim parsing failure -> mark unsupported gracefully

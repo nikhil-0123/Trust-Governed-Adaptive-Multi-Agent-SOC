@@ -114,20 +114,45 @@ import json
 
 @app.get("/api/v1/incidents", response_model=List[Incident])
 def get_incidents(token: str = Depends(verify_token), db: sqlite3.Connection = Depends(get_db)):
-    cursor = db.execute("SELECT * FROM incidents ORDER BY updated_at DESC LIMIT 100")
+    cursor = db.execute("""
+        SELECT i.*, 
+               gs.approval_status,
+               gd.decision as governance_decision
+        FROM incidents i
+        LEFT JOIN governance_state gs ON i.incident_id = gs.incident_id
+        LEFT JOIN governance_decisions gd ON gs.decision_id = gd.decision_id
+        ORDER BY i.updated_at DESC LIMIT 100
+    """)
     incidents = []
-    for row in cursor.fetchall():
+    rows = cursor.fetchall()
+    for row in rows:
         d = dict(row)
+        inc_id = d["incident_id"]
+        cmds = db.execute("SELECT command_type FROM endpoint_commands WHERE parameters LIKE ?", (f'%"{inc_id}"%',)).fetchall()
+        d["mitigation_dispatched_count"] = len(cmds)
+        d["dispatched_command_types"] = [c["command_type"].upper() for c in cmds]
         incidents.append(Incident(**d))
     return incidents
 
 @app.get("/api/v1/incidents/{incident_id}", response_model=Incident)
 def get_incident(incident_id: str, token: str = Depends(verify_token), db: sqlite3.Connection = Depends(get_db)):
-    cursor = db.execute("SELECT * FROM incidents WHERE incident_id = ?", (incident_id,))
+    cursor = db.execute("""
+        SELECT i.*, 
+               gs.approval_status,
+               gd.decision as governance_decision
+        FROM incidents i
+        LEFT JOIN governance_state gs ON i.incident_id = gs.incident_id
+        LEFT JOIN governance_decisions gd ON gs.decision_id = gd.decision_id
+        WHERE i.incident_id = ?
+    """, (incident_id,))
     row = cursor.fetchone()
     if not row:
         raise HTTPException(status_code=404, detail="Incident not found")
-    return Incident(**dict(row))
+    d = dict(row)
+    cmds = db.execute("SELECT command_type FROM endpoint_commands WHERE parameters LIKE ?", (f'%"{incident_id}"%',)).fetchall()
+    d["mitigation_dispatched_count"] = len(cmds)
+    d["dispatched_command_types"] = [c["command_type"].upper() for c in cmds]
+    return Incident(**d)
 
 @app.get("/api/v1/incidents/{incident_id}/evidence", response_model=List[DetectionEvent])
 def get_incident_evidence(incident_id: str, token: str = Depends(verify_token), db: sqlite3.Connection = Depends(get_db)):
@@ -519,6 +544,21 @@ def list_endpoints(
 
         endpoints.append(EndpointInfo(**d))
     return endpoints
+
+
+@app.delete("/api/v1/endpoints/{agent_id}")
+def delete_endpoint(
+    agent_id: str,
+    token: str = Depends(verify_token),
+    db: sqlite3.Connection = Depends(get_db)
+):
+    # Clean up associated commands first to satisfy foreign keys
+    db.execute("DELETE FROM endpoint_commands WHERE agent_id = ?", (agent_id,))
+    cursor = db.execute("DELETE FROM endpoints WHERE agent_id = ?", (agent_id,))
+    if cursor.rowcount == 0:
+        raise HTTPException(status_code=404, detail="Endpoint agent not found")
+    db.commit()
+    return {"acknowledged": True, "agent_id": agent_id, "deleted": True}
 
 
 @app.post("/api/v1/endpoints/{agent_id}/commands", response_model=EndpointCommand, status_code=status.HTTP_201_CREATED)

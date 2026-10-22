@@ -34,6 +34,11 @@ class Incident(BaseModel):
     status: str
     latest_assessment_id: Optional[str] = None
     latest_analysis_id: Optional[str] = None
+    # Enriched Governance & Response Status for real-time dashboard presentation
+    governance_decision: Optional[str] = None
+    approval_status: Optional[str] = None
+    mitigation_dispatched_count: Optional[int] = 0
+    dispatched_command_types: Optional[List[str]] = Field(default_factory=list)
 
 class ThreatContext(BaseModel):
     context_id: str

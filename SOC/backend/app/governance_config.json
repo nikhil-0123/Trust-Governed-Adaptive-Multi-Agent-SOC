@@ -4,7 +4,7 @@
     "config_version": "v1.0",
     "trust_policy": {
         "global_reject_max_trust_threshold": 0.2,
-        "auto_approve_min_trust": 0.8
+        "auto_approve_min_trust": 0.35
     },
     "risk_policy": {
         "global_reject_min_risk_threshold": 0.9,
@@ -27,12 +27,13 @@
         "ISOLATE_HOST",
         "BLOCK_SOURCE",
         "DISABLE_ACCOUNT",
+        "KILL_PROCESS",
         "NO_ACTION",
         "COLLECT_MORE_EVIDENCE"
     ],
     "mitre_restrictions": {
-        "Exfiltration": ["ISOLATE_HOST", "DISABLE_ACCOUNT", "BLOCK_SOURCE"],
-        "Execution": ["ISOLATE_HOST", "DISABLE_ACCOUNT", "BLOCK_SOURCE"]
+        "Exfiltration": ["ISOLATE_HOST", "DISABLE_ACCOUNT", "BLOCK_SOURCE", "KILL_PROCESS"],
+        "Execution": ["ISOLATE_HOST", "DISABLE_ACCOUNT", "BLOCK_SOURCE", "KILL_PROCESS"]
     },
     "confidence_threshold": {
         "auto_approve_min_confidence": 0.8

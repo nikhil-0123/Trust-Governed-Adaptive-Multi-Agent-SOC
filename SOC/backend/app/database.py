@@ -2,7 +2,7 @@ import sqlite3
 import os
 import contextlib
 
-DB_PATH = os.getenv("SOC_DB_PATH", "soc_central.db")
+DB_PATH = os.getenv("SOC_DB_PATH", os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "soc_central.db"))
 
 def init_db():
     conn = sqlite3.connect(DB_PATH)
