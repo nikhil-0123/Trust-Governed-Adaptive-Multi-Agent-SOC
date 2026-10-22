@@ -35,6 +35,9 @@ Desktop.ini
 *.db
 *.sqlite
 *.sqlite3
+*.db-journal
+*.db-wal
+*.db-shm
 
 # Agent runtime logs and pid files
 *.log
