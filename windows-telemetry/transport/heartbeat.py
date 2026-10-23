@@ -43,15 +43,16 @@ class HeartbeatWorker(threading.Thread):
         self.heartbeat_interval = heartbeat_interval
         self._stop_event = threading.Event()
         self._start_time = time.time()
+        self._first_heartbeat_sent = False
         self.executor = WindowsResponseExecutor(soc_base_url=self.base_url, logger=self.logger)
 
     def run(self):
-        self.logger.info(f"HeartbeatWorker started for agent {self.agent_id} (interval={self.heartbeat_interval}s).")
+        self.logger.info(f"HeartbeatWorker started for agent {self.agent_id} targeting {self.base_url} (interval={self.heartbeat_interval}s).")
         while not self._stop_event.is_set():
             try:
                 self._send_heartbeat()
             except Exception as e:
-                self.logger.debug(f"Heartbeat check failed: {e}")
+                self.logger.warning(f"Heartbeat check failed: {e}")
             self._stop_event.wait(self.heartbeat_interval)
         self.logger.info("HeartbeatWorker stopped.")
 
@@ -93,12 +94,15 @@ class HeartbeatWorker(threading.Thread):
         try:
             with urllib.request.urlopen(req, timeout=5.0) as resp:
                 if resp.status == 200:
+                    if not self._first_heartbeat_sent:
+                        self.logger.info(f"Heartbeat successfully registered with Central SOC at {url}.")
+                        self._first_heartbeat_sent = True
                     body = json.loads(resp.read().decode("utf-8"))
                     commands = body.get("commands", [])
                     for cmd in commands:
                         self._handle_command(cmd)
         except Exception as e:
-            self.logger.debug(f"Heartbeat dispatch failed to {url}: {e}")
+            self.logger.warning(f"Heartbeat dispatch failed to {url}: {e}")
 
     def _handle_command(self, cmd: Dict[str, Any]):
         cmd_id = cmd.get("command_id")
