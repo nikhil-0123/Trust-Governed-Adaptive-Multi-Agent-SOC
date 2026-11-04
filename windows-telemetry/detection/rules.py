@@ -1,5 +1,6 @@
 from typing import Dict, Any, Optional
 from datetime import datetime, timedelta
+import re
 from .models import DetectionResult
 
 class BruteForceRule:
@@ -9,21 +10,40 @@ class BruteForceRule:
         self.window_seconds = 60
         self.state = {}
 
+    def _cleanup_stale_keys(self, current_time: datetime, active_key: Optional[tuple] = None):
+        """
+        Prunes inactive keys from state memory whose events and duplicate-alert suppression
+        windows are older than cutoff relative to current_time.
+        """
+        cutoff = current_time - timedelta(seconds=self.window_seconds)
+        stale_keys = []
+        for key, group_state in self.state.items():
+            if key == active_key:
+                continue
+            # Filter events older than cutoff
+            group_state["events"] = [(t, eid) for t, eid in group_state["events"] if t >= cutoff]
+            last_alert = group_state.get("last_alert_time")
+            # If no active events remain and no active alert suppression remains, key is stale
+            if not group_state["events"] and (last_alert is None or last_alert < cutoff):
+                stale_keys.append(key)
+        for key in stale_keys:
+            del self.state[key]
+
     def evaluate(self, normalized_event: Dict[str, Any]) -> Optional[DetectionResult]:
         evidence = normalized_event.get("evidence", {})
-        
+
         # Only process Windows Event ID 4625 (Failed Logon)
         if evidence.get("windows_event_id") != 4625:
             return None
-            
+
         username = normalized_event.get("username")
         if not username:
             # Cannot group safely without a username
             return None
-            
+
         source_ip = normalized_event.get("source_ip")
         group_key = (username, source_ip)
-        
+
         timestamp_str = normalized_event.get("timestamp")
         try:
             if timestamp_str.endswith('Z'):
@@ -32,23 +52,37 @@ class BruteForceRule:
         except (ValueError, TypeError, AttributeError) as e:
             raise ValueError(f"Invalid timestamp in event: {timestamp_str}") from e
 
+        # Clean up stale keys from other groups
+        self._cleanup_stale_keys(current_time, active_key=group_key)
+
         group_state = self.state.setdefault(group_key, {"events": [], "last_alert_time": None})
         events = group_state["events"]
-        
+
         event_id = normalized_event.get("event_id")
+
+        # Check for repeated events with the same event_id to prevent duplicate counting
+        if event_id and any(eid == event_id for _, eid in events):
+            return None
+
         events.append((current_time, event_id))
-        
-        cutoff = current_time - timedelta(seconds=self.window_seconds)
+
+        # Sort events by timestamp to reliably handle out-of-order event arrivals
+        events.sort(key=lambda x: x[0])
+
+        # Group reference time is the latest timestamp observed in the group
+        group_ref_time = max(current_time, events[-1][0])
+        cutoff = group_ref_time - timedelta(seconds=self.window_seconds)
+
         # Keep events within the window (>= cutoff)
         group_state["events"] = [(t, eid) for t, eid in events if t >= cutoff]
-        
+
         if len(group_state["events"]) >= self.failure_threshold:
             last_alert = group_state["last_alert_time"]
-            
+
             # Suppress duplicate alerts in the same sliding window
             if last_alert is None or last_alert < cutoff:
                 group_state["last_alert_time"] = current_time
-                
+
                 result_evidence = {
                     "windows_event_id": 4625,
                     "failure_count": len(group_state["events"]),
@@ -57,10 +91,10 @@ class BruteForceRule:
                     "username": username,
                     "related_event_ids": [eid for t, eid in group_state["events"]]
                 }
-                
+
                 if source_ip is not None:
                     result_evidence["source_ip"] = source_ip
-                    
+
                 return DetectionResult(
                     detected=True,
                     detection_type=self.name,
@@ -70,14 +104,12 @@ class BruteForceRule:
                     source_event_id=event_id,
                     evidence=result_evidence
                 )
-                
+
         return None
 
     def reset_state(self):
         self.state.clear()
 
-
-import re
 
 def _extract_cmd_line(normalized_event: Dict[str, Any]) -> str:
     evidence = normalized_event.get("evidence", {})
@@ -267,4 +299,3 @@ class DefenseEvasionRule:
                     evidence=evidence
                 )
         return None
-

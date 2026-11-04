@@ -41,15 +41,47 @@ class Settings:
         default_data_dir = os.path.join(os.path.expanduser("~"), ".tgam_soc", "telemetry")
         self.data_dir = os.getenv("DATA_DIR", default_data_dir)
 
-        default_checkpoint_dir = os.path.join(self.data_dir, "state")
-        self.checkpoint_dir = os.getenv("WINDOWS_CHECKPOINT_DIR", default_checkpoint_dir)
-        
-        # Step 5: Detection Output
-        default_detection_output_dir = os.path.join(self.data_dir, "detections")
-        self.detection_output_dir = os.getenv("DETECTION_OUTPUT_DIR", default_detection_output_dir)
+        # Internal backing attributes for dynamically resolved directory paths
+        self._checkpoint_dir = os.getenv("WINDOWS_CHECKPOINT_DIR")
+        self._detection_output_dir = os.getenv("DETECTION_OUTPUT_DIR")
+        self._outbox_db_path = os.getenv("OUTBOX_DB_PATH")
+
         # Step 6: Central SOC Transport
         self.soc_api_url = os.getenv("SOC_API_URL", "http://127.0.0.1:8000/api/v1/detection-events")
         self.soc_api_token = os.getenv("SOC_API_TOKEN", "dev-token-123")
-        self.outbox_db_path = os.getenv("OUTBOX_DB_PATH", os.path.join(self.data_dir, "outbox.db"))
+        self.medium_confidence_threshold = float(os.getenv("MEDIUM_CONFIDENCE_THRESHOLD", "0.8"))
+
+    @property
+    def checkpoint_dir(self) -> str:
+        return self._checkpoint_dir or os.path.join(self.data_dir, "state")
+
+    @checkpoint_dir.setter
+    def checkpoint_dir(self, value: str):
+        self._checkpoint_dir = value
+
+    @property
+    def detection_output_dir(self) -> str:
+        return self._detection_output_dir or os.path.join(self.data_dir, "detections")
+
+    @detection_output_dir.setter
+    def detection_output_dir(self, value: str):
+        self._detection_output_dir = value
+
+    @property
+    def outbox_db_path(self) -> str:
+        return self._outbox_db_path or os.path.join(self.data_dir, "outbox.db")
+
+    @outbox_db_path.setter
+    def outbox_db_path(self, value: str):
+        self._outbox_db_path = value
+
+    def ensure_directories(self):
+        """Explicitly provisions required application directories without side effects during initialization."""
+        os.makedirs(self.data_dir, exist_ok=True)
+        os.makedirs(self.checkpoint_dir, exist_ok=True)
+        os.makedirs(self.detection_output_dir, exist_ok=True)
+        outbox_dir = os.path.dirname(os.path.abspath(self.outbox_db_path))
+        if outbox_dir:
+            os.makedirs(outbox_dir, exist_ok=True)
 
 config = Settings()

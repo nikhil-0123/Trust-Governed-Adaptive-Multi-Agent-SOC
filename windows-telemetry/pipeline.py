@@ -26,7 +26,7 @@ class WindowsDetectionPipeline:
         self.engine = DetectionEngine(logger)
         self.writer = DetectionEventWriter(config.detection_output_dir, logger)
         self.collector = WindowsEventCollector(logger)
-        
+
         self.outbox = Outbox(config.outbox_db_path, logger)
         self.client = TransportClient(config.soc_api_url, config.soc_api_token, logger)
         self.delivery_manager = DeliveryManager(self.outbox, self.client, logger)
@@ -47,26 +47,27 @@ class WindowsDetectionPipeline:
         )
 
     def initialize(self):
+        config.ensure_directories()
         self.collector.initialize()
         self.delivery_worker.start()
         self.heartbeat_worker.start()
-        
+
     def process_batch(self):
         raw_events = self.collector.collect_once()
         if not raw_events:
             return
-            
+
         last_successful_record_id = -1
-        
+
         for raw_event in raw_events:
             record_id = raw_event.get("record_id", -1)
             try:
                 # 1. Normalize
                 normalized_event = self.normalizer.normalize(raw_event)
-                
+
                 # 2. Detect
                 results = self.engine.process_event(normalized_event)
-                
+
                 # 3. Build & Write
                 for result in results:
                     detection_event = DetectionEventBuilder.build(normalized_event, result)
@@ -77,16 +78,16 @@ class WindowsDetectionPipeline:
                         event_dict = dataclasses.asdict(detection_event)
                         if ImportantEventFilter.should_forward(event_dict):
                             self.outbox.add_event(event_dict)
-                        
+
                 # 4. Checkpoint success marking
                 last_successful_record_id = record_id
-                
+
             except Exception as e:
                 # Pipeline processing failure (normalization, infrastructure, or logic).
                 # Must NOT advance checkpoint past this failed event.
                 self.logger.error(f"Pipeline processing failed on record {record_id}, halting batch. Error: {e}")
                 break
-                
+
         # Advance the collector checkpoint only up to the last successful record
         if last_successful_record_id > 0:
             self.collector.update_checkpoint(last_successful_record_id)

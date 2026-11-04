@@ -8,6 +8,7 @@ import urllib.error
 from datetime import datetime, timezone
 from typing import Optional, List, Dict, Any
 
+from config.settings import config
 from response.executor import WindowsResponseExecutor
 
 DEFAULT_WINDOWS_CAPABILITIES = [
@@ -28,7 +29,8 @@ class HeartbeatWorker(threading.Thread):
         api_token: str,
         logger: logging.Logger,
         capabilities: Optional[List[str]] = None,
-        heartbeat_interval: float = 15.0
+        heartbeat_interval: float = 15.0,
+        agent_version: Optional[str] = None
     ):
         super().__init__(name="HeartbeatWorker", daemon=True)
         self.agent_id = agent_id
@@ -41,6 +43,7 @@ class HeartbeatWorker(threading.Thread):
         self.logger = logger
         self.capabilities = capabilities or list(DEFAULT_WINDOWS_CAPABILITIES)
         self.heartbeat_interval = heartbeat_interval
+        self.agent_version = agent_version or config.version
         self._stop_event = threading.Event()
         self._start_time = time.time()
         self._first_heartbeat_sent = False
@@ -78,7 +81,7 @@ class HeartbeatWorker(threading.Thread):
             "hostname": socket.gethostname(),
             "os": self.os_type,
             "ip_address": self._get_local_ip(),
-            "agent_version": "1.0.0",
+            "agent_version": self.agent_version,
             "capabilities": self.capabilities
         }
         data = json.dumps(payload).encode("utf-8")
@@ -134,7 +137,7 @@ class HeartbeatWorker(threading.Thread):
                     "status": "RUNNING",
                     "agent_id": self.agent_id,
                     "capabilities": self.capabilities,
-                    "agent_version": "1.0.0"
+                    "agent_version": self.agent_version
                 }
             elif cmd_type in (
                 "BLOCK_SOURCE", "BLOCK_SOURCE_IP", "UNBLOCK_SOURCE",
