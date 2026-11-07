@@ -15,7 +15,7 @@ class DetectionEngine:
         self.logger = logger
         # Rules and models initialized here
         self.rules = [
-            BruteForceRule(),
+            BruteForceRule(logger=logger),
             SuspiciousPowerShellRule(),
             SuspiciousLolbinsDownloadRule(),
             ReconnaissanceCommandsRule(),

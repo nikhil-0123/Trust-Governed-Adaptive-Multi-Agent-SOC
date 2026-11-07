@@ -46,6 +46,18 @@ class Settings:
         self._detection_output_dir = os.getenv("DETECTION_OUTPUT_DIR")
         self._outbox_db_path = os.getenv("OUTBOX_DB_PATH")
 
+        # Step 4: Detection Engine Configuration (Phase 1)
+        val_max_keys = int(os.getenv("WINDOWS_DETECTION_MAX_STATE_KEYS", "10000"))
+        if val_max_keys < 2:
+            raise ValueError(f"WINDOWS_DETECTION_MAX_STATE_KEYS must be an integer >= 2, got {val_max_keys}")
+        self.windows_detection_max_state_keys = val_max_keys
+
+        val_cleanup_sec = float(os.getenv("WINDOWS_DETECTION_CLEANUP_INTERVAL_SECONDS", "5.0"))
+        import math
+        if not math.isfinite(val_cleanup_sec) or val_cleanup_sec <= 0:
+            raise ValueError(f"WINDOWS_DETECTION_CLEANUP_INTERVAL_SECONDS must be finite and > 0, got {val_cleanup_sec}")
+        self.windows_detection_cleanup_interval_seconds = val_cleanup_sec
+
         # Step 6: Central SOC Transport
         self.soc_api_url = os.getenv("SOC_API_URL", "http://127.0.0.1:8000/api/v1/detection-events")
         self.soc_api_token = os.getenv("SOC_API_TOKEN", "dev-token-123")
@@ -66,7 +78,6 @@ class Settings:
         if val_autocheckpoint < 10:
             raise ValueError(f"OUTBOX_WAL_AUTOCHECKPOINT must be an integer >= 10, got {val_autocheckpoint}")
         self.outbox_wal_autocheckpoint = val_autocheckpoint
-
 
     @property
     def checkpoint_dir(self) -> str:

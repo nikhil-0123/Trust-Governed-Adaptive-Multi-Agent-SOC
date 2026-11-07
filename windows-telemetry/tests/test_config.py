@@ -13,6 +13,8 @@ class TestConfig(unittest.TestCase):
         self.assertIsInstance(settings.data_dir, str)
         self.assertGreater(len(settings.data_dir), 0)
         self.assertEqual(settings.medium_confidence_threshold, 0.8)
+        self.assertEqual(settings.windows_detection_max_state_keys, 10000)
+        self.assertEqual(settings.windows_detection_cleanup_interval_seconds, 5.0)
 
     def test_settings_initialization_has_no_filesystem_side_effects(self):
         with tempfile.TemporaryDirectory() as base_tmp:
@@ -39,6 +41,22 @@ class TestConfig(unittest.TestCase):
             self.assertTrue(os.path.exists(settings.checkpoint_dir))
             self.assertTrue(os.path.exists(settings.detection_output_dir))
             self.assertTrue(os.path.exists(os.path.dirname(os.path.abspath(settings.outbox_db_path))))
+
+    def test_invalid_max_state_keys_env_var(self):
+        os.environ["WINDOWS_DETECTION_MAX_STATE_KEYS"] = "1"
+        try:
+            with self.assertRaises(ValueError):
+                Settings()
+        finally:
+            os.environ.pop("WINDOWS_DETECTION_MAX_STATE_KEYS", None)
+
+    def test_invalid_cleanup_interval_env_var(self):
+        os.environ["WINDOWS_DETECTION_CLEANUP_INTERVAL_SECONDS"] = "0"
+        try:
+            with self.assertRaises(ValueError):
+                Settings()
+        finally:
+            os.environ.pop("WINDOWS_DETECTION_CLEANUP_INTERVAL_SECONDS", None)
 
 if __name__ == "__main__":
     unittest.main()

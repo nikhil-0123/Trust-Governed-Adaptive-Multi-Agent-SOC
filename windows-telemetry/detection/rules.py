@@ -1,21 +1,116 @@
 from typing import Dict, Any, Optional
 from datetime import datetime, timedelta
 import re
+import time
+import heapq
+import logging
+import math
 from .models import DetectionResult
 
 class BruteForceRule:
-    def __init__(self):
+    def __init__(
+        self,
+        failure_threshold: int = 5,
+        window_seconds: int = 60,
+        max_state_keys: Optional[int] = None,
+        cleanup_interval_seconds: Optional[float] = None,
+        logger: Optional[logging.Logger] = None
+    ):
         self.name = "windows_bruteforce_rule"
-        self.failure_threshold = 5
-        self.window_seconds = 60
-        self.state = {}
 
-    def _cleanup_stale_keys(self, current_time: datetime, active_key: Optional[tuple] = None):
+        # Validate failure_threshold
+        if isinstance(failure_threshold, bool) or not isinstance(failure_threshold, int) or failure_threshold < 3:
+            raise ValueError(f"failure_threshold must be an integer >= 3 to maintain distinct classification tiers, got {failure_threshold}")
+        self.failure_threshold = failure_threshold
+
+        # Validate window_seconds
+        if isinstance(window_seconds, bool) or not isinstance(window_seconds, int) or window_seconds <= 0:
+            raise ValueError(f"window_seconds must be a positive integer, got {window_seconds}")
+        self.window_seconds = window_seconds
+
+        self.logger = logger or logging.getLogger(self.name)
+
+        # Resolve and validate max_state_keys
+        if max_state_keys is None:
+            from config.settings import config
+            max_state_keys = getattr(config, 'windows_detection_max_state_keys', 10000)
+
+        if isinstance(max_state_keys, bool) or not isinstance(max_state_keys, int):
+            raise TypeError(f"max_state_keys must be an int, got {type(max_state_keys).__name__}")
+        if max_state_keys < 2:
+            raise ValueError(f"max_state_keys must be an integer >= 2, got {max_state_keys}")
+        self.max_state_keys = max_state_keys
+
+        # Guarantee 0 < low_watermark < max_state_keys for all valid max_state_keys
+        self.low_watermark = max(1, min(int(self.max_state_keys * 0.85), self.max_state_keys - 1))
+
+        # Resolve and validate cleanup_interval_seconds
+        if cleanup_interval_seconds is None:
+            from config.settings import config
+            cleanup_interval_seconds = getattr(config, 'windows_detection_cleanup_interval_seconds', 5.0)
+
+        if isinstance(cleanup_interval_seconds, bool) or not isinstance(cleanup_interval_seconds, (int, float)):
+            raise TypeError(f"cleanup_interval_seconds must be a float or int, got {type(cleanup_interval_seconds).__name__}")
+        if not math.isfinite(cleanup_interval_seconds):
+            raise ValueError(f"cleanup_interval_seconds must be finite, got {cleanup_interval_seconds}")
+        if cleanup_interval_seconds <= 0:
+            raise ValueError(f"cleanup_interval_seconds must be > 0, got {cleanup_interval_seconds}")
+        self.cleanup_interval = float(cleanup_interval_seconds)
+
+        self.state = {}
+        self._last_cleanup_monotonic = 0.0
+        self._last_cleanup_event_time = None
+        self._max_observed_event_time = None
+        self._last_warning_monotonic = 0.0
+        self.metrics = {
+            "evaluations": 0,
+            "fast_path_evaluations": 0,
+            "ttl_cleanups": 0,
+            "capacity_classification_scans": 0,
+            "heap_selection_operations": 0,
+            "tier1_evictions": 0,
+            "tier2_evictions": 0,
+            "forced_tier3_evictions": 0,
+            "forced_tier4_evictions": 0,
+            "forced_active_state_evictions": 0,
+            "total_evictions": 0
+        }
+
+    def _cleanup_stale_keys(self, current_time: Optional[datetime] = None, active_key: Optional[tuple] = None, force: bool = False):
         """
         Prunes inactive keys from state memory whose events and duplicate-alert suppression
-        windows are older than cutoff relative to current_time.
+        windows are older than cutoff relative to _max_observed_event_time (non-regressing watermark).
+        Throttled by monotonic wall-clock and event-time progression unless force=True.
         """
-        cutoff = current_time - timedelta(seconds=self.window_seconds)
+        now_mono = time.monotonic()
+        mono_due = (now_mono - self._last_cleanup_monotonic >= self.cleanup_interval)
+
+        watermark = self._max_observed_event_time
+        if watermark is None and current_time is not None:
+            watermark = current_time
+
+        event_time_due = False
+        if watermark is not None:
+            if self._last_cleanup_event_time is not None:
+                if (watermark - self._last_cleanup_event_time).total_seconds() >= self.cleanup_interval:
+                    event_time_due = True
+            else:
+                event_time_due = True
+
+        if not force and not mono_due and not event_time_due:
+            return
+
+        self._last_cleanup_monotonic = now_mono
+        if watermark is not None:
+            if self._last_cleanup_event_time is None or watermark > self._last_cleanup_event_time:
+                self._last_cleanup_event_time = watermark
+        self.metrics["ttl_cleanups"] += 1
+
+        if watermark is None:
+            return
+
+        cutoff = watermark - timedelta(seconds=self.window_seconds)
+
         stale_keys = []
         for key, group_state in self.state.items():
             if key == active_key:
@@ -29,16 +124,166 @@ class BruteForceRule:
         for key in stale_keys:
             del self.state[key]
 
+    def _classify_and_evict_batch(self, current_time: datetime, active_key: Optional[tuple] = None):
+        """
+        Deterministically evicts keys when state exceeds capacity (max_state_keys)
+        down to low watermark using 4 mutually exclusive tiers.
+
+        Routine Eviction:
+        - Tier 1: Noise (len <= 1, not alert-active) - priority 1
+        - Tier 2: Low Multi-Attempt (2 <= len <= T-2, not alert-active) - priority 2
+
+        Forced Eviction (Protected State Fallback):
+        - Tier 3: Alerted Ongoing (alert-active) - sacrificed first to preserve duplicate suppression
+                  only as long as possible while avoiding dropped unalerted attacks
+        - Tier 4: Near-Threshold (len >= T-1, not alert-active) - sacrificed last to protect active attacks
+        """
+        if len(self.state) <= self.max_state_keys:
+            return
+
+        # Step 1: Force TTL cleanup first
+        self._cleanup_stale_keys(current_time, active_key=active_key, force=True)
+        if len(self.state) <= self.max_state_keys:
+            return
+
+        num_to_evict = len(self.state) - self.low_watermark
+        if num_to_evict <= 0:
+            return
+
+        self.metrics["capacity_classification_scans"] += 1
+
+        watermark = self._max_observed_event_time if self._max_observed_event_time is not None else current_time
+        cutoff = watermark - timedelta(seconds=self.window_seconds)
+
+        # Mutually exclusive tier collectors:
+        # Tier 1 (Noise): len(events) <= 1 and not is_alert_active -> priority 1
+        # Tier 2 (Low Multi-Attempt): 2 <= len(events) <= T - 2 and not is_alert_active -> priority 2
+        # Tier 3 (Alerted Ongoing): is_alert_active -> PROTECTED (Forced Stage 1 fallback)
+        # Tier 4 (Near-Threshold): len(events) >= T - 1 and not is_alert_active -> PROTECTED (Forced Stage 2 fallback)
+        tier1 = []
+        tier2 = []
+        tier3 = []
+        tier4 = []
+
+        for key, group_state in self.state.items():
+            if key == active_key:
+                continue
+            evts = group_state["events"]
+            cnt = len(evts)
+            last_alert = group_state.get("last_alert_time")
+            is_alert_active = (last_alert is not None and last_alert >= cutoff)
+
+            username = str(key[0]) if key[0] is not None else ""
+            ip = str(key[1]) if key[1] is not None else ""
+            key_repr = repr(key)
+
+            if is_alert_active:
+                # Tier 3: Alerted ongoing cluster under duplicate suppression
+                tier3.append((last_alert, username, ip, key_repr, key))
+            else:
+                # Alert is expired or None
+                if cnt <= 1:
+                    t_val = evts[0][0] if evts else cutoff
+                    tier1.append((t_val, username, ip, key_repr, key))
+                elif 2 <= cnt <= self.failure_threshold - 2:
+                    tier2.append((evts[0][0], username, ip, key_repr, key))
+                elif cnt >= self.failure_threshold - 1:
+                    latest_t = evts[-1][0] if evts else current_time
+                    tier4.append((latest_t, username, ip, key_repr, key))
+
+        evicted_keys = []
+
+        def evict_from_tier(candidates, needed):
+            if not candidates or needed <= 0:
+                return 0
+            if len(candidates) <= needed:
+                for item in candidates:
+                    evicted_keys.append(item[4])
+                return len(candidates)
+            self.metrics["heap_selection_operations"] += 1
+            selected = heapq.nsmallest(needed, candidates)
+            for item in selected:
+                evicted_keys.append(item[4])
+            return needed
+
+        # --- ROUTINE EVICTION ---
+        # Priority 1: Evict Tier 1 (Noise)
+        evicted_t1 = evict_from_tier(tier1, num_to_evict)
+        self.metrics["tier1_evictions"] += evicted_t1
+        num_to_evict -= evicted_t1
+
+        # Priority 2: Evict Tier 2 (Low Multi-Attempt) if still needed
+        if num_to_evict > 0:
+            evicted_t2 = evict_from_tier(tier2, num_to_evict)
+            self.metrics["tier2_evictions"] += evicted_t2
+            num_to_evict -= evicted_t2
+
+        # --- FORCED EVICTION (PROTECTED TIERS FALLBACK) ---
+        # Entered ONLY when Tier 1 and Tier 2 are exhausted and capacity cannot otherwise be maintained
+        evicted_t3 = 0
+        evicted_t4 = 0
+
+        # Forced Stage 1: Evict Tier 3 (Alerted Groups)
+        # Oldest last_alert_time evicted first
+        if num_to_evict > 0 and tier3:
+            evicted_t3 = evict_from_tier(tier3, num_to_evict)
+            self.metrics["forced_tier3_evictions"] += evicted_t3
+            num_to_evict -= evicted_t3
+
+        # Forced Stage 2: Evict Tier 4 (Near-Threshold Groups)
+        # Oldest latest_event_time evicted first
+        if num_to_evict > 0 and tier4:
+            evicted_t4 = evict_from_tier(tier4, num_to_evict)
+            self.metrics["forced_tier4_evictions"] += evicted_t4
+            num_to_evict -= evicted_t4
+
+        total_forced = evicted_t3 + evicted_t4
+        now_mono = time.monotonic()
+        if total_forced > 0 and (now_mono - self._last_warning_monotonic >= 5.0):
+            if evicted_t3 > 0 and evicted_t4 > 0:
+                eviction_tier_name = "Tier 3 (Alerted) + Tier 4 (Near-Threshold)"
+                msg = f"State forced eviction executed: evicted {evicted_t3} Tier 3 and {evicted_t4} Tier 4 candidate(s)"
+            elif evicted_t3 > 0:
+                eviction_tier_name = "Tier 3 (Alerted)"
+                msg = f"State forced eviction executed: evicted {evicted_t3} Tier 3 candidate(s)"
+            else:
+                eviction_tier_name = "Tier 4 (Near-Threshold)"
+                msg = f"State forced eviction executed: evicted {evicted_t4} Tier 4 candidate(s)"
+
+            extra_payload = {
+                "event_type": "state_forced_eviction",
+                "eviction_tier": eviction_tier_name,
+                "forced_eviction_count": total_forced,
+                "current_size": len(self.state),
+                "max_capacity": self.max_state_keys,
+                "low_watermark": self.low_watermark,
+            }
+            self.logger.warning(msg, extra=extra_payload)
+            self._last_warning_monotonic = now_mono
+
+        self.metrics["forced_active_state_evictions"] = (
+            self.metrics["forced_tier3_evictions"] + self.metrics["forced_tier4_evictions"]
+        )
+
+        for k in evicted_keys:
+            if k in self.state:
+                del self.state[k]
+
+        self.metrics["total_evictions"] += len(evicted_keys)
+
     def evaluate(self, normalized_event: Dict[str, Any]) -> Optional[DetectionResult]:
+        self.metrics["evaluations"] += 1
         evidence = normalized_event.get("evidence", {})
 
-        # Only process Windows Event ID 4625 (Failed Logon)
+        # Fast-path 1: Only process Windows Event ID 4625 (Failed Logon)
         if evidence.get("windows_event_id") != 4625:
+            self.metrics["fast_path_evaluations"] += 1
             return None
 
         username = normalized_event.get("username")
+        # Fast-path 2: Cannot group safely without a username
         if not username:
-            # Cannot group safely without a username
+            self.metrics["fast_path_evaluations"] += 1
             return None
 
         source_ip = normalized_event.get("source_ip")
@@ -52,7 +297,10 @@ class BruteForceRule:
         except (ValueError, TypeError, AttributeError) as e:
             raise ValueError(f"Invalid timestamp in event: {timestamp_str}") from e
 
-        # Clean up stale keys from other groups
+        if self._max_observed_event_time is None or current_time > self._max_observed_event_time:
+            self._max_observed_event_time = current_time
+
+        # Clean up stale keys periodically (throttled by monotonic/event-time interval)
         self._cleanup_stale_keys(current_time, active_key=group_key)
 
         group_state = self.state.setdefault(group_key, {"events": [], "last_alert_time": None})
@@ -60,8 +308,9 @@ class BruteForceRule:
 
         event_id = normalized_event.get("event_id")
 
-        # Check for repeated events with the same event_id to prevent duplicate counting
+        # Fast-path 3: Check for repeated events with the same event_id to prevent duplicate counting
         if event_id and any(eid == event_id for _, eid in events):
+            self.metrics["fast_path_evaluations"] += 1
             return None
 
         events.append((current_time, event_id))
@@ -75,6 +324,10 @@ class BruteForceRule:
 
         # Keep events within the window (>= cutoff)
         group_state["events"] = [(t, eid) for t, eid in events if t >= cutoff]
+
+        # Enforce capacity bounds with deterministic watermark batch eviction
+        if len(self.state) > self.max_state_keys:
+            self._classify_and_evict_batch(current_time, active_key=group_key)
 
         if len(group_state["events"]) >= self.failure_threshold:
             last_alert = group_state["last_alert_time"]
@@ -109,6 +362,12 @@ class BruteForceRule:
 
     def reset_state(self):
         self.state.clear()
+        self._last_cleanup_monotonic = 0.0
+        self._last_cleanup_event_time = None
+        self._max_observed_event_time = None
+        self._last_warning_monotonic = 0.0
+        for k in self.metrics:
+            self.metrics[k] = 0
 
 
 def _extract_cmd_line(normalized_event: Dict[str, Any]) -> str:
