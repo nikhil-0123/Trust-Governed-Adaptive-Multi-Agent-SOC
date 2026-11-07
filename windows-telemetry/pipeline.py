@@ -27,7 +27,13 @@ class WindowsDetectionPipeline:
         self.writer = DetectionEventWriter(config.detection_output_dir, logger)
         self.collector = WindowsEventCollector(logger)
 
-        self.outbox = Outbox(config.outbox_db_path, logger)
+        self.outbox = Outbox(
+            config.outbox_db_path,
+            logger,
+            busy_timeout_ms=config.outbox_busy_timeout_ms,
+            synchronous_mode=config.outbox_synchronous_mode,
+            wal_autocheckpoint=config.outbox_wal_autocheckpoint
+        )
         self.client = TransportClient(config.soc_api_url, config.soc_api_token, logger)
         self.delivery_manager = DeliveryManager(self.outbox, self.client, logger)
         # Daemon delivery worker

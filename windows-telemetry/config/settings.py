@@ -51,6 +51,23 @@ class Settings:
         self.soc_api_token = os.getenv("SOC_API_TOKEN", "dev-token-123")
         self.medium_confidence_threshold = float(os.getenv("MEDIUM_CONFIDENCE_THRESHOLD", "0.8"))
 
+        # Step 7: Outbox Storage & WAL Configuration (WP-2-D)
+        val_sync = os.getenv("OUTBOX_SYNCHRONOUS_MODE", "NORMAL").strip().upper()
+        if val_sync not in ("NORMAL", "FULL"):
+            raise ValueError(f"OUTBOX_SYNCHRONOUS_MODE must be 'NORMAL' or 'FULL', got '{val_sync}'")
+        self.outbox_synchronous_mode = val_sync
+
+        val_busy_timeout = int(os.getenv("OUTBOX_BUSY_TIMEOUT_MS", "5000"))
+        if val_busy_timeout < 1000:
+            raise ValueError(f"OUTBOX_BUSY_TIMEOUT_MS must be an integer >= 1000, got {val_busy_timeout}")
+        self.outbox_busy_timeout_ms = val_busy_timeout
+
+        val_autocheckpoint = int(os.getenv("OUTBOX_WAL_AUTOCHECKPOINT", "1000"))
+        if val_autocheckpoint < 10:
+            raise ValueError(f"OUTBOX_WAL_AUTOCHECKPOINT must be an integer >= 10, got {val_autocheckpoint}")
+        self.outbox_wal_autocheckpoint = val_autocheckpoint
+
+
     @property
     def checkpoint_dir(self) -> str:
         return self._checkpoint_dir or os.path.join(self.data_dir, "state")
