@@ -3194,6 +3194,349 @@ class TestEpochGovernance(unittest.TestCase):
             dispatched_domain = dispatch_governed_response(conn, inc_id_domain, [{"type": "DISABLE_ACCOUNT", "reason": "Domain account"}])
             self.assertEqual(len(dispatched_domain), 0)
 
+    # =========================================================================
+    # PR #1 WP-1E CRITICAL CORRECTNESS REGRESSION TESTS
+    # =========================================================================
+
+    def test_corrupt_stored_event_fails_closed_and_preserves_row(self):
+        """
+        1. Corrupted stored-event handling:
+        Never assume unreadable stored payload has the same hash as incoming payload.
+        Fail closed with HTTP 500, refuse to acknowledge as duplicate, preserve DB row.
+        """
+        ev_id = f"det-corrupt-{uuid.uuid4()}"
+        ev = dict(self.base_event)
+        ev["detection_event_id"] = ev_id
+
+        # 1. Ingest valid event
+        res1 = self.client.post("/api/v1/detection-events", json_data=ev, headers=self.headers)
+        self.assertEqual(res1.status_code, 201)
+
+        # 2. Simulate database payload corruption: corrupt data and clear cached payload_hash
+        corrupt_raw_str = "{this is not valid json! bad bytes"
+        with get_db_connection() as conn:
+            conn.execute(
+                "UPDATE events SET data = ?, payload_hash = NULL WHERE detection_event_id = ?",
+                (corrupt_raw_str, ev_id)
+            )
+            conn.commit()
+
+        # 3. Resubmit incoming event -> MUST FAIL CLOSED (HTTP 500), never return 201 duplicate
+        res2 = self.client.post("/api/v1/detection-events", json_data=ev, headers=self.headers)
+        self.assertEqual(res2.status_code, 500)
+        self.assertFalse(res2.json().get("accepted", True))
+        self.assertIn("corrupted or unverifiable", res2.json()["detail"])
+
+        # 4. Verify original stored DB row was preserved and NOT overwritten
+        with get_db_connection() as conn:
+            row = conn.execute("SELECT data, payload_hash FROM events WHERE detection_event_id = ?", (ev_id,)).fetchone()
+            self.assertEqual(row["data"], corrupt_raw_str)
+            self.assertIsNone(row["payload_hash"])
+
+    def test_strict_epoch_validation_rejects_malformed_and_conflicts(self):
+        """
+        2. Strict epoch validation:
+        Explicit field presence checks, reject zero/negative/bool/float/string,
+        reject conflicting values, never silently substitute another field.
+        """
+        ev_id = f"det-epoch-val-{uuid.uuid4()}"
+        ev = dict(self.base_event)
+        ev["detection_event_id"] = ev_id
+
+        # 2A: Reject explicit zero
+        ev["channel_epoch"] = 0
+        res = self.client.post("/api/v1/detection-events", json_data=ev, headers=self.headers)
+        self.assertEqual(res.status_code, 422)
+
+        # 2B: Reject explicit negative
+        ev["channel_epoch"] = -5
+        res = self.client.post("/api/v1/detection-events", json_data=ev, headers=self.headers)
+        self.assertEqual(res.status_code, 422)
+
+        # 2C: Reject explicit booleans (False and True)
+        ev["channel_epoch"] = False
+        res = self.client.post("/api/v1/detection-events", json_data=ev, headers=self.headers)
+        self.assertEqual(res.status_code, 422)
+        ev["channel_epoch"] = True
+        res = self.client.post("/api/v1/detection-events", json_data=ev, headers=self.headers)
+        self.assertEqual(res.status_code, 422)
+
+        # 2D: Reject float
+        ev["channel_epoch"] = 2.5
+        res = self.client.post("/api/v1/detection-events", json_data=ev, headers=self.headers)
+        self.assertEqual(res.status_code, 422)
+
+        # 2E: Reject string integer representation
+        ev["channel_epoch"] = "2"
+        res = self.client.post("/api/v1/detection-events", json_data=ev, headers=self.headers)
+        self.assertEqual(res.status_code, 422)
+
+        # 2F: Never silently substitute another field when higher-priority field is invalid
+        ev["channel_epoch"] = 0  # Invalid!
+        ev["evidence"] = {"channel_epoch": 1}  # Valid fallback candidate, MUST NOT BE USED!
+        res = self.client.post("/api/v1/detection-events", json_data=ev, headers=self.headers)
+        self.assertEqual(res.status_code, 422)
+        self.assertIn("Invalid channel_epoch in parsed_dict['channel_epoch']", res.json()["detail"])
+
+        # 2G: Multiple supported fields with conflicting values must be rejected
+        del ev["channel_epoch"]
+        ev["epoch"] = 1
+        ev["evidence"] = {"channel_epoch": 2}  # Conflicting!
+        res = self.client.post("/api/v1/detection-events", json_data=ev, headers=self.headers)
+        self.assertEqual(res.status_code, 422)
+        self.assertIn("Conflicting epoch values", res.json()["detail"])
+
+    def test_channel_identity_no_security_default_and_legacy_unverified(self):
+        """
+        3. Channel identity:
+        Remove unconditional default of 'Security'. Events without trustworthy channel
+        remain LEGACY_UNVERIFIED and do NOT create agent_channel_epochs rows.
+        """
+        agent_id = f"AGT-CH-TEST-{uuid.uuid4().hex[:6]}"
+        ev_id = f"det-no-ch-{uuid.uuid4()}"
+        ev = {
+            "detection_event_id": ev_id,
+            "timestamp": "2026-11-19T12:00:00Z",
+            "agent_id": agent_id,
+            "hostname": "TEST-HOST",
+            "confidence": 0.9,
+            "severity": "medium",
+            "detection_type": "generic_rule",
+            "evidence": {}  # No channel, no log_name, no source_manifest
+        }
+
+        # 3A: Submit event with no channel identity
+        res = self.client.post("/api/v1/detection-events", json_data=ev, headers=self.headers)
+        self.assertEqual(res.status_code, 201)
+        self.assertEqual(res.json()["quarantine_status"], "LEGACY_UNVERIFIED")
+
+        # Verify NO record was created in agent_channel_epochs for this agent
+        with get_db_connection() as conn:
+            ch_row = conn.execute("SELECT * FROM agent_channel_epochs WHERE agent_id = ?", (agent_id,)).fetchone()
+            self.assertIsNone(ch_row, "Authoritative agent/channel epoch record must NOT be created for missing channel!")
+            ev_row = conn.execute("SELECT channel, channel_epoch, quarantine_status FROM events WHERE detection_event_id = ?", (ev_id,)).fetchone()
+            self.assertIsNone(ev_row["channel"])
+            self.assertIsNone(ev_row["channel_epoch"])
+            self.assertEqual(ev_row["quarantine_status"], "LEGACY_UNVERIFIED")
+
+        # 3B: Ambiguous/conflicting channels must remain LEGACY_UNVERIFIED without authoritative record
+        agent_id_ambig = f"AGT-AMBIG-{uuid.uuid4().hex[:6]}"
+        ev_ambig = dict(ev)
+        ev_ambig["agent_id"] = agent_id_ambig
+        ev_ambig["detection_event_id"] = f"det-ambig-{uuid.uuid4()}"
+        ev_ambig["channel"] = "Security"
+        ev_ambig["evidence"] = {"log_name": "System"}  # Conflicting channels!
+        res_ambig = self.client.post("/api/v1/detection-events", json_data=ev_ambig, headers=self.headers)
+        self.assertEqual(res_ambig.status_code, 201)
+        self.assertEqual(res_ambig.json()["quarantine_status"], "LEGACY_UNVERIFIED")
+        with get_db_connection() as conn:
+            ch_ambig = conn.execute("SELECT * FROM agent_channel_epochs WHERE agent_id = ?", (agent_id_ambig,)).fetchone()
+            self.assertIsNone(ch_ambig, "Authoritative record must NOT be created for ambiguous channel!")
+
+        # 3C: Explicit source_manifest channel is recognized
+        agent_id_sysmon = f"AGT-SYSMON-{uuid.uuid4().hex[:6]}"
+        ev_sysmon = dict(ev)
+        ev_sysmon["agent_id"] = agent_id_sysmon
+        ev_sysmon["detection_event_id"] = f"det-sysmon-{uuid.uuid4()}"
+        ev_sysmon["evidence"] = {
+            "source_manifest": {
+                "channel": "Microsoft-Windows-Sysmon/Operational",
+                "epoch": 1
+            }
+        }
+        res_sys = self.client.post("/api/v1/detection-events", json_data=ev_sysmon, headers=self.headers)
+        self.assertEqual(res_sys.status_code, 201)
+        self.assertEqual(res_sys.json()["quarantine_status"], "ACTIVE_VERIFIED")
+        with get_db_connection() as conn:
+            ch_sys = conn.execute("SELECT current_epoch, status FROM agent_channel_epochs WHERE agent_id = ? AND channel = ?",
+                                  (agent_id_sysmon, "Microsoft-Windows-Sysmon/Operational")).fetchone()
+            self.assertIsNotNone(ch_sys)
+            self.assertEqual(ch_sys["status"], "ACTIVE")
+
+    def test_future_epoch_gap_freezes_channel_and_quarantines_subsequent_events(self):
+        """
+        4. Future-epoch gap freeze:
+        Once future-epoch gap is detected, freeze agent/channel (status='EPOCH_GAP_QUARANTINED').
+        Subsequent events CANNOT become ACTIVE_VERIFIED until resolved via Path A or Path B.
+        """
+        agent_id = f"AGT-GAP-FREEZE-{uuid.uuid4().hex[:6]}"
+        ch = "Security"
+
+        # Initialize channel at Epoch 1 with an active event
+        ev1 = dict(self.base_event)
+        ev1["agent_id"] = agent_id
+        ev1["channel"] = ch
+        ev1["channel_epoch"] = 1
+        ev1["detection_event_id"] = f"det-1-{uuid.uuid4()}"
+        res1 = self.client.post("/api/v1/detection-events", json_data=ev1, headers=self.headers)
+        self.assertEqual(res1.status_code, 201)
+        self.assertEqual(res1.json()["quarantine_status"], "ACTIVE_VERIFIED")
+
+        # 4A: Ingest event with future epoch 4 (gap! active is 1, received 4)
+        ev_future = dict(self.base_event)
+        ev_future["agent_id"] = agent_id
+        ev_future["channel"] = ch
+        ev_future["channel_epoch"] = 4
+        ev_future["detection_event_id"] = f"det-future-4-{uuid.uuid4()}"
+        res_fut = self.client.post("/api/v1/detection-events", json_data=ev_future, headers=self.headers)
+        self.assertEqual(res_fut.status_code, 201)
+        self.assertEqual(res_fut.json()["quarantine_status"], "GAP_QUARANTINED")
+
+        # Verify channel status is now FROZEN in EPOCH_GAP_QUARANTINED
+        with get_db_connection() as conn:
+            ch_state = conn.execute("SELECT current_epoch, status FROM agent_channel_epochs WHERE agent_id = ? AND channel = ?",
+                                    (agent_id, ch)).fetchone()
+            self.assertEqual(ch_state["status"], "EPOCH_GAP_QUARANTINED")
+            self.assertEqual(ch_state["current_epoch"], 1)
+
+        # 4B: Subsequent event claiming epoch 1 arrives while channel is frozen -> MUST BE QUARANTINED!
+        ev_subsequent_1 = dict(self.base_event)
+        ev_subsequent_1["agent_id"] = agent_id
+        ev_subsequent_1["channel"] = ch
+        ev_subsequent_1["channel_epoch"] = 1
+        ev_subsequent_1["detection_event_id"] = f"det-subsequent-1-{uuid.uuid4()}"
+        res_sub1 = self.client.post("/api/v1/detection-events", json_data=ev_subsequent_1, headers=self.headers)
+        self.assertEqual(res_sub1.status_code, 201)
+        self.assertEqual(res_sub1.json()["quarantine_status"], "GAP_QUARANTINED",
+                         "Subsequent event must NOT become ACTIVE_VERIFIED while channel is frozen!")
+
+        # 4C: Path A sequential recovery: Replay transitions 1->2, 2->3, 3->4
+        self.client.post("/api/v1/events/transition", json_data={
+            "transition_id": f"t-1-2-{uuid.uuid4()}", "agent_id": agent_id, "source_channel": ch, "target_epoch": 2
+        }, headers=self.headers)
+        self.client.post("/api/v1/events/transition", json_data={
+            "transition_id": f"t-2-3-{uuid.uuid4()}", "agent_id": agent_id, "source_channel": ch, "target_epoch": 3
+        }, headers=self.headers)
+        res_t4 = self.client.post("/api/v1/events/transition", json_data={
+            "transition_id": f"t-3-4-{uuid.uuid4()}", "agent_id": agent_id, "source_channel": ch, "target_epoch": 4
+        }, headers=self.headers)
+        self.assertEqual(res_t4.status_code, 200)
+        self.assertEqual(res_t4.json()["status"], "APPLIED")
+        self.assertEqual(res_t4.json()["active_epoch"], 4)
+
+        # Verify channel status is now restored to ACTIVE and events are RELEASED
+        with get_db_connection() as conn:
+            ch_restored = conn.execute("SELECT current_epoch, status FROM agent_channel_epochs WHERE agent_id = ? AND channel = ?",
+                                       (agent_id, ch)).fetchone()
+            self.assertEqual(ch_restored["status"], "ACTIVE")
+            self.assertEqual(ch_restored["current_epoch"], 4)
+
+            # Future event (epoch 4) was released
+            row_fut = conn.execute("SELECT quarantine_status FROM events WHERE detection_event_id = ?",
+                                   (ev_future["detection_event_id"],)).fetchone()
+            self.assertEqual(row_fut["quarantine_status"], "RELEASED")
+
+    def test_administrative_credential_separation_and_fail_closed(self):
+        """
+        Administrative credential separation and fail-closed verification:
+        1. Endpoint ingestion works with a valid SOC_API_TOKEN when SOC_ADMIN_API_TOKEN is absent.
+        2. Endpoint ingestion fails when SOC_API_TOKEN is absent.
+        3. Administrative operations fail when the admin token is absent.
+        4. Administrative operations fail when endpoint and admin tokens are identical.
+        5. Endpoint token cannot authorize administrative operations (HTTP 403 Forbidden).
+        6. Invalid admin token is rejected (HTTP 401 Unauthorized).
+        7. Distinct valid admin credentials permit authorized recovery (HTTP 200 OK).
+        """
+        orig_admin = os.environ.get("SOC_ADMIN_API_TOKEN")
+        orig_admin_alt = os.environ.get("SOC_ADMIN_TOKEN")
+        orig_endpoint = os.environ.get("SOC_API_TOKEN")
+
+        try:
+            # 1. Endpoint ingestion works with a valid SOC_API_TOKEN when SOC_ADMIN_API_TOKEN is absent
+            os.environ["SOC_API_TOKEN"] = "ep-valid-token-case1"
+            os.environ.pop("SOC_ADMIN_API_TOKEN", None)
+            os.environ.pop("SOC_ADMIN_TOKEN", None)
+            ev1 = dict(self.base_event)
+            ev1["detection_event_id"] = "det-auth-sep-1"
+            res1 = self.client.post(
+                "/api/v1/detection-events",
+                json_data=ev1,
+                headers={"Authorization": "Bearer ep-valid-token-case1"}
+            )
+            self.assertEqual(res1.status_code, 201)
+            self.assertTrue(res1.json()["accepted"])
+            self.assertFalse(res1.json()["duplicate"])
+            self.assertEqual(res1.json()["detection_event_id"], "det-auth-sep-1")
+
+            # 2. Endpoint ingestion fails when SOC_API_TOKEN is absent
+            os.environ["SOC_API_TOKEN"] = ""
+            ev2 = dict(self.base_event)
+            ev2["detection_event_id"] = "det-auth-sep-2"
+            res2 = self.client.post(
+                "/api/v1/detection-events",
+                json_data=ev2,
+                headers={"Authorization": "Bearer some-token"}
+            )
+            self.assertEqual(res2.status_code, 500)
+            self.assertIn("Endpoint credentials not configured", res2.json()["detail"])
+
+            # 3. Administrative operations fail when the admin token is absent
+            os.environ["SOC_API_TOKEN"] = "ep-valid-token"
+            os.environ.pop("SOC_ADMIN_API_TOKEN", None)
+            os.environ.pop("SOC_ADMIN_TOKEN", None)
+            res3 = self.client.post(
+                "/api/v1/agents/AGT-01/channels/Security/resolve_gap",
+                json_data={"target_epoch": 2, "resolution_reason": "test"},
+                headers={"Authorization": "Bearer ep-valid-token"}
+            )
+            self.assertEqual(res3.status_code, 500)
+            self.assertIn("Administrative credentials not configured", res3.json()["detail"])
+
+            # 4. Administrative operations fail when endpoint and admin tokens are identical
+            os.environ["SOC_API_TOKEN"] = "identical-secret-token"
+            os.environ["SOC_ADMIN_API_TOKEN"] = "identical-secret-token"
+            res4 = self.client.post(
+                "/api/v1/agents/AGT-01/channels/Security/resolve_gap",
+                json_data={"target_epoch": 2, "resolution_reason": "test"},
+                headers={"Authorization": "Bearer identical-secret-token"}
+            )
+            self.assertEqual(res4.status_code, 500)
+            self.assertIn("cannot be identical", res4.json()["detail"])
+
+            # 5. Endpoint token cannot authorize administrative operations (HTTP 403 Forbidden)
+            os.environ["SOC_API_TOKEN"] = "endpoint-secret-abc"
+            os.environ["SOC_ADMIN_API_TOKEN"] = "admin-secret-xyz"
+            res5 = self.client.post(
+                "/api/v1/agents/AGT-01/channels/Security/resolve_gap",
+                json_data={"target_epoch": 2, "resolution_reason": "test"},
+                headers={"Authorization": "Bearer endpoint-secret-abc"}
+            )
+            self.assertEqual(res5.status_code, 403)
+            self.assertIn("Endpoint credentials cannot perform administrative operations", res5.json()["detail"])
+
+            # 6. Invalid admin token is rejected (HTTP 401 Unauthorized)
+            res6 = self.client.post(
+                "/api/v1/agents/AGT-01/channels/Security/resolve_gap",
+                json_data={"target_epoch": 2, "resolution_reason": "test"},
+                headers={"Authorization": "Bearer invalid-admin-token"}
+            )
+            self.assertEqual(res6.status_code, 401)
+            self.assertIn("Invalid administrator credentials", res6.json()["detail"])
+
+            # 7. Distinct valid admin credentials permit authorized recovery (HTTP 200 OK)
+            res7 = self.client.post(
+                "/api/v1/agents/AGT-01/channels/Security/resolve_gap",
+                json_data={"target_epoch": 2, "resolution_reason": "Authorized recovery"},
+                headers={"Authorization": "Bearer admin-secret-xyz"}
+            )
+            self.assertEqual(res7.status_code, 200)
+            self.assertEqual(res7.json()["status"], "RESOLVED")
+            self.assertEqual(res7.json()["active_epoch"], 2)
+
+        finally:
+            if orig_admin is not None:
+                os.environ["SOC_ADMIN_API_TOKEN"] = orig_admin
+            else:
+                os.environ.pop("SOC_ADMIN_API_TOKEN", None)
+            if orig_admin_alt is not None:
+                os.environ["SOC_ADMIN_TOKEN"] = orig_admin_alt
+            else:
+                os.environ.pop("SOC_ADMIN_TOKEN", None)
+            if orig_endpoint is not None:
+                os.environ["SOC_API_TOKEN"] = orig_endpoint
+            else:
+                os.environ.pop("SOC_API_TOKEN", None)
+
 
 if __name__ == "__main__":
     unittest.main()

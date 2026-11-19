@@ -12,9 +12,24 @@ def setup_env():
     db_fd, db_path = tempfile.mkstemp(suffix=".db")
     app.database.DB_PATH = db_path
     app.database.init_db()
+
+    orig_api_token = os.environ.get("SOC_API_TOKEN")
+    orig_admin_token = os.environ.get("SOC_ADMIN_API_TOKEN")
+    os.environ["SOC_API_TOKEN"] = "dev-token-123"
+    os.environ["SOC_ADMIN_API_TOKEN"] = "dev-admin-secret-token"
     
     yield
     
+    if orig_api_token is not None:
+        os.environ["SOC_API_TOKEN"] = orig_api_token
+    else:
+        os.environ.pop("SOC_API_TOKEN", None)
+
+    if orig_admin_token is not None:
+        os.environ["SOC_ADMIN_API_TOKEN"] = orig_admin_token
+    else:
+        os.environ.pop("SOC_ADMIN_API_TOKEN", None)
+
     os.close(db_fd)
     try:
         os.unlink(db_path)

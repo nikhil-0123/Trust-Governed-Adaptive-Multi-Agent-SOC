@@ -99,11 +99,25 @@ def get_db():
     finally:
         conn.close()
 
-def verify_token(authorization: Optional[str] = Header(None)):
+def verify_token(authorization: Optional[str] = Header(None)) -> str:
+    """
+    Endpoint authentication dependency.
+    Requires a configured, non-empty SOC_API_TOKEN.
+    Validates Authorization Bearer token against endpoint credentials.
+    Does NOT require administrator credentials to be configured.
+    Fails closed for missing or invalid endpoint credentials.
+    """
+    endpoint_token = os.getenv("SOC_API_TOKEN", "dev-token-123")
+
+    if not endpoint_token or not endpoint_token.strip():
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Endpoint credentials not configured; failing closed"
+        )
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Missing or invalid Authorization header")
     token = authorization.split(" ")[1]
-    if token != API_TOKEN:
+    if token != endpoint_token:
         raise HTTPException(status_code=401, detail="Unauthorized")
     return token
 
@@ -111,23 +125,35 @@ def verify_admin_token(authorization: Optional[str] = Header(None)) -> str:
     """
     Dedicated administrative authorization dependency (WP-1E.4S).
     Derives trusted server-side administrator identity.
-    Fails closed if administrative credentials are missing or unconfigured.
+    Fails closed if administrative credentials are missing, unconfigured, or identical to endpoint credentials.
     Explicitly rejects endpoint agent credentials from performing admin actions.
     """
     admin_token = os.getenv("SOC_ADMIN_API_TOKEN") or os.getenv("SOC_ADMIN_TOKEN")
+    endpoint_token = os.getenv("SOC_API_TOKEN", "dev-token-123")
+
     if not admin_token or not admin_token.strip():
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Administrative credentials not configured; failing closed"
         )
+    if not endpoint_token or not endpoint_token.strip():
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Endpoint credentials not configured; failing closed"
+        )
+    if admin_token.strip() == endpoint_token.strip():
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Administrative credentials cannot be identical to endpoint credentials; failing closed"
+        )
+
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Missing or invalid Authorization header"
         )
     token = authorization.split(" ")[1]
-    endpoint_token = os.getenv("SOC_API_TOKEN", "dev-token-123")
-    if token == endpoint_token and token != admin_token:
+    if token == endpoint_token:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Endpoint credentials cannot perform administrative operations"
