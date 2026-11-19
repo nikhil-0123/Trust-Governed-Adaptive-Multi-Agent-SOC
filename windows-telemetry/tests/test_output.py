@@ -51,6 +51,37 @@ class TestOutputPipeline(unittest.TestCase):
         self.assertEqual(event.evidence, {"detector_key": "val"})
         self.assertTrue(len(event.detection_event_id) == 64) # SHA256
 
+    def test_builder_identity_fields_passthrough(self):
+        norm = copy.deepcopy(self.valid_normalized)
+        norm["evidence"] = {
+            "target_account_id": "DOMAIN:CORP\\alice",
+            "target_user": "alice",
+            "target_domain": "CORP",
+            "domain_status": "OBSERVED_DOMAIN",
+            "domain_namespace": "DOMAIN:CORP",
+            "caller_user": "SYSTEM",
+            "caller_domain": "NT AUTHORITY"
+        }
+        res = DetectionResult(
+            detected=True,
+            detection_type="test_rule",
+            confidence=1.0,
+            severity="high",
+            detector_name="test_detector",
+            evidence={"failure_count": 5}
+        )
+        event = DetectionEventBuilder.build(norm, res)
+        self.assertIsNotNone(event)
+        self.assertEqual(event.evidence["target_account_id"], "DOMAIN:CORP\\alice")
+        self.assertEqual(event.evidence["target_user"], "alice")
+        self.assertEqual(event.evidence["target_domain"], "CORP")
+        self.assertEqual(event.evidence["domain_status"], "OBSERVED_DOMAIN")
+        self.assertEqual(event.evidence["domain_namespace"], "DOMAIN:CORP")
+        self.assertEqual(event.evidence["caller_user"], "SYSTEM")
+        self.assertEqual(event.evidence["caller_domain"], "NT AUTHORITY")
+        self.assertEqual(event.evidence["failure_count"], 5)
+        self.assertTrue(len(event.detection_event_id) == 64) # SHA256
+
     def test_builder_no_detection(self):
         neg_result = copy.deepcopy(self.valid_result)
         neg_result.detected = False
@@ -146,6 +177,10 @@ class TestPipelineIntegration(unittest.TestCase):
         self.pipeline.collector = MockCollector()
 
     def tearDown(self):
+        try:
+            self.pipeline.shutdown()
+        except Exception:
+            pass
         import config.settings
         config.settings.config.data_dir = self._orig_data_dir
         config.settings.config.detection_output_dir = self._orig_output_dir
@@ -212,7 +247,8 @@ class TestPipelineIntegration(unittest.TestCase):
                 "timestamp": f"{base_time}{i}.000Z",
                 "provider": "p",
                 "computer": "c",
-                "username": "admin"
+                "username": "admin",
+                "target_domain": "."
             })
 
         self.pipeline.process_batch()
@@ -232,7 +268,8 @@ class TestPipelineIntegration(unittest.TestCase):
                 "timestamp": f"{base_time}{i}.000Z",
                 "provider": "p",
                 "computer": "c",
-                "username": "admin"
+                "username": "admin",
+                "target_domain": "."
             })
 
         self.pipeline.process_batch()
@@ -263,7 +300,8 @@ class TestPipelineIntegration(unittest.TestCase):
                 "timestamp": f"{base_time}{i}.000Z",
                 "provider": "p",
                 "computer": "c",
-                "username": "admin"
+                "username": "admin",
+                "target_domain": "."
             })
 
         # 2. Mock HTTP call to block/timeout (simulating SOC outage)
@@ -318,6 +356,7 @@ class TestPipelineIntegration(unittest.TestCase):
   <EventData>
     <Data Name='SubjectUserName'>-</Data>
     <Data Name='TargetUserName'>security_admin</Data>
+    <Data Name='TargetDomainName'>.</Data>
     <Data Name='IpAddress'>192.168.1.200</Data>
     <Data Name='LogonType'>3</Data>
   </EventData>

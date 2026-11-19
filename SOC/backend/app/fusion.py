@@ -56,43 +56,43 @@ class EvidenceFusionEngine:
             entities.append(("source_ip", source_ip))
         if event.agent_id:
             entities.append(("agent_id", event.agent_id))
-        username = evidence.get("username")
-        if username:
-            entities.append(("username", username))
 
-        candidate_incident_id = self._find_candidate_incident(hostname, source_ip, event_time)
+        domain_status = evidence.get("domain_status")
+        target_account_id = evidence.get("target_account_id")
+        target_user = evidence.get("target_user")
+        raw_username = evidence.get("username") or getattr(event, "username", None)
+
+        domain_account = None
+        endpoint_account = None
+
+        if domain_status in ("OBSERVED_DOMAIN", "EXPLICIT_DOMAIN") and target_account_id:
+            domain_account = target_account_id
+            entities.append(("domain_account", domain_account))
+        elif domain_status == "LOCAL_SAM" and (target_user or target_account_id):
+            u = target_user or (target_account_id.split("\\", 1)[-1] if target_account_id else "")
+            endpoint_account = f"{event.agent_id}|LOCAL_SAM\\{u}"
+            entities.append(("endpoint_account", endpoint_account))
+        elif target_account_id and domain_status not in (None, "UNVERIFIED"):
+            domain_account = target_account_id
+            entities.append(("domain_account", domain_account))
+        elif raw_username:
+            endpoint_account = f"{event.agent_id}|{raw_username}"
+            entities.append(("endpoint_account", endpoint_account))
+
+        candidate_incident_id = self._find_candidate_incident(
+            hostname=hostname,
+            source_ip=source_ip,
+            event_time=event_time,
+            agent_id=event.agent_id,
+            domain_account=domain_account
+        )
 
         if candidate_incident_id:
             self._attach_evidence(candidate_incident_id, event, event_time, entities)
         else:
             self._create_incident(event, event_time, entities)
 
-    def _find_candidate_incident(self, hostname: str, source_ip: Optional[str], event_time: datetime) -> Optional[str]:
-        # Case 1 & Case 2: Matching hostname + optional source_ip + within time window
-        # Select newest compatible incident by last_seen, use incident_id as tie-breaker
-        
-        query = """
-            SELECT i.incident_id, i.first_seen, i.last_seen 
-            FROM incidents i
-            JOIN incident_entities e ON i.incident_id = e.incident_id
-            WHERE i.status = 'OPEN' 
-            AND e.entity_type = 'hostname' AND e.entity_value = ?
-        """
-        params = [hostname]
-        
-        if source_ip:
-            query += """
-                AND EXISTS (
-                    SELECT 1 FROM incident_entities e2 
-                    WHERE e2.incident_id = i.incident_id 
-                    AND e2.entity_type = 'source_ip' AND e2.entity_value = ?
-                )
-            """
-            params.append(source_ip)
-            
-        cursor = self.conn.execute(query, params)
-        candidates = cursor.fetchall()
-        
+    def _filter_and_rank_candidates(self, candidates, event_time: datetime) -> Optional[str]:
         valid_candidates = []
         for row in candidates:
             first_seen = parse_utc_timestamp(row["first_seen"])
@@ -118,9 +118,64 @@ class EvidenceFusionEngine:
         if not valid_candidates:
             return None
             
-        # Select: 1. smallest absolute time distance, 2. newest last_seen, 3. incident_id
         valid_candidates.sort(key=lambda x: (x["diff"], -x["last_seen"].timestamp(), x["incident_id"]))
         return valid_candidates[0]["incident_id"]
+
+    def _find_candidate_incident(
+        self,
+        hostname: str,
+        source_ip: Optional[str],
+        event_time: datetime,
+        agent_id: Optional[str] = None,
+        domain_account: Optional[str] = None
+    ) -> Optional[str]:
+        # 1. Domain-account correlation across endpoints
+        if domain_account:
+            query = """
+                SELECT i.incident_id, i.first_seen, i.last_seen
+                FROM incidents i
+                JOIN incident_entities e ON i.incident_id = e.incident_id
+                WHERE i.status = 'OPEN'
+                AND e.entity_type = 'domain_account' AND e.entity_value = ?
+            """
+            cursor = self.conn.execute(query, (domain_account,))
+            match = self._filter_and_rank_candidates(cursor.fetchall(), event_time)
+            if match:
+                return match
+
+        # 2. Hostname + optional source_ip + agent_id within time window
+        query = """
+            SELECT i.incident_id, i.first_seen, i.last_seen
+            FROM incidents i
+            JOIN incident_entities e ON i.incident_id = e.incident_id
+            WHERE i.status = 'OPEN'
+            AND e.entity_type = 'hostname' AND e.entity_value = ?
+        """
+        params = [hostname]
+
+        if agent_id:
+            query += """
+                AND NOT EXISTS (
+                    SELECT 1 FROM incident_entities ea
+                    WHERE ea.incident_id = i.incident_id
+                    AND ea.entity_type = 'agent_id'
+                    AND ea.entity_value != ?
+                )
+            """
+            params.append(agent_id)
+
+        if source_ip:
+            query += """
+                AND EXISTS (
+                    SELECT 1 FROM incident_entities e2
+                    WHERE e2.incident_id = i.incident_id
+                    AND e2.entity_type = 'source_ip' AND e2.entity_value = ?
+                )
+            """
+            params.append(source_ip)
+
+        cursor = self.conn.execute(query, params)
+        return self._filter_and_rank_candidates(cursor.fetchall(), event_time)
 
     def _create_incident(self, event: DetectionEvent, event_time: datetime, entities: List[Tuple[str, str]]):
         incident_id = str(uuid.uuid4())

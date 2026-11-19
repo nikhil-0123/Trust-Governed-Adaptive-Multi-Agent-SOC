@@ -200,8 +200,18 @@ class ReasoningWorker(threading.Thread):
             
         hostname = entities.get("hostname", ["unavailable"])[0]
         source_ip = entities.get("source_ip", ["unavailable"])[0]
-        username = entities.get("username", ["unavailable"])[0]
         agent_id = entities.get("agent_id", ["unavailable"])[0]
+        domain_account = entities.get("domain_account", [None])[0]
+        endpoint_account = entities.get("endpoint_account", [None])[0]
+
+        username = entities.get("username", [None])[0]
+        if not username:
+            if domain_account:
+                username = domain_account
+            elif endpoint_account:
+                username = endpoint_account.split("|", 1)[-1]
+            else:
+                username = "unavailable"
             
         incident_context = {
             "incident_id": incident_id,
@@ -212,7 +222,9 @@ class ReasoningWorker(threading.Thread):
             "hostname": hostname,
             "source_ip": source_ip,
             "username": username,
-            "agent_id": agent_id
+            "agent_id": agent_id,
+            "domain_account": domain_account,
+            "endpoint_account": endpoint_account
         }
 
         # 4. Bounded Evidence Retrieval

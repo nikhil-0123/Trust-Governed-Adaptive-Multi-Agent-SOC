@@ -280,14 +280,26 @@ class BruteForceRule:
             self.metrics["fast_path_evaluations"] += 1
             return None
 
-        username = normalized_event.get("username")
-        # Fast-path 2: Cannot group safely without a username
-        if not username:
-            self.metrics["fast_path_evaluations"] += 1
-            return None
+        endpoint_hostname = normalized_event.get("hostname", "unknown-host")
 
-        source_ip = normalized_event.get("source_ip")
-        group_key = (username, source_ip)
+        # WP-1C: Require verified target_account_id for account-level brute-force tracking
+        target_account_id = evidence.get("target_account_id")
+        if not target_account_id:
+            # Events with unverified target domain must not increment account-level counter
+            if evidence.get("domain_status") == "UNVERIFIED":
+                self.metrics["fast_path_evaluations"] += 1
+                return None
+            username = normalized_event.get("username")
+            if not username:
+                self.metrics["fast_path_evaluations"] += 1
+                return None
+            # Synthetic legacy unit test compatibility (when target_account_id not provided in evidence)
+            source_ip = normalized_event.get("source_ip")
+            group_key = (username, source_ip)
+            target_account_id = f"LOCAL_SAM\\{username.lower()}"
+        else:
+            source_ip = normalized_event.get("source_ip")
+            group_key = (target_account_id, endpoint_hostname, source_ip)
 
         timestamp_str = normalized_event.get("timestamp")
         try:
@@ -336,12 +348,19 @@ class BruteForceRule:
             if last_alert is None or last_alert < cutoff:
                 group_state["last_alert_time"] = current_time
 
+                username = normalized_event.get("username")
                 result_evidence = {
                     "windows_event_id": 4625,
                     "failure_count": len(group_state["events"]),
                     "threshold": self.failure_threshold,
                     "window_seconds": self.window_seconds,
+                    "target_account_id": target_account_id,
+                    "target_user": evidence.get("target_user") or username,
+                    "target_domain": evidence.get("target_domain"),
+                    "domain_status": evidence.get("domain_status", "LOCAL_SAM"),
+                    "domain_namespace": evidence.get("domain_namespace", "LOCAL_SAM"),
                     "username": username,
+                    "hostname": endpoint_hostname,
                     "related_event_ids": [eid for t, eid in group_state["events"]]
                 }
 
