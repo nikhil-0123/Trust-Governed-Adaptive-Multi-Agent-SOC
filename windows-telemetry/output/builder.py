@@ -24,6 +24,51 @@ class DetectionEventBuilder:
         # Deterministic ID algorithm: SHA256(agent_id + source_event_id + detection_type + detector_name)
         hash_input = f"{normalized_event['agent_id']}|{source_event_id}|{result.detection_type}|{result.detector_name}".encode('utf-8')
         detection_event_id = hashlib.sha256(hash_input).hexdigest()
+
+        # WP-1C: Ensure all canonical identity attributes from normalized event survive into DetectionEvent.evidence
+        evidence = result.evidence.copy() if result.evidence else {}
+        norm_evidence = normalized_event.get("evidence") or {}
+        for id_field in (
+            "target_account_id",
+            "target_user",
+            "target_domain",
+            "domain_status",
+            "domain_namespace",
+            "caller_user",
+            "caller_domain",
+        ):
+            if id_field in norm_evidence and id_field not in evidence:
+                evidence[id_field] = norm_evidence[id_field]
+
+        if "username" in normalized_event and "username" not in evidence:
+            evidence["username"] = normalized_event["username"]
+
+        # Phase 2: Preserve Sysmon process, network, and DNS attributes
+        for fld in (
+            "sysmon_event_id",
+            "process_guid",
+            "parent_process_guid",
+            "process_id",
+            "parent_process_id",
+            "process_name",
+            "parent_process_name",
+            "sha256",
+            "md5",
+            "sha1",
+            "imphash",
+            "integrity_level",
+            "current_directory",
+            "destination_ip",
+            "destination_port",
+            "source_port",
+            "protocol",
+            "initiated",
+            "query_name",
+            "query_status",
+            "query_results",
+        ):
+            if fld in norm_evidence and fld not in evidence:
+                evidence[fld] = norm_evidence[fld]
         
         return DetectionEvent(
             detection_event_id=detection_event_id,
@@ -36,5 +81,5 @@ class DetectionEventBuilder:
             confidence=result.confidence,
             severity=result.severity,
             detector_name=result.detector_name,
-            evidence=result.evidence.copy()
+            evidence=evidence
         )

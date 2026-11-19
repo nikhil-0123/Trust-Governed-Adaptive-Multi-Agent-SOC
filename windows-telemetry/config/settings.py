@@ -33,6 +33,8 @@ class Settings:
 
         # Step 2: Collector Configuration
         self.windows_security_log_name = os.getenv("WINDOWS_SECURITY_LOG_NAME", "Security")
+        self.windows_sysmon_log_name = os.getenv("WINDOWS_SYSMON_LOG_NAME", "Microsoft-Windows-Sysmon/Operational")
+        self.enable_sysmon_collection = os.getenv("ENABLE_SYSMON_COLLECTION", "true").lower() == "true"
         self.windows_event_batch_size = int(os.getenv("WINDOWS_EVENT_BATCH_SIZE", "100"))
         self.windows_event_poll_interval = int(os.getenv("WINDOWS_EVENT_POLL_INTERVAL_SECONDS", "5"))
         self.windows_initial_lookback_minutes = int(os.getenv("WINDOWS_INITIAL_LOOKBACK_MINUTES", "10"))

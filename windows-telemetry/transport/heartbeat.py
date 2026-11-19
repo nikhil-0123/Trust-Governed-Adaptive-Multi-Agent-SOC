@@ -13,6 +13,7 @@ from response.executor import WindowsResponseExecutor
 
 DEFAULT_WINDOWS_CAPABILITIES = [
     "EventLog_4625", "EventLog_4688",
+    "Sysmon_Event1", "Sysmon_Event3", "Sysmon_Event22",
     "BLOCK_SOURCE", "KILL_PROCESS", "ISOLATE_HOST", "DISABLE_ACCOUNT"
 ]
 
@@ -47,7 +48,12 @@ class HeartbeatWorker(threading.Thread):
         self._stop_event = threading.Event()
         self._start_time = time.time()
         self._first_heartbeat_sent = False
-        self.executor = WindowsResponseExecutor(soc_base_url=self.base_url, logger=self.logger)
+        self.executor = WindowsResponseExecutor(
+            soc_base_url=self.base_url,
+            logger=self.logger,
+            agent_id=self.agent_id,
+            hostname=socket.gethostname()
+        )
 
     def run(self):
         self.logger.info(f"HeartbeatWorker started for agent {self.agent_id} targeting {self.base_url} (interval={self.heartbeat_interval}s).")
