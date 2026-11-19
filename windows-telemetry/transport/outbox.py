@@ -11,8 +11,74 @@ try:
     import msvcrt
 except ImportError:
     msvcrt = None
+import hashlib
 from datetime import datetime, timezone, timedelta
-from typing import List, Dict, Any, Optional, NamedTuple
+from typing import List, Dict, Any, Optional, NamedTuple, Tuple
+
+try:
+    from canonical import canonicalize_tgam_rcc_v1
+except ImportError:
+    import sys
+    from pathlib import Path
+    _win_telemetry_dir = str(Path(__file__).resolve().parent.parent)
+    if _win_telemetry_dir not in sys.path:
+        sys.path.insert(0, _win_telemetry_dir)
+    from canonical import canonicalize_tgam_rcc_v1
+
+class OutboxPayloadConflictError(Exception):
+    """
+    Raised when an incoming event has the same detection_event_id as an existing event
+    in the outbox but has a conflicting payload.
+    """
+    def __init__(
+        self,
+        message: str,
+        event_id: str,
+        conflict_id: str,
+        existing_hash: str,
+        incoming_hash: str
+    ):
+        super().__init__(message)
+        self.event_id = event_id
+        self.conflict_id = conflict_id
+        self.existing_hash = existing_hash
+        self.incoming_hash = incoming_hash
+
+def build_outbox_conflict_manifest(
+    event_id: str,
+    hash_min: str,
+    hash_max: str
+) -> Dict[str, Any]:
+    """
+    Builds the authoritative TGAM-RCC-v1 Outbox Conflict Manifest.
+    Required fields: conflict_type ('outbox_payload_collision'), event_id, hash_min, hash_max.
+    """
+    if not isinstance(event_id, str) or not event_id.strip():
+        raise ValueError("event_id must be a non-empty string")
+    if not isinstance(hash_min, str) or not hash_min.strip():
+        raise ValueError("hash_min must be a non-empty string")
+    if not isinstance(hash_max, str) or not hash_max.strip():
+        raise ValueError("hash_max must be a non-empty string")
+
+    return {
+        "conflict_type": "outbox_payload_collision",
+        "event_id": event_id.strip(),
+        "hash_max": hash_max.strip(),
+        "hash_min": hash_min.strip(),
+    }
+
+def generate_outbox_conflict_id(
+    event_id: str,
+    hash_min: str,
+    hash_max: str
+) -> str:
+    """
+    Generates deterministic SHA-256 conflict_id using TGAM-RCC-v1 canonical serialization
+    of the approved conflict manifest.
+    """
+    manifest = build_outbox_conflict_manifest(event_id, hash_min, hash_max)
+    canonical_bytes = canonicalize_tgam_rcc_v1(manifest)
+    return hashlib.sha256(canonical_bytes).hexdigest()
 
 class CheckpointResult(NamedTuple):
     busy: int
@@ -674,8 +740,24 @@ class Outbox:
         conn = self._get_connection()
         try:
             self._validate_or_migrate_schema(conn)
+            self._ensure_conflicts_table(conn)
         finally:
             conn.close()
+
+    def _ensure_conflicts_table(self, conn: sqlite3.Connection):
+        """Ensures companion outbox_conflicts table and index exist."""
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS outbox_conflicts (
+                conflict_id TEXT PRIMARY KEY,
+                detection_event_id TEXT NOT NULL,
+                payload_a TEXT NOT NULL,
+                payload_a_hash TEXT NOT NULL,
+                payload_b TEXT NOT NULL,
+                payload_b_hash TEXT NOT NULL,
+                detected_at TEXT NOT NULL
+            );
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_outbox_conflicts_event_id ON outbox_conflicts(detection_event_id);")
 
     def _validate_or_migrate_schema(self, conn: sqlite3.Connection):
         cur = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='schema_migrations'")
@@ -954,17 +1036,123 @@ class Outbox:
         if not event_id:
             raise ValueError("Event missing detection_event_id")
 
-        def _op(conn: sqlite3.Connection):
-            conn.execute('''
-                INSERT OR IGNORE INTO outbox (detection_event_id, event_data, status)
-                VALUES (?, ?, 'pending')
-            ''', (event_id, json.dumps(event)))
+        incoming_canonical_bytes = canonicalize_tgam_rcc_v1(event)
+        incoming_hash = hashlib.sha256(incoming_canonical_bytes).hexdigest()
+
+        def _op(conn: sqlite3.Connection) -> Optional[Tuple[str, str, str]]:
+            self._ensure_conflicts_table(conn)
+
+            cursor = conn.execute(
+                "SELECT event_data, status FROM outbox WHERE detection_event_id = ?",
+                (event_id,)
+            )
+            row = cursor.fetchone()
+
+            if row is None:
+                conn.execute(
+                    "INSERT INTO outbox (detection_event_id, event_data, status) VALUES (?, ?, 'pending')",
+                    (event_id, json.dumps(event))
+                )
+                return None
+
+            # Existing event found: verify canonical payload equality
+            existing_event_data = json.loads(row["event_data"])
+            existing_canonical_bytes = canonicalize_tgam_rcc_v1(existing_event_data)
+            existing_hash = hashlib.sha256(existing_canonical_bytes).hexdigest()
+
+            if incoming_hash == existing_hash:
+                # Deterministic identical event replay: idempotent no-op
+                return None
+
+            # Conflicting payload detected!
+            # Condition 3: Deterministic conflict evidence
+            # Sort payloads deterministically so submitting A->B or B->A produces identical row contents
+            if existing_hash < incoming_hash:
+                ha, pa = existing_hash, existing_canonical_bytes.decode("utf-8")
+                hb, pb = incoming_hash, incoming_canonical_bytes.decode("utf-8")
+            else:
+                ha, pa = incoming_hash, incoming_canonical_bytes.decode("utf-8")
+                hb, pb = existing_hash, existing_canonical_bytes.decode("utf-8")
+
+            conflict_id = generate_outbox_conflict_id(event_id=event_id, hash_min=ha, hash_max=hb)
+
+            # Record durable conflict evidence into outbox_conflicts inside transaction
+            conn.execute("""
+                INSERT OR IGNORE INTO outbox_conflicts (
+                    conflict_id,
+                    detection_event_id,
+                    payload_a,
+                    payload_a_hash,
+                    payload_b,
+                    payload_b_hash,
+                    detected_at
+                ) VALUES (?, ?, ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+            """, (conflict_id, event_id, pa, ha, pb, hb))
+
+            return (conflict_id, existing_hash, incoming_hash)
 
         try:
-            self._execute_transaction_with_retry(_op)
+            conflict_info = self._execute_transaction_with_retry(_op)
         except Exception as e:
             self.logger.error(f"Failed to add event {event_id} to outbox: {e}")
             raise
+
+        # Condition 1: Conflict durability and crash semantics
+        # Conflict evidence committed to disk before raising OutboxPayloadConflictError
+        if conflict_info is not None:
+            conflict_id, existing_hash, incoming_hash = conflict_info
+            msg = (
+                f"Outbox payload conflict detected for detection_event_id '{event_id}': "
+                f"existing_hash={existing_hash}, incoming_hash={incoming_hash}, conflict_id={conflict_id}"
+            )
+            self.logger.error(msg)
+            raise OutboxPayloadConflictError(
+                message=msg,
+                event_id=event_id,
+                conflict_id=conflict_id,
+                existing_hash=existing_hash,
+                incoming_hash=incoming_hash
+            )
+
+    def get_conflict(self, conflict_id: str) -> Optional[Dict[str, Any]]:
+        conn = self._get_connection()
+        try:
+            cursor = conn.execute(
+                "SELECT conflict_id, detection_event_id, payload_a, payload_a_hash, payload_b, payload_b_hash, detected_at "
+                "FROM outbox_conflicts WHERE conflict_id = ?",
+                (conflict_id,)
+            )
+            row = cursor.fetchone()
+            return dict(row) if row else None
+        finally:
+            conn.close()
+
+    def get_conflicts_for_event(self, event_id: str) -> List[Dict[str, Any]]:
+        conn = self._get_connection()
+        try:
+            cursor = conn.execute(
+                "SELECT conflict_id, detection_event_id, payload_a, payload_a_hash, payload_b, payload_b_hash, detected_at "
+                "FROM outbox_conflicts WHERE detection_event_id = ? ORDER BY detected_at ASC",
+                (event_id,)
+            )
+            return [dict(row) for row in cursor.fetchall()]
+        finally:
+            conn.close()
+
+    def get_all_conflicts(self, limit: Optional[int] = None) -> List[Dict[str, Any]]:
+        conn = self._get_connection()
+        try:
+            self._ensure_conflicts_table(conn)
+            query = (
+                "SELECT conflict_id, detection_event_id, payload_a, payload_a_hash, payload_b, payload_b_hash, detected_at "
+                "FROM outbox_conflicts ORDER BY detected_at ASC, conflict_id ASC"
+            )
+            if limit is not None:
+                query += f" LIMIT {int(limit)}"
+            cursor = conn.execute(query)
+            return [dict(row) for row in cursor.fetchall()]
+        finally:
+            conn.close()
 
     def get_pending_events(self, limit: int = 50, eligible_only: bool = False, now_utc: Optional[str] = None) -> List[Dict[str, Any]]:
         conn = self._get_connection()

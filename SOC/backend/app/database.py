@@ -19,6 +19,97 @@ def init_db():
             )
         ''')
         
+        # WP-1E.4 Ingestion & Epoch Governance Columns on events
+        for col_def in [
+            "payload_hash TEXT",
+            "quarantine_status TEXT",
+            "agent_id TEXT",
+            "channel TEXT",
+            "channel_epoch INTEGER",
+            "transition_id TEXT",
+            "recovery_request_id TEXT"
+        ]:
+            try:
+                conn.execute(f"ALTER TABLE events ADD COLUMN {col_def}")
+            except sqlite3.OperationalError:
+                pass  # Column already exists
+
+        # WP-1E.4 Ingestion & Epoch Governance Tables
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS event_conflicts (
+                conflict_id TEXT PRIMARY KEY,
+                event_id TEXT NOT NULL,
+                payload_a TEXT NOT NULL,
+                payload_a_hash TEXT NOT NULL,
+                payload_b TEXT NOT NULL,
+                payload_b_hash TEXT NOT NULL,
+                detected_at TEXT NOT NULL
+            )
+        ''')
+        conn.execute('CREATE INDEX IF NOT EXISTS idx_event_conflicts_event_id ON event_conflicts(event_id)')
+
+        # WP-1E.4S Transition Conflicts Table
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS transition_conflicts (
+                conflict_id TEXT PRIMARY KEY,
+                transition_id TEXT NOT NULL,
+                payload_a TEXT NOT NULL,
+                payload_a_hash TEXT NOT NULL,
+                payload_b TEXT NOT NULL,
+                payload_b_hash TEXT NOT NULL,
+                detected_at TEXT NOT NULL
+            )
+        ''')
+        conn.execute('CREATE INDEX IF NOT EXISTS idx_transition_conflicts_tid ON transition_conflicts(transition_id)')
+
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS agent_channel_epochs (
+                agent_id TEXT NOT NULL,
+                channel TEXT NOT NULL,
+                current_epoch INTEGER NOT NULL DEFAULT 1,
+                status TEXT NOT NULL DEFAULT 'ACTIVE',
+                last_transition_id TEXT,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (agent_id, channel)
+            )
+        ''')
+        conn.execute('CREATE INDEX IF NOT EXISTS idx_agent_channel_epochs_lookup ON agent_channel_epochs(agent_id, channel)')
+
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS channel_transitions (
+                transition_id TEXT PRIMARY KEY,
+                agent_id TEXT NOT NULL,
+                source_channel TEXT NOT NULL,
+                target_channel TEXT NOT NULL,
+                target_epoch INTEGER NOT NULL,
+                transition_type TEXT NOT NULL,
+                received_at TEXT NOT NULL,
+                payload TEXT
+            )
+        ''')
+        conn.execute('CREATE INDEX IF NOT EXISTS idx_channel_transitions_lookup ON channel_transitions(agent_id, source_channel, target_epoch)')
+
+        for col_def in [
+            "payload_hash TEXT",
+            "recovery_request_id TEXT"
+        ]:
+            try:
+                conn.execute(f"ALTER TABLE channel_transitions ADD COLUMN {col_def}")
+            except sqlite3.OperationalError:
+                pass  # Column already exists
+
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS epoch_allocation_ledger (
+                recovery_request_id TEXT PRIMARY KEY,
+                agent_id TEXT NOT NULL,
+                channel TEXT NOT NULL,
+                recovery_reason TEXT NOT NULL,
+                allocated_epoch INTEGER NOT NULL,
+                allocated_at TEXT NOT NULL
+            )
+        ''')
+        conn.execute('CREATE INDEX IF NOT EXISTS idx_epoch_alloc_agent_ch ON epoch_allocation_ledger(agent_id, channel)')
+
         # New Step 7 Tables
         conn.execute('''
             CREATE TABLE IF NOT EXISTS fusion_event_state (

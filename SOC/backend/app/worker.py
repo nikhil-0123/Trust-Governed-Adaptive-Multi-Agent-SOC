@@ -34,11 +34,14 @@ class FusionWorker(threading.Thread):
         with get_db_connection() as conn:
             # Sync fusion_event_state for any new events
             # Insert PENDING for events that aren't in fusion_event_state yet
+            # Only verified active-epoch events and explicitly released events enter the eligible processing path
+            # Fail closed for LEGACY_UNVERIFIED, GAP_QUARANTINED, RETIRED_EPOCH_DELAYED, and unverified NULL
             conn.execute("""
                 INSERT INTO fusion_event_state (detection_event_id, status, updated_at)
                 SELECT detection_event_id, 'PENDING', CURRENT_TIMESTAMP 
                 FROM events 
-                WHERE detection_event_id NOT IN (SELECT detection_event_id FROM fusion_event_state)
+                WHERE quarantine_status IN ('ACTIVE_VERIFIED', 'RELEASED')
+                  AND detection_event_id NOT IN (SELECT detection_event_id FROM fusion_event_state)
             """)
             conn.commit()
 
