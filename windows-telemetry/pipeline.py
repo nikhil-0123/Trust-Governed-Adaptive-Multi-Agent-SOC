@@ -1,4 +1,5 @@
 import logging
+from typing import List, Optional, Dict, Any
 from config.settings import config
 from normalizer.windows_event_normalizer import WindowsEventNormalizer
 from detection.detector import DetectionEngine
@@ -51,20 +52,54 @@ class WindowsDetectionPipeline:
         self.delivery_manager = DeliveryManager(self.outbox, self.client, logger)
         # Daemon delivery worker
         self.delivery_worker = DeliveryWorker(self.delivery_manager, logger, poll_interval=1.0)
-        # Daemon heartbeat worker
+        # Daemon heartbeat worker - initialized with effective capabilities
         self.heartbeat_worker = HeartbeatWorker(
             agent_id=self.identity.agent_id,
             os_type="windows",
             soc_api_url=config.soc_api_url,
             api_token=config.soc_api_token,
             logger=logger,
-            capabilities=[
-                "EventLog_4625", "EventLog_4688",
-                "Sysmon_Event1", "Sysmon_Event3", "Sysmon_Event22",
-                "BLOCK_SOURCE", "KILL_PROCESS", "ISOLATE_HOST", "DISABLE_ACCOUNT"
-            ],
+            capabilities=self.get_effective_capabilities(),
             heartbeat_interval=15.0
         )
+
+    def get_effective_capabilities(self) -> List[str]:
+        """
+        Computes the effective capability list based on configured and initialized collectors.
+
+        Security capabilities ('EventLog_4625', 'EventLog_4688') and mitigation actions
+        ('BLOCK_SOURCE', 'KILL_PROCESS', 'ISOLATE_HOST', 'DISABLE_ACCOUNT') are base endpoint capabilities.
+
+        Sysmon capabilities ('Sysmon_Event1', 'Sysmon_Event3', 'Sysmon_Event22') are reported
+        ONLY when Sysmon collection is enabled in settings AND the Sysmon collector has
+        initialized successfully.
+
+        Note: Reporting Sysmon capabilities indicates that the local collector is configured
+        and initialized; it does not assert verified live service status of the Windows Sysmon driver.
+        """
+        caps = ["EventLog_4625", "EventLog_4688"]
+
+        if (
+            config.enable_sysmon_collection
+            and self.sysmon_collector is not None
+            and getattr(self.sysmon_collector, "is_initialized", False)
+        ):
+            caps.extend(["Sysmon_Event1", "Sysmon_Event3", "Sysmon_Event22"])
+
+        caps.extend(["BLOCK_SOURCE", "KILL_PROCESS", "ISOLATE_HOST", "DISABLE_ACCOUNT"])
+
+        seen = set()
+        return [c for c in caps if not (c in seen or seen.add(c))]
+
+    def refresh_capabilities(self) -> List[str]:
+        """
+        Re-evaluates effective capabilities based on current collector states
+        and updates the heartbeat worker.
+        """
+        effective = self.get_effective_capabilities()
+        if hasattr(self, "heartbeat_worker") and self.heartbeat_worker:
+            self.heartbeat_worker.update_capabilities(effective)
+        return effective
 
     def initialize(self):
         config.ensure_directories()
@@ -72,8 +107,12 @@ class WindowsDetectionPipeline:
         if self.sysmon_collector:
             try:
                 self.sysmon_collector.initialize()
+                self.logger.info("Sysmon collector initialized; reporting configured Sysmon capabilities.")
             except Exception as e:
                 self.logger.warning(f"Sysmon collector initialization bypassed: {e}")
+                self.sysmon_collector.is_initialized = False
+
+        self.refresh_capabilities()
         self.delivery_worker.start()
         self.heartbeat_worker.start()
 

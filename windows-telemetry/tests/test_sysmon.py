@@ -1,4 +1,5 @@
 import unittest
+from unittest import mock
 import os
 import json
 import tempfile
@@ -506,13 +507,84 @@ class TestSysmonPipelineMultichannel(unittest.TestCase):
         self.assertEqual(payload["evidence"]["sysmon_event_id"], 1)
         self.assertEqual(payload["evidence"]["sha256"], "A1B2C3D4E5F60718293A4B5C6D7E8F90A1B2C3D4E5F60718293A4B5C6D7E8F90")
 
-    def test_pipeline_heartbeat_capabilities_include_sysmon(self):
+    def test_pipeline_heartbeat_capabilities_include_sysmon_when_initialized(self):
+        """When Sysmon is enabled and collector initializes successfully, all 3 Sysmon capabilities are present."""
         logger = logging.getLogger("TestCapabilities")
         pipeline = WindowsDetectionPipeline(logger)
-        caps = pipeline.heartbeat_worker.capabilities
+        # Before initialization: Sysmon capabilities must be absent
+        self.assertNotIn("Sysmon_Event1", pipeline.heartbeat_worker.capabilities)
+        self.assertNotIn("Sysmon_Event3", pipeline.heartbeat_worker.capabilities)
+        self.assertNotIn("Sysmon_Event22", pipeline.heartbeat_worker.capabilities)
+
+        # Initialize Sysmon collector and refresh capabilities
+        pipeline.collector.initialize()
+        self.assertIsNotNone(pipeline.sysmon_collector)
+        pipeline.sysmon_collector.initialize()
+        caps = pipeline.refresh_capabilities()
+
         self.assertIn("Sysmon_Event1", caps)
         self.assertIn("Sysmon_Event3", caps)
         self.assertIn("Sysmon_Event22", caps)
+        self.assertIn("EventLog_4625", caps)
+        self.assertIn("EventLog_4688", caps)
+        self.assertIn("BLOCK_SOURCE", caps)
+        self.assertEqual(pipeline.heartbeat_worker.capabilities, caps)
+
+    def test_pipeline_heartbeat_capabilities_sysmon_disabled(self):
+        """When Sysmon collection is disabled, all Sysmon capabilities are absent, Security capabilities remain."""
+        logger = logging.getLogger("TestCapsDisabled")
+        orig_flag = config.enable_sysmon_collection
+        try:
+            config.enable_sysmon_collection = False
+            pipeline = WindowsDetectionPipeline(logger)
+            pipeline.collector.initialize()
+            caps = pipeline.refresh_capabilities()
+
+            self.assertIsNone(pipeline.sysmon_collector)
+            self.assertNotIn("Sysmon_Event1", caps)
+            self.assertNotIn("Sysmon_Event3", caps)
+            self.assertNotIn("Sysmon_Event22", caps)
+            self.assertIn("EventLog_4625", caps)
+            self.assertIn("EventLog_4688", caps)
+            self.assertIn("BLOCK_SOURCE", caps)
+        finally:
+            config.enable_sysmon_collection = orig_flag
+
+    def test_pipeline_heartbeat_capabilities_sysmon_init_failure(self):
+        """When Sysmon collector fails to initialize, Sysmon capabilities are absent, Security capabilities remain."""
+        logger = logging.getLogger("TestCapsInitFail")
+        pipeline = WindowsDetectionPipeline(logger)
+        pipeline.collector.initialize()
+
+        # Simulate Sysmon initialization failure
+        with mock.patch.object(pipeline.sysmon_collector, "initialize", side_effect=RuntimeError("Sysmon channel unavailable")):
+            try:
+                pipeline.sysmon_collector.initialize()
+            except Exception:
+                pipeline.sysmon_collector.is_initialized = False
+
+            caps = pipeline.refresh_capabilities()
+
+            self.assertFalse(pipeline.sysmon_collector.is_initialized)
+            self.assertNotIn("Sysmon_Event1", caps)
+            self.assertNotIn("Sysmon_Event3", caps)
+            self.assertNotIn("Sysmon_Event22", caps)
+            self.assertIn("EventLog_4625", caps)
+            self.assertIn("EventLog_4688", caps)
+            self.assertIn("BLOCK_SOURCE", caps)
+
+    def test_pipeline_capabilities_no_duplicates(self):
+        """Effective capabilities must never contain duplicate entries."""
+        logger = logging.getLogger("TestCapsNoDup")
+        pipeline = WindowsDetectionPipeline(logger)
+        caps_initial = pipeline.get_effective_capabilities()
+        self.assertEqual(len(caps_initial), len(set(caps_initial)))
+
+        pipeline.collector.initialize()
+        if pipeline.sysmon_collector:
+            pipeline.sysmon_collector.initialize()
+        caps_initialized = pipeline.get_effective_capabilities()
+        self.assertEqual(len(caps_initialized), len(set(caps_initialized)))
 
 
 if __name__ == "__main__":
