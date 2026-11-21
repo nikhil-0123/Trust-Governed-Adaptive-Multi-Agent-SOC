@@ -1,4 +1,5 @@
 import json
+import sqlite3
 import uuid
 import logging
 from dataclasses import dataclass
@@ -846,86 +847,171 @@ def dispatch_governed_response(
     dispatched = []
     now_iso = datetime.now(timezone.utc).isoformat()
 
-    for action_item in actions_to_process:
-        cmd_type = action_item["type"]
-        reason = action_item["reason"]
+    # WP-1E Phase 5: Acquire immediate transaction lock for SQLite write reservation
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+    except sqlite3.OperationalError:
+        # Connection may already be inside an active transaction or autocommit off
+        pass
 
-        if cmd_type == "DISABLE_ACCOUNT":
-            # Cardinality and target validation strictly enforced: NEVER broadcast
-            params = build_endpoint_command_params(cmd_type, targets, reason, incident_id, custom_params)
-            params["approved_by"] = approved_by
+    try:
+        for action_item in actions_to_process:
+            cmd_type = action_item["type"]
+            reason = action_item["reason"]
 
-            if params.get("status") == "ESCALATION_REQUIRED":
-                logger.info(
-                    f"DISABLE_ACCOUNT for incident {incident_id} requires enterprise escalation: "
-                    f"{params.get('escalation_reason')}. Zero commands dispatched to endpoints."
-                )
-                continue
-
-            target_agent = params.get("target_agent_id")
-            if not target_agent:
-                raise ValueError(f"Missing target_agent_id for DISABLE_ACCOUNT in incident {incident_id}")
-
-            ep_check = conn.execute("SELECT 1 FROM endpoints WHERE agent_id = ?", (target_agent,)).fetchone()
-            if not ep_check:
-                target_host = params.get("target_hostname") or (targets["hostnames"][0] if targets["hostnames"] else "unknown-host")
-                conn.execute("""
-                    INSERT INTO endpoints (agent_id, hostname, os, status, last_heartbeat)
-                    VALUES (?, ?, 'windows', 'ONLINE', ?)
-                """, (target_agent, target_host, now_iso))
-
-            cmd_id = str(uuid.uuid4())
-            params_json = json.dumps(params)
-            conn.execute("""
-                INSERT INTO endpoint_commands (
-                    command_id, agent_id, command_type, parameters, status, result, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, 'PENDING', NULL, ?, ?)
-            """, (cmd_id, target_agent, cmd_type, params_json, now_iso, now_iso))
-
-            dispatched.append({
-                "command_id": cmd_id,
-                "agent_id": target_agent,
-                "command_type": cmd_type,
-                "parameters": params,
-                "status": "PENDING",
-                "created_at": now_iso
-            })
-
-        else:
-            if not target_agent_ids:
-                logger.warning(f"No target agent IDs identified for incident {incident_id}. Command {cmd_type} will not be dispatched.")
-                continue
-
-            for agent_id in target_agent_ids:
-                ep_check = conn.execute("SELECT 1 FROM endpoints WHERE agent_id = ?", (agent_id,)).fetchone()
-                if not ep_check:
-                    primary_host = targets["hostnames"][0] if targets["hostnames"] else "unknown-host"
-                    conn.execute("""
-                        INSERT INTO endpoints (agent_id, hostname, os, status, last_heartbeat)
-                        VALUES (?, ?, 'unknown', 'ONLINE', ?)
-                    """, (agent_id, primary_host, now_iso))
-
+            if cmd_type == "DISABLE_ACCOUNT":
+                # Cardinality and target validation strictly enforced: NEVER broadcast
                 params = build_endpoint_command_params(cmd_type, targets, reason, incident_id, custom_params)
                 params["approved_by"] = approved_by
 
-                cmd_id = str(uuid.uuid4())
-                params_json = json.dumps(params)
+                if params.get("status") == "ESCALATION_REQUIRED":
+                    logger.info(
+                        f"DISABLE_ACCOUNT for incident {incident_id} requires enterprise escalation: "
+                        f"{params.get('escalation_reason')}. Zero commands dispatched to endpoints."
+                    )
+                    continue
 
-                conn.execute("""
-                    INSERT INTO endpoint_commands (
-                        command_id, agent_id, command_type, parameters, status, result, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, 'PENDING', NULL, ?, ?)
-                """, (cmd_id, agent_id, cmd_type, params_json, now_iso, now_iso))
+                target_agent = params.get("target_agent_id")
+                if not target_agent:
+                    raise ValueError(f"Missing target_agent_id for DISABLE_ACCOUNT in incident {incident_id}")
 
-                dispatched.append({
-                    "command_id": cmd_id,
-                    "agent_id": agent_id,
-                    "command_type": cmd_type,
-                    "parameters": params,
-                    "status": "PENDING",
-                    "created_at": now_iso
-                })
+                # Savepoint per action to guarantee atomic lease reservation and rollback on conflict
+                sp_name = f"sp_lease_disable_{uuid.uuid4().hex[:8]}"
+                conn.execute(f"SAVEPOINT {sp_name}")
+                try:
+                    # 1. Check existing lease
+                    lease_check = conn.execute(
+                        "SELECT lease_id FROM action_leases WHERE agent_id = ? AND incident_id = ? AND action_type = ?",
+                        (target_agent, incident_id, cmd_type)
+                    ).fetchone()
+                    if lease_check:
+                        logger.info(
+                            f"Action lease already active for {cmd_type} on {target_agent} (incident {incident_id}). "
+                            f"Suppressing duplicate command."
+                        )
+                        conn.execute(f"RELEASE SAVEPOINT {sp_name}")
+                        continue
 
-    conn.commit()
-    logger.info(f"Dispatched {len(dispatched)} response command(s) for incident {incident_id} (Approved by: {approved_by})")
-    return dispatched
+                    # 2. Reserve lease BEFORE command insertion (Requirement 8: handle uniqueness conflicts without duplicate commands)
+                    lease_id = str(uuid.uuid4())
+                    conn.execute("""
+                        INSERT INTO action_leases (lease_id, agent_id, incident_id, action_type, command_id, granted_at)
+                        VALUES (?, ?, ?, ?, NULL, ?)
+                    """, (lease_id, target_agent, incident_id, cmd_type, now_iso))
+
+                    # 3. Create endpoint & command
+                    ep_check = conn.execute("SELECT 1 FROM endpoints WHERE agent_id = ?", (target_agent,)).fetchone()
+                    if not ep_check:
+                        target_host = params.get("target_hostname") or (targets["hostnames"][0] if targets["hostnames"] else "unknown-host")
+                        conn.execute("""
+                            INSERT INTO endpoints (agent_id, hostname, os, status, last_heartbeat)
+                            VALUES (?, ?, 'windows', 'ONLINE', ?)
+                        """, (target_agent, target_host, now_iso))
+
+                    cmd_id = str(uuid.uuid4())
+                    params_json = json.dumps(params)
+                    conn.execute("""
+                        INSERT INTO endpoint_commands (
+                            command_id, agent_id, command_type, parameters, status, result, created_at, updated_at
+                        ) VALUES (?, ?, ?, ?, 'PENDING', NULL, ?, ?)
+                    """, (cmd_id, target_agent, cmd_type, params_json, now_iso, now_iso))
+
+                    # 4. Bind command_id to lease
+                    conn.execute("UPDATE action_leases SET command_id = ? WHERE lease_id = ?", (cmd_id, lease_id))
+                    conn.execute(f"RELEASE SAVEPOINT {sp_name}")
+
+                    dispatched.append({
+                        "command_id": cmd_id,
+                        "agent_id": target_agent,
+                        "command_type": cmd_type,
+                        "parameters": params,
+                        "status": "PENDING",
+                        "created_at": now_iso
+                    })
+                except sqlite3.IntegrityError:
+                    conn.execute(f"ROLLBACK TO SAVEPOINT {sp_name}")
+                    logger.info(
+                        f"Action lease conflict for {cmd_type} on {target_agent} (incident {incident_id}). "
+                        f"Duplicate command suppressed."
+                    )
+                    continue
+
+            else:
+                if not target_agent_ids:
+                    logger.warning(f"No target agent IDs identified for incident {incident_id}. Command {cmd_type} will not be dispatched.")
+                    continue
+
+                for agent_id in target_agent_ids:
+                    sp_name = f"sp_lease_{cmd_type}_{uuid.uuid4().hex[:8]}"
+                    conn.execute(f"SAVEPOINT {sp_name}")
+                    try:
+                        # 1. Check existing lease
+                        lease_check = conn.execute(
+                            "SELECT lease_id FROM action_leases WHERE agent_id = ? AND incident_id = ? AND action_type = ?",
+                            (agent_id, incident_id, cmd_type)
+                        ).fetchone()
+                        if lease_check:
+                            logger.info(
+                                f"Action lease already active for {cmd_type} on {agent_id} (incident {incident_id}). "
+                                f"Suppressing duplicate command."
+                            )
+                            conn.execute(f"RELEASE SAVEPOINT {sp_name}")
+                            continue
+
+                        # 2. Reserve lease BEFORE command insertion
+                        lease_id = str(uuid.uuid4())
+                        conn.execute("""
+                            INSERT INTO action_leases (lease_id, agent_id, incident_id, action_type, command_id, granted_at)
+                            VALUES (?, ?, ?, ?, NULL, ?)
+                        """, (lease_id, agent_id, incident_id, cmd_type, now_iso))
+
+                        # 3. Create endpoint & command
+                        ep_check = conn.execute("SELECT 1 FROM endpoints WHERE agent_id = ?", (agent_id,)).fetchone()
+                        if not ep_check:
+                            primary_host = targets["hostnames"][0] if targets["hostnames"] else "unknown-host"
+                            conn.execute("""
+                                INSERT INTO endpoints (agent_id, hostname, os, status, last_heartbeat)
+                                VALUES (?, ?, 'unknown', 'ONLINE', ?)
+                            """, (agent_id, primary_host, now_iso))
+
+                        params = build_endpoint_command_params(cmd_type, targets, reason, incident_id, custom_params)
+                        params["approved_by"] = approved_by
+
+                        cmd_id = str(uuid.uuid4())
+                        params_json = json.dumps(params)
+                        conn.execute("""
+                            INSERT INTO endpoint_commands (
+                                command_id, agent_id, command_type, parameters, status, result, created_at, updated_at
+                            ) VALUES (?, ?, ?, ?, 'PENDING', NULL, ?, ?)
+                        """, (cmd_id, agent_id, cmd_type, params_json, now_iso, now_iso))
+
+                        # 4. Bind command_id to lease
+                        conn.execute("UPDATE action_leases SET command_id = ? WHERE lease_id = ?", (cmd_id, lease_id))
+                        conn.execute(f"RELEASE SAVEPOINT {sp_name}")
+
+                        dispatched.append({
+                            "command_id": cmd_id,
+                            "agent_id": agent_id,
+                            "command_type": cmd_type,
+                            "parameters": params,
+                            "status": "PENDING",
+                            "created_at": now_iso
+                        })
+                    except sqlite3.IntegrityError:
+                        conn.execute(f"ROLLBACK TO SAVEPOINT {sp_name}")
+                        logger.info(
+                            f"Action lease conflict for {cmd_type} on {agent_id} (incident {incident_id}). "
+                            f"Duplicate command suppressed."
+                        )
+                        continue
+
+        conn.commit()
+        logger.info(f"Dispatched {len(dispatched)} response command(s) for incident {incident_id} (Approved by: {approved_by})")
+        return dispatched
+
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        raise

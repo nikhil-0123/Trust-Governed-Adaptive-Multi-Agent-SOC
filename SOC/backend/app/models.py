@@ -8,11 +8,12 @@ class DetectionEvent(BaseModel):
     agent_id: str
     hostname: str
     os: str
-    source_event_id: str
+    source_event_id: Optional[str] = None
     detection_type: str
     confidence: float = Field(..., ge=0.0, le=1.0)
     severity: str
     detector_name: str
+    detector_version: Optional[str] = "1.0.0"
     evidence: Dict[str, Any]
 
 class IncidentEvidence(BaseModel):

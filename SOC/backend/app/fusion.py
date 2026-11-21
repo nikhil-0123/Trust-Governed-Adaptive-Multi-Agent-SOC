@@ -1,4 +1,5 @@
 import json
+import sqlite3
 import logging
 from datetime import datetime, timezone
 import uuid
@@ -79,6 +80,21 @@ class EvidenceFusionEngine:
             endpoint_account = f"{event.agent_id}|{raw_username}"
             entities.append(("endpoint_account", endpoint_account))
 
+        # WP-1E Phase 5: Check incident_anchors for historical anchor or re-evaluation
+        if event.agent_id and event.source_event_id:
+            try:
+                anchor_cursor = self.conn.execute(
+                    "SELECT incident_id FROM incident_anchors WHERE agent_id = ? AND source_event_id = ?",
+                    (event.agent_id, event.source_event_id)
+                )
+                anchor_row = anchor_cursor.fetchone()
+                if anchor_row:
+                    anchored_incident_id = anchor_row["incident_id"] if isinstance(anchor_row, sqlite3.Row) else anchor_row[0]
+                    self._attach_evidence(anchored_incident_id, event, event_time, entities, is_reevaluation=True)
+                    return
+            except sqlite3.OperationalError:
+                pass
+
         candidate_incident_id = self._find_candidate_incident(
             hostname=hostname,
             source_ip=source_ip,
@@ -88,9 +104,46 @@ class EvidenceFusionEngine:
         )
 
         if candidate_incident_id:
-            self._attach_evidence(candidate_incident_id, event, event_time, entities)
+            incident_id = candidate_incident_id
+            self._attach_evidence(incident_id, event, event_time, entities, is_reevaluation=False)
+            if event.agent_id and event.source_event_id:
+                try:
+                    now_iso = datetime.now(timezone.utc).isoformat()
+                    self.conn.execute("""
+                        INSERT OR IGNORE INTO incident_anchors (agent_id, source_event_id, incident_id, created_at)
+                        VALUES (?, ?, ?, ?)
+                    """, (event.agent_id, event.source_event_id, incident_id, now_iso))
+                except sqlite3.OperationalError:
+                    pass
         else:
-            self._create_incident(event, event_time, entities)
+            # Need to create an incident. Use a SAVEPOINT to guard against concurrent anchor creation races.
+            if event.agent_id and event.source_event_id:
+                sp_name = f"sp_anchor_{uuid.uuid4().hex[:8]}"
+                self.conn.execute(f"SAVEPOINT {sp_name}")
+                try:
+                    incident_id = self._create_incident(event, event_time, entities)
+                    now_iso = datetime.now(timezone.utc).isoformat()
+                    self.conn.execute("""
+                        INSERT INTO incident_anchors (agent_id, source_event_id, incident_id, created_at)
+                        VALUES (?, ?, ?, ?)
+                    """, (event.agent_id, event.source_event_id, incident_id, now_iso))
+                    self.conn.execute(f"RELEASE SAVEPOINT {sp_name}")
+                except sqlite3.IntegrityError:
+                    # Concurrency conflict: another worker already anchored (agent_id, source_event_id)!
+                    # Rollback the savepoint to completely eliminate the speculative duplicate incident!
+                    self.conn.execute(f"ROLLBACK TO SAVEPOINT {sp_name}")
+
+                    # Fetch the winning anchor and attach this event as HISTORICAL_RE_EVALUATION
+                    anchor_cursor = self.conn.execute(
+                        "SELECT incident_id FROM incident_anchors WHERE agent_id = ? AND source_event_id = ?",
+                        (event.agent_id, event.source_event_id)
+                    )
+                    anchor_row = anchor_cursor.fetchone()
+                    if anchor_row:
+                        winning_id = anchor_row["incident_id"] if isinstance(anchor_row, sqlite3.Row) else anchor_row[0]
+                        self._attach_evidence(winning_id, event, event_time, entities, is_reevaluation=True)
+            else:
+                self._create_incident(event, event_time, entities)
 
     def _filter_and_rank_candidates(self, candidates, event_time: datetime) -> Optional[str]:
         valid_candidates = []
@@ -155,14 +208,28 @@ class EvidenceFusionEngine:
 
         if agent_id:
             query += """
+                AND EXISTS (
+                    SELECT 1 FROM incident_entities ea_match
+                    WHERE ea_match.incident_id = i.incident_id
+                    AND ea_match.entity_type = 'agent_id'
+                    AND ea_match.entity_value = ?
+                )
                 AND NOT EXISTS (
-                    SELECT 1 FROM incident_entities ea
-                    WHERE ea.incident_id = i.incident_id
-                    AND ea.entity_type = 'agent_id'
-                    AND ea.entity_value != ?
+                    SELECT 1 FROM incident_entities ea_conflict
+                    WHERE ea_conflict.incident_id = i.incident_id
+                    AND ea_conflict.entity_type = 'agent_id'
+                    AND ea_conflict.entity_value != ?
                 )
             """
-            params.append(agent_id)
+            params.extend([agent_id, agent_id])
+        else:
+            query += """
+                AND NOT EXISTS (
+                    SELECT 1 FROM incident_entities ea_any
+                    WHERE ea_any.incident_id = i.incident_id
+                    AND ea_any.entity_type = 'agent_id'
+                )
+            """
 
         if source_ip:
             query += """
@@ -187,10 +254,16 @@ class EvidenceFusionEngine:
             VALUES (?, ?, ?, ?, ?, ?, ?)
         """, (incident_id, now, now, event_time_str, event_time_str, event.severity.upper(), "OPEN"))
         
-        self.conn.execute("""
-            INSERT INTO incident_evidence (incident_id, detection_event_id)
-            VALUES (?, ?)
-        """, (incident_id, event.detection_event_id))
+        try:
+            self.conn.execute("""
+                INSERT INTO incident_evidence (incident_id, detection_event_id, classification)
+                VALUES (?, ?, 'PRIMARY_DETECTION')
+            """, (incident_id, event.detection_event_id))
+        except sqlite3.OperationalError:
+            self.conn.execute("""
+                INSERT INTO incident_evidence (incident_id, detection_event_id)
+                VALUES (?, ?)
+            """, (incident_id, event.detection_event_id))
         
         for e_type, e_val in entities:
             self.conn.execute("""
@@ -202,16 +275,25 @@ class EvidenceFusionEngine:
             INSERT OR REPLACE INTO assessment_state (incident_id, status, attempts, updated_at)
             VALUES (?, 'PENDING', 0, ?)
         """, (incident_id, now))
+        return incident_id
 
-    def _attach_evidence(self, incident_id: str, event: DetectionEvent, event_time: datetime, entities: List[Tuple[str, str]]):
-        # Idempotency check: if already attached, do nothing
+    def _attach_evidence(self, incident_id: str, event: DetectionEvent, event_time: datetime, entities: List[Tuple[str, str]], is_reevaluation: bool = False):
+        classification = "HISTORICAL_RE_EVALUATION" if is_reevaluation else "PRIMARY_DETECTION"
+        # Idempotency check: if already attached, do nothing (or update classification if re-evaluation)
         cursor = self.conn.execute("SELECT 1 FROM incident_evidence WHERE incident_id = ? AND detection_event_id = ?", (incident_id, event.detection_event_id))
         if cursor.fetchone():
+            if is_reevaluation:
+                try:
+                    self.conn.execute("UPDATE incident_evidence SET classification = ? WHERE incident_id = ? AND detection_event_id = ?", (classification, incident_id, event.detection_event_id))
+                except sqlite3.OperationalError:
+                    pass
             return
             
         cursor = self.conn.execute("SELECT first_seen, last_seen, max_severity FROM incidents WHERE incident_id = ?", (incident_id,))
         row = cursor.fetchone()
-        
+        if not row:
+            return
+
         current_first = parse_utc_timestamp(row["first_seen"])
         current_last = parse_utc_timestamp(row["last_seen"])
         current_severity = row["max_severity"]
@@ -227,10 +309,22 @@ class EvidenceFusionEngine:
             WHERE incident_id = ?
         """, (now, new_first.isoformat(), new_last.isoformat(), new_severity, incident_id))
         
-        self.conn.execute("""
-            INSERT OR IGNORE INTO incident_evidence (incident_id, detection_event_id)
-            VALUES (?, ?)
-        """, (incident_id, event.detection_event_id))
+        try:
+            self.conn.execute("""
+                INSERT INTO incident_evidence (incident_id, detection_event_id, classification)
+                VALUES (?, ?, ?)
+                ON CONFLICT(incident_id, detection_event_id) DO UPDATE SET classification = excluded.classification
+            """, (incident_id, event.detection_event_id, classification))
+        except sqlite3.OperationalError:
+            self.conn.execute("""
+                INSERT OR IGNORE INTO incident_evidence (incident_id, detection_event_id)
+                VALUES (?, ?)
+            """, (incident_id, event.detection_event_id))
+
+        try:
+            self.conn.execute("UPDATE events SET classification = ? WHERE detection_event_id = ?", (classification, event.detection_event_id))
+        except sqlite3.OperationalError:
+            pass
         
         for e_type, e_val in entities:
             self.conn.execute("""
@@ -242,3 +336,4 @@ class EvidenceFusionEngine:
             INSERT OR REPLACE INTO assessment_state (incident_id, status, attempts, updated_at)
             VALUES (?, 'PENDING', 0, ?)
         """, (incident_id, now))
+        return incident_id

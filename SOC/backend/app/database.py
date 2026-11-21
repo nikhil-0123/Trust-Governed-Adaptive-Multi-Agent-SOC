@@ -355,6 +355,43 @@ def init_db():
         ''')
         conn.execute('CREATE INDEX IF NOT EXISTS idx_endpoint_commands_agent ON endpoint_commands(agent_id, status)')
 
+        # WP-1E Phase 5 Tables: Incident Anchors & Action Leases
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS incident_anchors (
+                agent_id TEXT NOT NULL,
+                source_event_id TEXT NOT NULL,
+                incident_id TEXT NOT NULL,
+                created_at TIMESTAMP NOT NULL,
+                PRIMARY KEY (agent_id, source_event_id),
+                FOREIGN KEY(incident_id) REFERENCES incidents(incident_id)
+            )
+        ''')
+        conn.execute('CREATE INDEX IF NOT EXISTS idx_incident_anchors_lookup ON incident_anchors(agent_id, source_event_id)')
+
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS action_leases (
+                lease_id TEXT PRIMARY KEY,
+                agent_id TEXT NOT NULL,
+                incident_id TEXT NOT NULL,
+                action_type TEXT NOT NULL,
+                command_id TEXT,
+                granted_at TIMESTAMP NOT NULL,
+                UNIQUE(agent_id, incident_id, action_type)
+            )
+        ''')
+        conn.execute('CREATE INDEX IF NOT EXISTS idx_action_leases_lookup ON action_leases(agent_id, incident_id, action_type)')
+
+        # WP-1E Phase 5: Explicit Historical Re-Evaluation Classification Column
+        try:
+            conn.execute("ALTER TABLE incident_evidence ADD COLUMN classification TEXT DEFAULT 'PRIMARY_DETECTION'")
+        except sqlite3.OperationalError:
+            pass
+
+        try:
+            conn.execute("ALTER TABLE events ADD COLUMN classification TEXT DEFAULT 'PRIMARY_DETECTION'")
+        except sqlite3.OperationalError:
+            pass
+
         conn.commit()
 
     finally:

@@ -29,6 +29,8 @@ from app.canonical import (
     DuplicateKeyError,
     TGAMCanonicalizationError,
 )
+from pydantic import ValidationError
+from app.models import DetectionEvent
 
 logger = logging.getLogger(__name__)
 
@@ -52,20 +54,26 @@ def ingest_event_transactional(
     if not isinstance(parsed_dict, dict):
         return 400, {"detail": "JSON body must be an object"}
 
-    # Step 2: Validate essential schema fields
-    event_id = parsed_dict.get("detection_event_id")
-    if not event_id or not isinstance(event_id, str):
+    # Step 2: Validate complete DetectionEvent contract
+    if isinstance(parsed_dict.get("confidence"), bool):
+        return 422, {"detail": "Missing or invalid required field 'confidence': booleans are not allowed"}
+
+    try:
+        validated_event = DetectionEvent(**parsed_dict)
+    except ValidationError as e:
+        return 422, {"detail": f"Schema validation error: {e}"}
+
+    event_id = validated_event.detection_event_id
+    if not event_id or not event_id.strip():
         return 422, {"detail": "Missing or invalid required field 'detection_event_id'"}
-    
-    agent_id = parsed_dict.get("agent_id")
-    if not agent_id or not isinstance(agent_id, str):
+
+    agent_id = validated_event.agent_id
+    if not agent_id or not agent_id.strip():
         return 422, {"detail": "Missing or invalid required field 'agent_id'"}
 
-    confidence = parsed_dict.get("confidence")
-    if confidence is None or not isinstance(confidence, (int, float)) or isinstance(confidence, bool):
-        return 422, {"detail": "Missing or invalid required field 'confidence'"}
-    if confidence < 0.0 or confidence > 1.0:
-        return 422, {"detail": "confidence must be between 0.0 and 1.0"}
+    source_event_id = getattr(validated_event, "source_event_id", None) or parsed_dict.get("source_event_id")
+    if not source_event_id or not str(source_event_id).strip():
+        return 422, {"detail": "Missing or invalid required field 'source_event_id'"}
 
     # Step 3: Compute canonical payload hash
     incoming_hash = compute_payload_hash(parsed_dict)
@@ -347,13 +355,19 @@ def process_channel_transition(
 
         # Sanitize and server-derive authorization fields
         stored_payload = dict(transition_dict)
-        if authenticated_actor:
+        from app.response_bridge import TRUSTED_AUTHORIZATION_ACTORS
+        if authenticated_actor and authenticated_actor in TRUSTED_AUTHORIZATION_ACTORS:
             stored_payload["authorized_by"] = authenticated_actor
             stored_payload["status"] = "APPROVED"
         else:
-            # Strip caller-supplied administrative claims if not authenticated as admin
+            # Strip caller-supplied administrative claims if not authenticated as trusted admin
             for field in ("authorized_by", "approved_by", "authorization_status", "status", "state"):
                 stored_payload.pop(field, None)
+            if isinstance(stored_payload.get("payload"), dict):
+                inner_p = dict(stored_payload["payload"])
+                for field in ("authorized_by", "approved_by", "authorization_status", "status", "state"):
+                    inner_p.pop(field, None)
+                stored_payload["payload"] = inner_p
 
         incoming_hash = compute_payload_hash(stored_payload)
         rec_req_id = stored_payload.get("recovery_request_id")

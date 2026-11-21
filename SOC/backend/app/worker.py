@@ -46,11 +46,15 @@ class FusionWorker(threading.Thread):
             conn.commit()
 
             # Select batch of PENDING, retryable FAILED, or stale PROCESSING
+            # Re-verifies event existence and quarantine_status during every batch query
             cursor = conn.execute("""
-                SELECT detection_event_id FROM fusion_event_state
-                WHERE (status IN ('PENDING', 'FAILED') OR (status = 'PROCESSING' AND updated_at < datetime('now', '-1 hour')))
-                AND attempts < ?
-                ORDER BY updated_at ASC LIMIT 100
+                SELECT fes.detection_event_id
+                FROM fusion_event_state fes
+                INNER JOIN events e ON fes.detection_event_id = e.detection_event_id
+                WHERE (fes.status IN ('PENDING', 'FAILED') OR (fes.status = 'PROCESSING' AND fes.updated_at < datetime('now', '-1 hour')))
+                  AND fes.attempts < ?
+                  AND e.quarantine_status IN ('ACTIVE_VERIFIED', 'RELEASED')
+                ORDER BY fes.updated_at ASC LIMIT 100
             """, (MAX_RETRIES,))
             
             rows = cursor.fetchall()
@@ -73,8 +77,8 @@ class FusionWorker(threading.Thread):
             """, (now, event_id))
             conn.commit()
 
-            # 2. Transaction for actual fusion work
-            conn.execute("BEGIN TRANSACTION")
+            # 2. Transaction for actual fusion work (BEGIN IMMEDIATE for concurrency reservation)
+            conn.execute("BEGIN IMMEDIATE")
             
             engine = EvidenceFusionEngine(conn)
             engine.process_event(event_id)
