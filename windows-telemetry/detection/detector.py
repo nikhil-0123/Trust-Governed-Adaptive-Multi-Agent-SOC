@@ -36,6 +36,16 @@ class DetectionEngine:
             try:
                 result = rule.evaluate(normalized_event)
                 if result:
+                    if not result.rules_digest and hasattr(rule, "get_rules_digest"):
+                        result.rules_digest = rule.get_rules_digest()
+                    if result.thresholds is None and hasattr(rule, "get_thresholds"):
+                        result.thresholds = rule.get_thresholds()
+                    if result.detector_config is None and hasattr(rule, "get_detector_config"):
+                        result.detector_config = rule.get_detector_config()
+                    if hasattr(rule, "detector_version") and getattr(result, "detector_version", "1.0.0") == "1.0.0":
+                        result.detector_version = rule.detector_version
+                    if hasattr(rule, "detector_name") and not getattr(result, "detector_name", None):
+                        result.detector_name = rule.detector_name
                     results.append(result)
             except NotImplementedError as e:
                 self.logger.warning(f"Rule {rule.name} blocked: {e}")

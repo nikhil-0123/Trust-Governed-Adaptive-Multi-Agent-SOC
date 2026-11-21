@@ -33,7 +33,9 @@ class Settings:
 
         # Step 2: Collector Configuration
         self.windows_security_log_name = os.getenv("WINDOWS_SECURITY_LOG_NAME", "Security")
+        self.windows_system_log_name = os.getenv("WINDOWS_SYSTEM_LOG_NAME", "System")
         self.windows_sysmon_log_name = os.getenv("WINDOWS_SYSMON_LOG_NAME", "Microsoft-Windows-Sysmon/Operational")
+        self.enable_system_collection = os.getenv("ENABLE_SYSTEM_COLLECTION", "true").lower() == "true"
         self.enable_sysmon_collection = os.getenv("ENABLE_SYSMON_COLLECTION", "true").lower() == "true"
         self.windows_event_batch_size = int(os.getenv("WINDOWS_EVENT_BATCH_SIZE", "100"))
         self.windows_event_poll_interval = int(os.getenv("WINDOWS_EVENT_POLL_INTERVAL_SECONDS", "5"))
@@ -62,7 +64,9 @@ class Settings:
 
         # Step 6: Central SOC Transport
         self.soc_api_url = os.getenv("SOC_API_URL", "http://127.0.0.1:8000/api/v1/detection-events")
+        self.soc_transition_api_url = os.getenv("SOC_TRANSITION_API_URL", "http://127.0.0.1:8000/api/v1/events/transition")
         self.soc_api_token = os.getenv("SOC_API_TOKEN", "dev-token-123")
+        self.soc_agent_api_token = os.getenv("SOC_AGENT_API_TOKEN", "").strip()
         self.medium_confidence_threshold = float(os.getenv("MEDIUM_CONFIDENCE_THRESHOLD", "0.8"))
 
         # Step 7: Outbox Storage & WAL Configuration (WP-2-D)

@@ -137,6 +137,9 @@ class CanonicalAuthEvent:
     sub_status_code: Optional[str] = None
     target_domain: Optional[str] = None
     source_workstation: Optional[str] = None
+    domain_status: str = "UNVERIFIED"
+    domain_namespace: str = "UNVERIFIED"
+    target_account_id: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -149,6 +152,9 @@ class HistoricalAuthRecord:
     observed_username: Optional[str]
     logon_type: Optional[int]
     logon_type_status: LogonTypeStatus
+    target_account_id: Optional[str] = None
+    target_user: Optional[str] = None
+    domain_namespace: Optional[str] = None
 
 
 class Clock(ABC):
@@ -276,6 +282,36 @@ def canonical_auth_from_contract_v1(event: Dict[str, Any]) -> Optional[Canonical
         observed_username = str(raw_user).strip()
         identity_role = IdentityRole.AMBIGUOUS
 
+    # WP-1C: Invariant resolution for canonical identity fields
+    target_user = evidence.get("target_user")
+    if target_user is None and raw_user not in (None, "", "-"):
+        target_user = str(raw_user).strip()
+    target_domain = evidence.get("target_domain")
+    domain_status = evidence.get("domain_status")
+    domain_namespace = evidence.get("domain_namespace")
+    target_account_id = evidence.get("target_account_id")
+
+    if domain_status is None:
+        if target_user is None:
+            domain_status = "UNVERIFIED"
+            domain_namespace = "UNVERIFIED"
+            target_account_id = None
+        elif target_domain == ".":
+            domain_status = "LOCAL_SAM"
+            domain_namespace = "LOCAL_SAM"
+            target_account_id = f"LOCAL_SAM\\{target_user.lower()}"
+        elif target_domain is not None:
+            domain_status = "OBSERVED_DOMAIN"
+            domain_namespace = f"DOMAIN:{target_domain.upper()}"
+            target_account_id = f"{domain_namespace}\\{target_user.lower()}"
+        else:
+            domain_status = "UNVERIFIED"
+            domain_namespace = "UNVERIFIED"
+            target_account_id = None
+
+    if target_account_id:
+        identity_role = IdentityRole.TARGET_USER
+
     # Logon type parsing
     raw_lt = evidence.get("logon_type")
     if raw_lt is None or raw_lt == "" or raw_lt == "-":
@@ -308,7 +344,16 @@ def canonical_auth_from_contract_v1(event: Dict[str, Any]) -> Optional[Canonical
         source_ip_status=ip_status,
         destination_host=str(hostname),
         ingestion_timestamp=datetime.now(timezone.utc).timestamp(),
-        dedup_hash=str(event_id)
+        dedup_hash=str(event_id),
+        target_user=target_user,
+        caller_user=evidence.get("caller_user"),
+        status_code=evidence.get("status"),
+        sub_status_code=evidence.get("sub_status"),
+        target_domain=target_domain,
+        source_workstation=evidence.get("workstation_name"),
+        domain_status=domain_status,
+        domain_namespace=domain_namespace,
+        target_account_id=target_account_id
     )
 
 
@@ -556,6 +601,9 @@ class AuthenticationFeatureExtractor(ICollectionHealthListener):
             observed_username=event.observed_username,
             logon_type=event.logon_type,
             logon_type_status=event.logon_type_status,
+            target_account_id=event.target_account_id,
+            target_user=event.target_user,
+            domain_namespace=event.domain_namespace
         )
         q.append(rec)
         self._entity_last_active[entity_key] = event.timestamp_epoch
@@ -574,8 +622,11 @@ class AuthenticationFeatureExtractor(ICollectionHealthListener):
         host = event.destination_host
         t = event.timestamp_epoch
 
-        # Features f1-f4: strictly unavailable while identity is ambiguous
-        f1_reason = "AMBIGUOUS_IDENTITY_ROLE" if event.identity_role == IdentityRole.AMBIGUOUS else "TARGET_USER_REQUIRED"
+        # Features f1-f4: strictly unavailable while identity is ambiguous or domain unverified
+        if event.domain_status == "UNVERIFIED" and event.target_user:
+            f1_reason = "TARGET_DOMAIN_UNVERIFIED"
+        else:
+            f1_reason = "AMBIGUOUS_IDENTITY_ROLE" if event.identity_role == IdentityRole.AMBIGUOUS else "TARGET_USER_REQUIRED"
         f1 = FeatureMeasurement(value=None, is_available=False, reason=f1_reason)
         f2 = FeatureMeasurement(value=None, is_available=False, reason=f1_reason)
         f3 = FeatureMeasurement(value=None, is_available=False, reason=f1_reason)

@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 
 @dataclass
 class DetectionEvent:
@@ -14,3 +14,5 @@ class DetectionEvent:
     severity: str
     detector_name: str
     evidence: Dict[str, Any] = field(default_factory=dict)
+    detector_version: str = "1.0.0"
+    detector_revision: Optional[str] = None

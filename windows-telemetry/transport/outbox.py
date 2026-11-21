@@ -555,6 +555,14 @@ class WindowsProcessLock:
     def __exit__(self, exc_type, exc_val, exc_tb):
         self.release()
 
+class OutboxLockTimeoutError(Exception):
+    """Raised when outbox lock acquisition times out or fails under strict concurrency enforcement."""
+    pass
+
+class DeliveryLockTimeoutError(OutboxLockTimeoutError):
+    """Alias for outbox lock acquisition failure in delivery layer."""
+    pass
+
 class OutboxLock:
     """
     Two-Tier Synchronization Guard:
@@ -572,16 +580,28 @@ class OutboxLock:
         self._local_acquired = False
         self._os_lock = WindowsProcessLock(self.canonical_lock_path, logger=logger)
         self._os_acquired = False
+        self._holder_thread: Optional[int] = None
 
-    def acquire(self) -> bool:
+    def is_held_by_current_thread(self) -> bool:
+        return self._os_acquired and self._holder_thread == threading.get_ident()
+
+    def acquire(self, timeout: float = 0.0) -> bool:
+        if self.is_held_by_current_thread():
+            return True
+
         with self._registry_lock:
             if self.canonical_db_path not in self._process_locks:
                 self._process_locks[self.canonical_db_path] = threading.Lock()
             self._local_lock = self._process_locks[self.canonical_db_path]
 
-        self._local_acquired = self._local_lock.acquire(blocking=False)
-        if not self._local_acquired:
-            return False
+        start_time = time.time()
+        while True:
+            self._local_acquired = self._local_lock.acquire(blocking=False)
+            if self._local_acquired:
+                break
+            if timeout <= 0 or (time.time() - start_time) >= timeout:
+                return False
+            time.sleep(0.01)
 
         self._os_acquired = self._os_lock.acquire()
         if not self._os_acquired:
@@ -589,6 +609,7 @@ class OutboxLock:
             self._local_acquired = False
             return False
 
+        self._holder_thread = threading.get_ident()
         return True
 
     def release(self) -> None:
@@ -597,6 +618,7 @@ class OutboxLock:
                 self._os_lock.release()
         finally:
             self._os_acquired = False
+            self._holder_thread = None
             if self._local_acquired and self._local_lock is not None:
                 try:
                     self._local_lock.release()
@@ -1199,7 +1221,7 @@ class Outbox:
                         last_attempt = strftime('%Y-%m-%dT%H:%M:%SZ', 'now'),
                         last_error = ?,
                         next_attempt_at = ?
-                    WHERE detection_event_id = ?
+                    WHERE detection_event_id = ? AND status != 'delivered'
                 ''', (sanitized_error, next_attempt_at, event_id))
             else:
                 conn.execute('''
@@ -1207,7 +1229,7 @@ class Outbox:
                         attempts = attempts + 1,
                         last_attempt = strftime('%Y-%m-%dT%H:%M:%SZ', 'now'),
                         last_error = ?
-                    WHERE detection_event_id = ?
+                    WHERE detection_event_id = ? AND status != 'delivered'
                 ''', (sanitized_error, event_id))
 
         self._execute_transaction_with_retry(_op)
@@ -1226,7 +1248,7 @@ class Outbox:
                         last_error = ?,
                         last_attempt = strftime('%Y-%m-%dT%H:%M:%SZ', 'now'),
                         next_attempt_at = NULL
-                    WHERE detection_event_id = ?
+                    WHERE detection_event_id = ? AND status != 'delivered'
                 ''', (reason, sanitized_error, event_id))
             else:
                 conn.execute('''
@@ -1237,7 +1259,7 @@ class Outbox:
                         last_error = ?,
                         last_attempt = strftime('%Y-%m-%dT%H:%M:%SZ', 'now'),
                         next_attempt_at = NULL
-                    WHERE detection_event_id = ?
+                    WHERE detection_event_id = ? AND status != 'delivered'
                 ''', (reason, sanitized_error, event_id))
 
         self._execute_transaction_with_retry(_op)
@@ -1272,4 +1294,358 @@ class Outbox:
             ''', (cutoff_time,))
             return cur.rowcount
 
+        return self._execute_transaction_with_retry(_op)
+
+    def add_transition(self, transition: Dict[str, Any]):
+        """Directs ChannelTransition to the dedicated transition_outbox table."""
+        if not hasattr(self, "_transition_outbox") or self._transition_outbox is None:
+            self._transition_outbox = TransitionOutbox(
+                self.db_path,
+                self.logger,
+                busy_timeout_ms=self.busy_timeout_ms,
+                synchronous_mode=self.synchronous_mode,
+                wal_autocheckpoint=self.wal_autocheckpoint
+            )
+        return self._transition_outbox.add_transition(transition)
+
+    def get_pending_transitions(self, limit: int = 50, eligible_only: bool = False, now_utc: Optional[str] = None) -> List[Dict[str, Any]]:
+        if not hasattr(self, "_transition_outbox") or self._transition_outbox is None:
+            self._transition_outbox = TransitionOutbox(
+                self.db_path,
+                self.logger,
+                busy_timeout_ms=self.busy_timeout_ms,
+                synchronous_mode=self.synchronous_mode,
+                wal_autocheckpoint=self.wal_autocheckpoint
+            )
+        return self._transition_outbox.get_pending_transitions(limit=limit, eligible_only=eligible_only, now_utc=now_utc)
+
+
+class TransitionOutbox:
+    """
+    Dedicated persistent outbox for ChannelTransition payloads.
+    Operates on the 'transition_outbox' table with canonical payload hashing,
+    immutable conflict detection, and retry/quarantine state transitions.
+    """
+    VALID_STATUSES = frozenset({'pending', 'delivered', 'quarantined'})
+
+    def __init__(
+        self,
+        db_path: str,
+        logger: logging.Logger,
+        busy_timeout_ms: int = 5000,
+        synchronous_mode: str = "NORMAL",
+        wal_autocheckpoint: int = 1000
+    ):
+        self.db_path = db_path
+        self.logger = logger
+        if not isinstance(busy_timeout_ms, int) or busy_timeout_ms < 1000:
+            raise ValueError(f"busy_timeout_ms must be an integer >= 1000, got: {busy_timeout_ms}")
+        self.busy_timeout_ms = busy_timeout_ms
+
+        sync_upper = str(synchronous_mode).upper().strip()
+        if sync_upper not in ("NORMAL", "FULL"):
+            raise ValueError(f"synchronous_mode must be 'NORMAL' or 'FULL', got: {synchronous_mode}")
+        self.synchronous_mode = sync_upper
+
+        if not isinstance(wal_autocheckpoint, int) or wal_autocheckpoint < 10:
+            raise ValueError(f"wal_autocheckpoint must be an integer >= 10, got: {wal_autocheckpoint}")
+        self.wal_autocheckpoint = wal_autocheckpoint
+
+        self._init_db()
+
+    def _get_connection(self) -> sqlite3.Connection:
+        conn = None
+        try:
+            conn = sqlite3.connect(
+                self.db_path,
+                timeout=float(self.busy_timeout_ms) / 1000.0,
+                isolation_level=None
+            )
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA journal_mode = WAL;")
+            conn.execute(f"PRAGMA synchronous = {self.synchronous_mode};")
+            conn.execute(f"PRAGMA busy_timeout = {self.busy_timeout_ms};")
+            conn.execute(f"PRAGMA wal_autocheckpoint = {self.wal_autocheckpoint};")
+            conn.execute("PRAGMA temp_store = MEMORY;")
+            conn.execute("PRAGMA foreign_keys = ON;")
+            return conn
+        except Exception:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+            raise
+
+    def _execute_transaction_with_retry(self, fn, max_retries: int = 5):
+        attempt = 0
+        while True:
+            conn = self._get_connection()
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                result = fn(conn)
+                conn.execute("COMMIT")
+                return result
+            except sqlite3.OperationalError as e:
+                try:
+                    conn.execute("ROLLBACK")
+                except Exception:
+                    pass
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+                conn = None
+
+                if is_sqlite_busy_or_locked(e) and attempt < max_retries:
+                    attempt += 1
+                    backoff = min(1.0, (0.05 * (2 ** (attempt - 1))) + random.uniform(0.01, 0.05))
+                    if self.logger:
+                        self.logger.warning(
+                            f"Transition DB busy or locked (attempt {attempt}/{max_retries}), retrying in {backoff:.3f}s: {e}"
+                        )
+                    time.sleep(backoff)
+                    continue
+                raise
+            except Exception:
+                try:
+                    conn.execute("ROLLBACK")
+                except Exception:
+                    pass
+                raise
+            finally:
+                if conn is not None:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+
+    def _init_db(self):
+        os.makedirs(os.path.dirname(os.path.abspath(self.db_path)), exist_ok=True)
+        conn = self._get_connection()
+        try:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS transition_outbox (
+                    transition_id TEXT PRIMARY KEY,
+                    transition_data TEXT NOT NULL,
+                    status TEXT NOT NULL CHECK(status IN ('pending', 'delivered', 'quarantined')),
+                    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    last_attempt TEXT,
+                    last_error TEXT,
+                    delivered_at TEXT,
+                    next_attempt_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+                    quarantined_at TEXT,
+                    quarantine_reason TEXT,
+                    CHECK (status != 'pending' OR next_attempt_at IS NOT NULL)
+                );
+            """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS transition_outbox_conflicts (
+                    conflict_id TEXT PRIMARY KEY,
+                    transition_id TEXT NOT NULL,
+                    payload_a TEXT NOT NULL,
+                    payload_a_hash TEXT NOT NULL,
+                    payload_b TEXT NOT NULL,
+                    payload_b_hash TEXT NOT NULL,
+                    detected_at TEXT NOT NULL
+                );
+            """)
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_transition_outbox_status_next ON transition_outbox (status, next_attempt_at) WHERE status = 'pending';")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_transition_outbox_status_delivered ON transition_outbox (status, delivered_at) WHERE status = 'delivered';")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_transition_outbox_quarantine_created ON transition_outbox (status, quarantined_at) WHERE status = 'quarantined';")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_transition_outbox_created_at ON transition_outbox (created_at);")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_transition_outbox_conflicts_tid ON transition_outbox_conflicts(transition_id);")
+        finally:
+            conn.close()
+
+    def add_transition(self, transition: Dict[str, Any]):
+        transition_id = transition.get("transition_id")
+        if not transition_id:
+            raise ValueError("Transition missing required field 'transition_id'")
+
+        incoming_canonical_bytes = canonicalize_tgam_rcc_v1(transition)
+        incoming_hash = hashlib.sha256(incoming_canonical_bytes).hexdigest()
+
+        def _op(conn: sqlite3.Connection) -> Optional[Tuple[str, str, str]]:
+            cursor = conn.execute(
+                "SELECT transition_data, status FROM transition_outbox WHERE transition_id = ?",
+                (transition_id,)
+            )
+            row = cursor.fetchone()
+
+            if row is None:
+                conn.execute(
+                    "INSERT INTO transition_outbox (transition_id, transition_data, status) VALUES (?, ?, 'pending')",
+                    (transition_id, json.dumps(transition))
+                )
+                return None
+
+            # Existing transition found: verify canonical payload equality
+            existing_data = json.loads(row["transition_data"])
+            existing_canonical_bytes = canonicalize_tgam_rcc_v1(existing_data)
+            existing_hash = hashlib.sha256(existing_canonical_bytes).hexdigest()
+
+            if incoming_hash == existing_hash:
+                # Deterministic identical replay: idempotent no-op
+                return None
+
+            # Conflicting payload detected!
+            if existing_hash < incoming_hash:
+                ha, pa = existing_hash, existing_canonical_bytes.decode("utf-8")
+                hb, pb = incoming_hash, incoming_canonical_bytes.decode("utf-8")
+            else:
+                ha, pa = incoming_hash, incoming_canonical_bytes.decode("utf-8")
+                hb, pb = existing_hash, existing_canonical_bytes.decode("utf-8")
+
+            manifest = {
+                "conflict_type": "transition_outbox_payload_collision",
+                "transition_id": str(transition_id).strip(),
+                "hash_max": hb,
+                "hash_min": ha,
+            }
+            conflict_id = hashlib.sha256(canonicalize_tgam_rcc_v1(manifest)).hexdigest()
+
+            conn.execute("""
+                INSERT OR IGNORE INTO transition_outbox_conflicts (
+                    conflict_id,
+                    transition_id,
+                    payload_a,
+                    payload_a_hash,
+                    payload_b,
+                    payload_b_hash,
+                    detected_at
+                ) VALUES (?, ?, ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+            """, (conflict_id, transition_id, pa, ha, pb, hb))
+
+            return (conflict_id, existing_hash, incoming_hash)
+
+        conflict_info = self._execute_transaction_with_retry(_op)
+        if conflict_info is not None:
+            conflict_id, existing_hash, incoming_hash = conflict_info
+            msg = (
+                f"Transition outbox payload conflict detected for transition_id '{transition_id}': "
+                f"existing_hash={existing_hash}, incoming_hash={incoming_hash}, conflict_id={conflict_id}"
+            )
+            self.logger.error(msg)
+            raise OutboxPayloadConflictError(
+                message=msg,
+                event_id=transition_id,
+                conflict_id=conflict_id,
+                existing_hash=existing_hash,
+                incoming_hash=incoming_hash
+            )
+
+    def add_event(self, transition: Dict[str, Any]):
+        """Alias for add_transition to satisfy generic enqueue callback protocols."""
+        return self.add_transition(transition)
+
+    def get_pending_transitions(self, limit: int = 50, eligible_only: bool = False, now_utc: Optional[str] = None) -> List[Dict[str, Any]]:
+        conn = self._get_connection()
+        try:
+            if eligible_only:
+                now_str = now_utc or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+                cursor = conn.execute('''
+                    SELECT transition_id, transition_data, attempts, created_at, next_attempt_at FROM transition_outbox
+                    WHERE status = 'pending' AND next_attempt_at <= ?
+                    ORDER BY next_attempt_at ASC, created_at ASC LIMIT ?
+                ''', (now_str, limit))
+            else:
+                cursor = conn.execute('''
+                    SELECT transition_id, transition_data, attempts, created_at, next_attempt_at FROM transition_outbox
+                    WHERE status = 'pending'
+                    ORDER BY created_at ASC LIMIT ?
+                ''', (limit,))
+            rows = [dict(row) for row in cursor.fetchall()]
+            cursor.close()
+            return rows
+        finally:
+            conn.close()
+
+    def mark_delivered(self, transition_id: str):
+        def _op(conn: sqlite3.Connection):
+            conn.execute('''
+                UPDATE transition_outbox SET
+                    status = 'delivered',
+                    last_attempt = strftime('%Y-%m-%dT%H:%M:%SZ', 'now'),
+                    delivered_at = COALESCE(delivered_at, strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+                WHERE transition_id = ?
+            ''', (transition_id,))
+        self._execute_transaction_with_retry(_op)
+
+    def mark_failed(self, transition_id: str, error: str, next_attempt_at: Optional[str] = None):
+        sanitized_error = sanitize_error_message(error)
+        def _op(conn: sqlite3.Connection):
+            if next_attempt_at:
+                conn.execute('''
+                    UPDATE transition_outbox SET
+                        attempts = attempts + 1,
+                        last_attempt = strftime('%Y-%m-%dT%H:%M:%SZ', 'now'),
+                        last_error = ?,
+                        next_attempt_at = ?
+                    WHERE transition_id = ? AND status != 'delivered'
+                ''', (sanitized_error, next_attempt_at, transition_id))
+            else:
+                conn.execute('''
+                    UPDATE transition_outbox SET
+                        attempts = attempts + 1,
+                        last_attempt = strftime('%Y-%m-%dT%H:%M:%SZ', 'now'),
+                        last_error = ?
+                    WHERE transition_id = ? AND status != 'delivered'
+                ''', (sanitized_error, transition_id))
+        self._execute_transaction_with_retry(_op)
+
+    def mark_quarantined(self, transition_id: str, reason: str, error: str = ""):
+        sanitized_error = sanitize_error_message(error)
+        def _op(conn: sqlite3.Connection):
+            conn.execute('''
+                UPDATE transition_outbox SET
+                    status = 'quarantined',
+                    quarantined_at = COALESCE(quarantined_at, strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+                    quarantine_reason = ?,
+                    last_error = ?,
+                    last_attempt = strftime('%Y-%m-%dT%H:%M:%SZ', 'now'),
+                    next_attempt_at = NULL
+                WHERE transition_id = ? AND status != 'delivered'
+            ''', (reason, sanitized_error, transition_id))
+        self._execute_transaction_with_retry(_op)
+
+    def get_conflicts_for_transition(self, transition_id: str) -> List[Dict[str, Any]]:
+        conn = self._get_connection()
+        try:
+            cursor = conn.execute(
+                "SELECT conflict_id, transition_id, payload_a, payload_a_hash, payload_b, payload_b_hash, detected_at "
+                "FROM transition_outbox_conflicts WHERE transition_id = ? ORDER BY detected_at ASC",
+                (transition_id,)
+            )
+            return [dict(row) for row in cursor.fetchall()]
+        finally:
+            conn.close()
+
+    def get_all_conflicts(self, limit: Optional[int] = None) -> List[Dict[str, Any]]:
+        conn = self._get_connection()
+        try:
+            query = (
+                "SELECT conflict_id, transition_id, payload_a, payload_a_hash, payload_b, payload_b_hash, detected_at "
+                "FROM transition_outbox_conflicts ORDER BY detected_at ASC, conflict_id ASC"
+            )
+            if limit is not None:
+                query += f" LIMIT {int(limit)}"
+            cursor = conn.execute(query)
+            return [dict(row) for row in cursor.fetchall()]
+        finally:
+            conn.close()
+
+    def purge_delivered_transitions(self, retention_hours: int = 72, cutoff_time: Optional[str] = None) -> int:
+        if cutoff_time is None:
+            cutoff_dt = datetime.now(timezone.utc) - timedelta(hours=retention_hours)
+            cutoff_time = cutoff_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+        def _op(conn: sqlite3.Connection):
+            cur = conn.execute('''
+                DELETE FROM transition_outbox
+                WHERE status = 'delivered'
+                  AND delivered_at IS NOT NULL
+                  AND delivered_at <= ?
+            ''', (cutoff_time,))
+            return cur.rowcount
         return self._execute_transaction_with_retry(_op)

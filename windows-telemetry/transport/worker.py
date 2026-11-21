@@ -1,6 +1,7 @@
 import threading
 import time
 import logging
+import inspect
 from typing import Optional, Any
 from .outbox import OutboxLock
 
@@ -74,11 +75,23 @@ class DeliveryWorker(threading.Thread):
                 )
                 return
 
+        # Determine invocation arguments for delivery_manager.process_outbox
+        process_outbox_kwargs = {}
+        target_fn = getattr(self.delivery_manager, "process_outbox", None)
+        if callable(target_fn):
+            try:
+                sig = inspect.signature(target_fn)
+                params = sig.parameters
+                if "lock_already_acquired" in params or any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()):
+                    process_outbox_kwargs["lock_already_acquired"] = True
+            except (ValueError, TypeError):
+                process_outbox_kwargs["lock_already_acquired"] = True
+
         self._last_checkpoint_time = time.time()
         try:
             while not self._stop_event.is_set():
                 try:
-                    self.delivery_manager.process_outbox()
+                    self.delivery_manager.process_outbox(**process_outbox_kwargs)
                 except Exception as e:
                     self.logger.error(f"Unexpected error in DeliveryWorker loop: {e}")
 
@@ -105,7 +118,7 @@ class DeliveryWorker(threading.Thread):
                 self._lock.release()
             self.logger.info("DeliveryWorker stopped.")
 
-    def stop(self):
+    def stop(self, timeout: float = 10.0):
         self._stop_event.set()
         if self.is_alive():
-            self.join(timeout=10.0)
+            self.join(timeout=timeout)

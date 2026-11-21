@@ -6,6 +6,7 @@ import heapq
 import logging
 import math
 from .models import DetectionResult
+from .manifest import compute_rules_digest
 
 class BruteForceRule:
     def __init__(
@@ -17,6 +18,8 @@ class BruteForceRule:
         logger: Optional[logging.Logger] = None
     ):
         self.name = "windows_bruteforce_rule"
+        self.detector_name = "windows_bruteforce_rule"
+        self.detector_version = "1.0.0"
 
         # Validate failure_threshold
         if isinstance(failure_threshold, bool) or not isinstance(failure_threshold, int) or failure_threshold < 3:
@@ -75,6 +78,29 @@ class BruteForceRule:
             "forced_active_state_evictions": 0,
             "total_evictions": 0
         }
+
+    def get_thresholds(self) -> Dict[str, Any]:
+        return {
+            "failure_threshold": float(self.failure_threshold),
+            "window_seconds": float(self.window_seconds),
+        }
+
+    def get_detector_config(self) -> Dict[str, Any]:
+        return {
+            "cleanup_interval_seconds": float(self.cleanup_interval),
+            "low_watermark": int(self.low_watermark),
+            "max_state_keys": int(self.max_state_keys),
+        }
+
+    def get_rules_digest(self) -> str:
+        sig = {
+            "detector_name": self.detector_name,
+            "failure_threshold": int(self.failure_threshold),
+            "target_event_id": 4625,
+            "tracked_entities": ["endpoint_hostname", "source_ip", "target_account_id"],
+            "window_seconds": int(self.window_seconds),
+        }
+        return compute_rules_digest(sig)
 
     def _cleanup_stale_keys(self, current_time: Optional[datetime] = None, active_key: Optional[tuple] = None, force: bool = False):
         """
@@ -372,9 +398,13 @@ class BruteForceRule:
                     detection_type=self.name,
                     confidence=1.0,
                     severity="high",
-                    detector_name=self.name,
+                    detector_name=self.detector_name,
                     source_event_id=event_id,
-                    evidence=result_evidence
+                    evidence=result_evidence,
+                    detector_version=self.detector_version,
+                    rules_digest=self.get_rules_digest(),
+                    thresholds=self.get_thresholds(),
+                    detector_config=self.get_detector_config(),
                 )
 
         return None
@@ -407,6 +437,8 @@ class SuspiciousPowerShellRule:
     """
     def __init__(self):
         self.name = "windows_powershell_execution"
+        self.detector_name = "windows_powershell_rule"
+        self.detector_version = "1.0.0"
         self.patterns = [
             (r'(?i)-(?:e|enc|encodedcommand)\s+[a-zA-Z0-9+/=]{6,}', "Base64 EncodedCommand"),
             (r'(?i)downloadstring|downloadfile|net\.webclient', "WebClient Download Cradle"),
@@ -415,6 +447,28 @@ class SuspiciousPowerShellRule:
             (r'(?i)-(?:w|windowstyle)\s+hidden', "Hidden WindowStyle"),
             (r'(?i)-(?:executionpolicy|ep)\s+bypass', "ExecutionPolicy Bypass")
         ]
+
+    def get_thresholds(self) -> Dict[str, Any]:
+        return {"confidence": 0.95}
+
+    def get_detector_config(self) -> Dict[str, Any]:
+        return {
+            "technique_id": "T1059.001",
+            "technique_name": "Command and Scripting Interpreter: PowerShell",
+            "tactic": "Execution"
+        }
+
+    def get_rules_digest(self) -> str:
+        pattern_specs = [
+            {"description": desc, "pattern": pat}
+            for pat, desc in sorted(self.patterns, key=lambda x: str(x[0]))
+        ]
+        sig = {
+            "detector_name": self.detector_name,
+            "patterns": pattern_specs,
+            "technique_id": "T1059.001",
+        }
+        return compute_rules_digest(sig)
 
     def evaluate(self, normalized_event: Dict[str, Any]) -> Optional[DetectionResult]:
         cmd = _extract_cmd_line(normalized_event)
@@ -443,9 +497,13 @@ class SuspiciousPowerShellRule:
                 detection_type=self.name,
                 confidence=0.95,
                 severity="high",
-                detector_name="windows_powershell_rule",
+                detector_name=self.detector_name,
                 source_event_id=event_id,
-                evidence=evidence
+                evidence=evidence,
+                detector_version=self.detector_version,
+                rules_digest=self.get_rules_digest(),
+                thresholds=self.get_thresholds(),
+                detector_config=self.get_detector_config(),
             )
         return None
 
@@ -457,6 +515,8 @@ class SuspiciousLolbinsDownloadRule:
     """
     def __init__(self):
         self.name = "windows_lolbin_download"
+        self.detector_name = "windows_lolbin_rule"
+        self.detector_version = "1.0.0"
         self.patterns = [
             (r'(?i)\bcertutil(?:\.exe)?\b.*[-/](?:urlcache|split)', "Certutil URLCache Stager"),
             (r'(?i)\bbitsadmin(?:\.exe)?\b.*[/-](?:transfer|create|addfile|resume)', "Bitsadmin Transfer"),
@@ -464,6 +524,28 @@ class SuspiciousLolbinsDownloadRule:
             (r'(?i)\brundll32(?:\.exe)?\b.*(?:https?://|javascript:)', "Rundll32 Remote URL / Script"),
             (r'(?i)\b(?:curl|wget)(?:\.exe)?\b.*https?://.*\.(?:exe|dll|ps1|bat|vbs|sh)', "Curl/Wget Tool Download")
         ]
+
+    def get_thresholds(self) -> Dict[str, Any]:
+        return {"confidence": 0.90}
+
+    def get_detector_config(self) -> Dict[str, Any]:
+        return {
+            "technique_id": "T1105",
+            "technique_name": "Ingress Tool Transfer",
+            "tactic": "Command and Control"
+        }
+
+    def get_rules_digest(self) -> str:
+        pattern_specs = [
+            {"description": desc, "pattern": pat}
+            for pat, desc in sorted(self.patterns, key=lambda x: str(x[0]))
+        ]
+        sig = {
+            "detector_name": self.detector_name,
+            "patterns": pattern_specs,
+            "technique_id": "T1105",
+        }
+        return compute_rules_digest(sig)
 
     def evaluate(self, normalized_event: Dict[str, Any]) -> Optional[DetectionResult]:
         cmd = _extract_cmd_line(normalized_event)
@@ -489,9 +571,13 @@ class SuspiciousLolbinsDownloadRule:
                 detection_type=self.name,
                 confidence=0.90,
                 severity="high",
-                detector_name="windows_lolbin_rule",
+                detector_name=self.detector_name,
                 source_event_id=event_id,
-                evidence=evidence
+                evidence=evidence,
+                detector_version=self.detector_version,
+                rules_digest=self.get_rules_digest(),
+                thresholds=self.get_thresholds(),
+                detector_config=self.get_detector_config(),
             )
         return None
 
@@ -503,6 +589,8 @@ class ReconnaissanceCommandsRule:
     """
     def __init__(self):
         self.name = "windows_reconnaissance"
+        self.detector_name = "windows_reconnaissance_rule"
+        self.detector_version = "1.0.0"
         self.patterns = [
             (r'(?i)\bwhoami(?:\.exe)?\s+/(?:all|priv)\b', "Whoami Privilege Enumeration", "T1033"),
             (r'(?i)\bnet(?:\.exe)?\s+localgroup\s+administrators\b', "Local Admin Discovery", "T1087"),
@@ -510,6 +598,27 @@ class ReconnaissanceCommandsRule:
             (r'(?i)\bsysteminfo(?:\.exe)?\b', "Systeminfo Discovery", "T1082"),
             (r'(?i)\bnltest(?:\.exe)?\s+/(?:dclist|domain_trusts)\b', "Domain Controller Enumeration", "T1018")
         ]
+
+    def get_thresholds(self) -> Dict[str, Any]:
+        return {"confidence": 0.85}
+
+    def get_detector_config(self) -> Dict[str, Any]:
+        return {
+            "technique_id": "T1082",
+            "technique_name": "Discovery",
+            "tactic": "Discovery"
+        }
+
+    def get_rules_digest(self) -> str:
+        pattern_specs = [
+            {"description": desc, "pattern": pat, "technique_id": tech_id}
+            for pat, desc, tech_id in sorted(self.patterns, key=lambda x: str(x[0]))
+        ]
+        sig = {
+            "detector_name": self.detector_name,
+            "patterns": pattern_specs,
+        }
+        return compute_rules_digest(sig)
 
     def evaluate(self, normalized_event: Dict[str, Any]) -> Optional[DetectionResult]:
         cmd = _extract_cmd_line(normalized_event)
@@ -531,9 +640,13 @@ class ReconnaissanceCommandsRule:
                     detection_type=self.name,
                     confidence=0.85,
                     severity="medium",
-                    detector_name="windows_reconnaissance_rule",
+                    detector_name=self.detector_name,
                     source_event_id=event_id,
-                    evidence=evidence
+                    evidence=evidence,
+                    detector_version=self.detector_version,
+                    rules_digest=self.get_rules_digest(),
+                    thresholds=self.get_thresholds(),
+                    detector_config=self.get_detector_config(),
                 )
         return None
 
@@ -545,12 +658,35 @@ class DefenseEvasionRule:
     """
     def __init__(self):
         self.name = "windows_defense_evasion"
+        self.detector_name = "windows_defense_evasion_rule"
+        self.detector_version = "1.0.0"
         self.patterns = [
             (r'(?i)\b(?:sc|net)(?:\.exe)?\s+stop\s+windefend\b', "Stop Windows Defender Service", "T1562.001"),
             (r'(?i)set-mppreference.*-disablerealtime', "Disable Defender Real-time Protection", "T1562.001"),
             (r'(?i)\bwevtutil(?:\.exe)?\s+cl\s+(?:security|system)\b', "Clear Windows Security Logs", "T1070.001"),
             (r'(?i)\bvssadmin(?:\.exe)?\s+delete\s+shadows\b', "Delete Shadow Copies (Ransomware Prep)", "T1490")
         ]
+
+    def get_thresholds(self) -> Dict[str, Any]:
+        return {"confidence": 0.98}
+
+    def get_detector_config(self) -> Dict[str, Any]:
+        return {
+            "technique_id": "T1562.001",
+            "technique_name": "Impair Defenses",
+            "tactic": "Defense Evasion"
+        }
+
+    def get_rules_digest(self) -> str:
+        pattern_specs = [
+            {"description": desc, "pattern": pat, "technique_id": tech_id}
+            for pat, desc, tech_id in sorted(self.patterns, key=lambda x: str(x[0]))
+        ]
+        sig = {
+            "detector_name": self.detector_name,
+            "patterns": pattern_specs,
+        }
+        return compute_rules_digest(sig)
 
     def evaluate(self, normalized_event: Dict[str, Any]) -> Optional[DetectionResult]:
         cmd = _extract_cmd_line(normalized_event)
@@ -572,8 +708,12 @@ class DefenseEvasionRule:
                     detection_type=self.name,
                     confidence=0.98,
                     severity="critical",
-                    detector_name="windows_defense_evasion_rule",
+                    detector_name=self.detector_name,
                     source_event_id=event_id,
-                    evidence=evidence
+                    evidence=evidence,
+                    detector_version=self.detector_version,
+                    rules_digest=self.get_rules_digest(),
+                    thresholds=self.get_thresholds(),
+                    detector_config=self.get_detector_config(),
                 )
         return None

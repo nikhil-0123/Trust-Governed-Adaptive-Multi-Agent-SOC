@@ -5,10 +5,10 @@ import logging
 from .models import DetectionEvent
 
 class DetectionEventWriter:
-    def __init__(self, output_dir: str, logger: logging.Logger):
+    def __init__(self, output_dir: str, logger: logging.Logger, filename: str = "detections.jsonl"):
         self.output_dir = output_dir
         self.logger = logger
-        self.output_file = os.path.join(self.output_dir, "detections.jsonl")
+        self.output_file = os.path.join(self.output_dir, filename)
         
     def write(self, event: DetectionEvent):
         try:

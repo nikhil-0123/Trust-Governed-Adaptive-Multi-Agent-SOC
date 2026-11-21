@@ -7,8 +7,8 @@ from output.builder import DetectionEventBuilder
 from output.writer import DetectionEventWriter
 from core.agent_identity import AgentIdentity
 from collectors.windows_event_collector import WindowsEventCollector
-from transport.outbox import Outbox, OutboxPayloadConflictError
-from transport.client import TransportClient
+from transport.outbox import Outbox, OutboxPayloadConflictError, TransitionOutbox
+from transport.client import TransportClient, TransitionTransportClient
 from transport.delivery import DeliveryManager
 from transport.filter import ImportantEventFilter
 from transport.worker import DeliveryWorker
@@ -21,18 +21,27 @@ class WindowsDetectionPipeline:
     Collect -> Normalize -> Detect -> Build -> Write -> Checkpoint.
     Supports multichannel collection across Windows Security and Sysmon operational logs.
     """
-    def __init__(self, logger: logging.Logger):
+    def __init__(self, logger: logging.Logger, execution_mode: Optional[str] = None):
         self.logger = logger
+        self.execution_mode = (execution_mode or getattr(config, "execution_mode", "PRODUCTION")).upper().strip()
         self.identity = AgentIdentity(config.data_dir)
         self.normalizer = WindowsEventNormalizer(self.identity, logger)
         self.engine = DetectionEngine(logger)
-        self.writer = DetectionEventWriter(config.detection_output_dir, logger)
+        writer_filename = "detections_eval.jsonl" if self.execution_mode == "EVALUATION" else "detections.jsonl"
+        self.writer = DetectionEventWriter(config.detection_output_dir, logger, filename=writer_filename)
         
         # Primary Security Collector (retains self.collector for backward compatibility)
         self.collector = WindowsEventCollector(
             logger, log_name=config.windows_security_log_name, agent_id=self.identity.agent_id
         )
         self.security_collector = self.collector
+
+        # Multichannel System Collector
+        self.system_collector = None
+        if config.enable_system_collection:
+            self.system_collector = WindowsEventCollector(
+                logger, log_name=config.windows_system_log_name, agent_id=self.identity.agent_id
+            )
 
         # Multichannel Sysmon Collector
         self.sysmon_collector = None
@@ -48,8 +57,34 @@ class WindowsDetectionPipeline:
             synchronous_mode=config.outbox_synchronous_mode,
             wal_autocheckpoint=config.outbox_wal_autocheckpoint
         )
+        self.transition_outbox = TransitionOutbox(
+            config.outbox_db_path,
+            logger,
+            busy_timeout_ms=config.outbox_busy_timeout_ms,
+            synchronous_mode=config.outbox_synchronous_mode,
+            wal_autocheckpoint=config.outbox_wal_autocheckpoint
+        )
         self.client = TransportClient(config.soc_api_url, config.soc_api_token, logger)
-        self.delivery_manager = DeliveryManager(self.outbox, self.client, logger)
+        self.transition_client = None
+        if getattr(config, "soc_agent_api_token", None):
+            try:
+                self.transition_client = TransitionTransportClient(
+                    config.soc_transition_api_url,
+                    config.soc_agent_api_token,
+                    logger,
+                    agent_id=getattr(config, "agent_id", None) or self.identity.agent_id
+                )
+            except Exception as ce:
+                self.logger.warning(f"Failed to initialize TransitionTransportClient: {ce}")
+        else:
+            self.logger.warning("SOC_AGENT_API_TOKEN is not configured; transition transport client is uninitialized.")
+        self.delivery_manager = DeliveryManager(
+            self.outbox,
+            self.client,
+            logger,
+            transition_outbox=self.transition_outbox,
+            transition_client=self.transition_client
+        )
         # Daemon delivery worker
         self.delivery_worker = DeliveryWorker(self.delivery_manager, logger, poll_interval=1.0)
         # Daemon heartbeat worker - initialized with effective capabilities
@@ -80,6 +115,13 @@ class WindowsDetectionPipeline:
         caps = ["EventLog_4625", "EventLog_4688"]
 
         if (
+            config.enable_system_collection
+            and self.system_collector is not None
+            and getattr(self.system_collector, "is_initialized", False)
+        ):
+            caps.append("EventLog_104")
+
+        if (
             config.enable_sysmon_collection
             and self.sysmon_collector is not None
             and getattr(self.sysmon_collector, "is_initialized", False)
@@ -103,6 +145,14 @@ class WindowsDetectionPipeline:
 
     def initialize(self):
         config.ensure_directories()
+        if self.system_collector:
+            try:
+                self.system_collector.initialize()
+                self.logger.info("System collector initialized successfully.")
+            except Exception as e:
+                self.logger.warning(f"System collector initialization bypassed: {e}")
+                self.system_collector.is_initialized = False
+
         self.collector.initialize()
         if self.sysmon_collector:
             try:
@@ -132,8 +182,9 @@ class WindowsDetectionPipeline:
             record_id = raw_event.get("record_id", -1)
             try:
                 # 1. Normalize with authoritative channel epoch and log_name
+                event_epoch = raw_event.get("epoch") or current_epoch
                 normalized_event = self.normalizer.normalize(
-                    raw_event, log_name=channel_log_name, epoch=current_epoch
+                    raw_event, log_name=channel_log_name, epoch=event_epoch
                 )
 
                 # 2. Detect
@@ -146,16 +197,18 @@ class WindowsDetectionPipeline:
                         # 3a. Write to local JSONL (Step 5)
                         self.writer.write(detection_event)
                         # 3b. Important Event Filter before local outbox for Central SOC (Step 6)
-                        event_dict = dataclasses.asdict(detection_event)
-                        if ImportantEventFilter.should_forward(event_dict):
-                            try:
-                                self.outbox.add_event(event_dict)
-                            except OutboxPayloadConflictError as ce:
-                                self.logger.error(
-                                    f"Outbox payload conflict on record {record_id} ({channel_name}): "
-                                    f"event_id={ce.event_id}, conflict_id={ce.conflict_id}, "
-                                    f"existing_hash={ce.existing_hash}, incoming_hash={ce.incoming_hash}"
-                                )
+                        # Benchmark / Replay isolation: EVALUATION mode bypasses Outbox queue
+                        if self.execution_mode != "EVALUATION":
+                            event_dict = dataclasses.asdict(detection_event)
+                            if ImportantEventFilter.should_forward(event_dict):
+                                try:
+                                    self.outbox.add_event(event_dict)
+                                except OutboxPayloadConflictError as ce:
+                                    self.logger.error(
+                                        f"Outbox payload conflict on record {record_id} ({channel_name}): "
+                                        f"event_id={ce.event_id}, conflict_id={ce.conflict_id}, "
+                                        f"existing_hash={ce.existing_hash}, incoming_hash={ce.incoming_hash}"
+                                    )
 
                 # 4. Checkpoint success marking
                 last_successful_record_id = record_id
@@ -170,11 +223,42 @@ class WindowsDetectionPipeline:
         if last_successful_record_id > 0:
             collector.update_checkpoint(last_successful_record_id)
 
+    def _drain_all_checkpoint_notifications(self):
+        """
+        Coordinates draining of pending outbox notifications across all active collectors
+        into their respective persistent outboxes (detection outbox vs transition outbox).
+        """
+        collectors = [self.collector]
+        if self.system_collector and getattr(self.system_collector, "is_initialized", False):
+            collectors.append(self.system_collector)
+        if self.sysmon_collector and getattr(self.sysmon_collector, "is_initialized", False):
+            collectors.append(self.sysmon_collector)
+
+        for col in collectors:
+            if col and hasattr(col, "checkpoint_manager") and col.checkpoint_manager:
+                try:
+                    col.checkpoint_manager.drain_pending_outbox_notifications(
+                        detection_outbox=self.outbox,
+                        transition_outbox=self.transition_outbox,
+                    )
+                except Exception as e:
+                    self.logger.error(
+                        f"Error draining checkpoint notifications for {getattr(col, 'log_name', 'unknown')}: {e}"
+                    )
+
     def process_batch(self):
-        # 1. Process Security events (primary collector, always executed)
+        # 1. Process System events first so cross-channel clear witnesses (Event 104) publish transitions
+        if self.system_collector and getattr(self.system_collector, "is_initialized", False):
+            try:
+                channel_name = getattr(self.system_collector, "log_name", "System")
+                self._process_channel_batch(self.system_collector, channel_name)
+            except Exception as e:
+                self.logger.error(f"System batch processing error: {e}")
+
+        # 2. Process Security events second (claims pending transitions before collecting)
         self._process_channel_batch(self.collector, "Security")
 
-        # 2. Process Sysmon events (only when initialized)
+        # 3. Process Sysmon events third (only when initialized)
         if self.sysmon_collector and getattr(self.sysmon_collector, "is_initialized", False):
             try:
                 channel_name = getattr(self.sysmon_collector, "log_name", "Sysmon")
@@ -182,15 +266,36 @@ class WindowsDetectionPipeline:
             except Exception as e:
                 self.logger.error(f"Sysmon batch processing error: {e}")
 
-    def shutdown(self):
+        # 4. Drain pending outbox notifications across all initialized collectors
+        self._drain_all_checkpoint_notifications()
+
+    def shutdown(self, worker_join_timeout: float = 10.0):
         """Gracefully terminates delivery worker and flushes pending outbox events."""
-        try:
-            self.delivery_manager.process_outbox()
-        except Exception:
-            pass
-        self.delivery_worker.stop()
-        self.heartbeat_worker.stop()
+        if self.delivery_worker:
+            self.delivery_worker.stop(timeout=worker_join_timeout)
+
+        if self.heartbeat_worker:
+            self.heartbeat_worker.stop()
+            if self.heartbeat_worker.is_alive():
+                self.heartbeat_worker.join(timeout=5.0)
+
+        if self.delivery_worker and self.delivery_worker.is_alive():
+            self.logger.error(
+                "DeliveryWorker failed to terminate within timeout; aborting final outbox flush to prevent concurrent execution race."
+            )
+        else:
+            try:
+                self._drain_all_checkpoint_notifications()
+            except Exception as e:
+                self.logger.error(f"Error during shutdown checkpoint drain: {e}")
+            try:
+                self.delivery_manager.process_outbox(timeout=5.0)
+            except Exception as e:
+                self.logger.error(f"Error during shutdown outbox flush: {e}")
+
         if hasattr(self.collector, "shutdown"):
             self.collector.shutdown()
+        if self.system_collector and hasattr(self.system_collector, "shutdown"):
+            self.system_collector.shutdown()
         if self.sysmon_collector and hasattr(self.sysmon_collector, "shutdown"):
             self.sysmon_collector.shutdown()
