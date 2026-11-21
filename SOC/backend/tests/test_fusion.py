@@ -228,6 +228,9 @@ class TestFusionEngine(unittest.TestCase):
 
     def test_worker_processing(self):
         self._insert_event("e1", "2026-10-03T10:00:00Z", "host1", "LOW")
+        with get_db_connection() as conn:
+            conn.execute("UPDATE events SET quarantine_status = 'ACTIVE_VERIFIED' WHERE detection_event_id = 'e1'")
+            conn.commit()
         
         worker = FusionWorker()
         worker.process_batch()

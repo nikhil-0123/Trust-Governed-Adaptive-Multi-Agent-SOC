@@ -310,7 +310,9 @@ class WindowsResponseExecutor:
         """
         # 1. Endpoint Identity Verification
         target_agent_id = parameters.get("target_agent_id")
-        if self.agent_id and target_agent_id:
+        if self.agent_id and (not target_agent_id or str(target_agent_id).strip().lower() != self.agent_id.lower()):
+            if not target_agent_id:
+                raise PermissionError("Missing required target_agent_id")
             if str(target_agent_id).strip().lower() != self.agent_id.lower():
                 raise PermissionError(
                     f"Target endpoint mismatch: target_agent_id '{target_agent_id}' "
@@ -318,7 +320,9 @@ class WindowsResponseExecutor:
                 )
 
         target_hostname = parameters.get("target_hostname")
-        if self.hostname and target_hostname:
+        if self.hostname and (not target_hostname or str(target_hostname).strip().lower() != self.hostname.lower()):
+            if not target_hostname:
+                raise PermissionError("Missing required target_hostname")
             if str(target_hostname).strip().lower() != self.hostname.lower():
                 raise PermissionError(
                     f"Target endpoint mismatch: target_hostname '{target_hostname}' "

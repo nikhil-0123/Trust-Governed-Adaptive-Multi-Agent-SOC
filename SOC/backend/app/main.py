@@ -149,18 +149,6 @@ def verify_token(authorization: Optional[str] = Header(None)) -> str:
     if token == endpoint_token.strip():
         return token
 
-    # Also accept valid per-agent tokens for general endpoint operations
-    agent_tokens_env = os.getenv("SOC_AGENT_API_TOKENS")
-    if agent_tokens_env:
-        try:
-            tokens_map = json.loads(agent_tokens_env)
-            if isinstance(tokens_map, dict):
-                for aid, atok in tokens_map.items():
-                    if isinstance(atok, str) and atok.strip() == token:
-                        return token
-        except Exception:
-            pass
-
     raise HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
         detail="Unauthorized"
@@ -408,14 +396,20 @@ async def allocate_epoch_endpoint(
     db: sqlite3.Connection = Depends(get_db)
 ):
     admin_token = os.getenv("SOC_ADMIN_API_TOKEN") or os.getenv("SOC_ADMIN_TOKEN")
-    is_admin = False
+    endpoint_token = os.getenv("SOC_API_TOKEN", "dev-token-123")
     try:
         tok = extract_bearer_token(authorization)
-        if admin_token and tok == admin_token.strip():
-            is_admin = True
-    except Exception:
-        pass
+    except HTTPException as he:
+        return JSONResponse(status_code=he.status_code, content={"detail": he.detail})
 
+    if not admin_token or not admin_token.strip():
+        return JSONResponse(status_code=500, content={"detail": "Administrative credentials not configured; failing closed"})
+    if not endpoint_token or not endpoint_token.strip():
+        return JSONResponse(status_code=500, content={"detail": "Endpoint credentials not configured; failing closed"})
+    if admin_token.strip() == endpoint_token.strip():
+        return JSONResponse(status_code=500, content={"detail": "Administrative credentials cannot be identical to endpoint credentials; failing closed"})
+
+    is_admin = tok == admin_token.strip()
     if not is_admin:
         try:
             auth_agent, token = derive_authenticated_agent(authorization)
