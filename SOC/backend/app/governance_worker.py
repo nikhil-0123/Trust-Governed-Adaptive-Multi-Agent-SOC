@@ -196,6 +196,17 @@ class GovernanceWorker(threading.Thread):
         # Calculate decision purely in memory
         decision_obj = self.engine.evaluate(analysis_dict, assessment_dict, severity)
         
+        # Defense-in-depth: Reject incidents containing quarantined, retired, future-epoch, or LEGACY_UNVERIFIED evidence
+        from app.response_bridge import check_incident_evidence_eligibility
+        is_eligible, ineligible_reason = check_incident_evidence_eligibility(conn, incident_id)
+        if not is_eligible:
+            decision_obj = GovernanceDecision(
+                decision="REJECT",
+                reason=f"Incident rejected: contains ineligible evidence ({ineligible_reason})",
+                policy_version=getattr(decision_obj, "policy_version", "v1.0"),
+                config_version=getattr(decision_obj, "config_version", "v1.0")
+            )
+
         decision_id = str(uuid.uuid4())
         
         approval_status = "NOT_REQUIRED"

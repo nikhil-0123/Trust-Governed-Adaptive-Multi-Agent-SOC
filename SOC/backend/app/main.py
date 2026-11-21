@@ -1,11 +1,21 @@
-from fastapi import FastAPI, Depends, HTTPException, Header, status
+import asyncio
+from fastapi import FastAPI, Depends, HTTPException, Header, status, Request
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
-from typing import Dict, Any, Optional, List
+from pydantic import BaseModel, Field, validator
+from typing import Dict, Any, Optional, List, Tuple
 import sqlite3
 import os
 import uuid
 from datetime import datetime, timezone
+
+from app.epoch_governance import (
+    ingest_event_transactional,
+    process_channel_transition,
+    resolve_epoch_gap,
+    allocate_recovery_epoch,
+    get_conflicts_query
+)
 
 app = FastAPI(title="TGAM-SOC Central Ingestion")
 
@@ -47,6 +57,8 @@ governance_worker = None
 @app.on_event("startup")
 def startup_event():
     database.init_db()
+    if os.getenv("DISABLE_STARTUP_WORKERS") == "1":
+        return
     global fusion_worker, mitre_worker, assessment_worker, reasoning_worker, governance_worker
     fusion_worker = FusionWorker()
     fusion_worker.start()
@@ -87,28 +99,379 @@ def get_db():
     finally:
         conn.close()
 
-def verify_token(authorization: Optional[str] = Header(None)):
-    if not authorization or not authorization.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Missing or invalid Authorization header")
-    token = authorization.split(" ")[1]
-    if token != API_TOKEN:
-        raise HTTPException(status_code=401, detail="Unauthorized")
+def extract_bearer_token(authorization: Optional[str]) -> str:
+    """
+    Hardened Bearer token parser.
+    Validates the Bearer scheme and extracts a non-empty token.
+    Rejects missing, empty, whitespace-only, and malformed authorization headers with HTTP 401.
+    """
+    if not authorization or not isinstance(authorization, str):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Missing or invalid Authorization header"
+        )
+    parts = authorization.strip().split()
+    if len(parts) != 2:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Malformed Authorization header; expected 'Bearer <token>'"
+        )
+    scheme, token = parts[0], parts[1]
+    if scheme.lower() != "bearer":
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid authorization scheme; expected 'Bearer'"
+        )
+    token = token.strip()
+    if not token:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Empty Bearer token"
+        )
     return token
 
-@app.post("/api/v1/detection-events", status_code=status.HTTP_201_CREATED)
-def ingest_event(event: DetectionEvent, token: str = Depends(verify_token), db: sqlite3.Connection = Depends(get_db)):
-    try:
-        cursor = db.execute("SELECT 1 FROM events WHERE detection_event_id = ?", (event.detection_event_id,))
-        if cursor.fetchone():
-            return {"accepted": True, "detection_event_id": event.detection_event_id, "duplicate": True}
+def verify_token(authorization: Optional[str] = Header(None)) -> str:
+    """
+    Endpoint authentication dependency.
+    Requires a configured, non-empty SOC_API_TOKEN.
+    Validates Authorization Bearer token against endpoint credentials.
+    Does NOT require administrator credentials to be configured.
+    Fails closed for missing or invalid endpoint credentials.
+    """
+    endpoint_token = os.getenv("SOC_API_TOKEN", "dev-token-123")
 
-        db.execute("INSERT INTO events (detection_event_id, data) VALUES (?, ?)", (event.detection_event_id, event.model_dump_json()))
-        db.commit()
-        return {"accepted": True, "detection_event_id": event.detection_event_id, "duplicate": False}
-    except sqlite3.Error:
-        raise HTTPException(status_code=500, detail="Database Error")
+    if not endpoint_token or not endpoint_token.strip():
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Endpoint credentials not configured; failing closed"
+        )
+    token = extract_bearer_token(authorization)
+    if token == endpoint_token.strip():
+        return token
+
+    raise HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Unauthorized"
+    )
+
+def derive_authenticated_agent(authorization: Optional[str]) -> Tuple[str, str]:
+    """
+    Derives authenticated agent identity from trusted server-side per-agent credentials.
+    Returns (authenticated_agent_id, token).
+    Fails closed:
+    - Raises 401 if authorization header is missing, malformed, or presents an unknown/invalid token.
+    - Raises 403 if caller presents the generic shared endpoint token (SOC_API_TOKEN), which cannot prove endpoint identity.
+    - Raises 503 if SOC_AGENT_API_TOKENS is missing, empty, or malformed on the server.
+    """
+    token = extract_bearer_token(authorization)
+
+    # Check server-side per-agent credential registry (SOC_AGENT_API_TOKENS)
+    agent_tokens_env = os.getenv("SOC_AGENT_API_TOKENS")
+    if not agent_tokens_env or not agent_tokens_env.strip():
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Per-agent credential mapping (SOC_AGENT_API_TOKENS) is not configured; endpoint transitions unavailable"
+        )
+
+    try:
+        tokens_map = json.loads(agent_tokens_env)
+        if not isinstance(tokens_map, dict):
+            raise ValueError("SOC_AGENT_API_TOKENS must be a JSON object mapping agent_id to token")
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"Per-agent credential mapping (SOC_AGENT_API_TOKENS) is malformed: {e}"
+        )
+
+    # Reject generic shared endpoint token from proving specific agent identity
+    endpoint_token = os.getenv("SOC_API_TOKEN", "dev-token-123")
+    if endpoint_token and token == endpoint_token.strip():
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Shared endpoint token cannot be treated as proof of agent identity; per-agent credentials required"
+        )
+
+    matched_agent = None
+    for aid, atok in tokens_map.items():
+        if isinstance(atok, str) and atok.strip() == token:
+            matched_agent = aid
+            break
+
+    if not matched_agent:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or unmapped agent credentials"
+        )
+
+    return matched_agent, token
+
+def verify_admin_token(authorization: Optional[str] = Header(None)) -> str:
+    """
+    Dedicated administrative authorization dependency (WP-1E.4S).
+    Derives trusted server-side administrator identity.
+    Fails closed if administrative credentials are missing, unconfigured, or identical to endpoint credentials.
+    Explicitly rejects endpoint agent credentials from performing admin actions.
+    """
+    admin_token = os.getenv("SOC_ADMIN_API_TOKEN") or os.getenv("SOC_ADMIN_TOKEN")
+    endpoint_token = os.getenv("SOC_API_TOKEN", "dev-token-123")
+
+    if not admin_token or not admin_token.strip():
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Administrative credentials not configured; failing closed"
+        )
+    if not endpoint_token or not endpoint_token.strip():
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Endpoint credentials not configured; failing closed"
+        )
+    if admin_token.strip() == endpoint_token.strip():
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Administrative credentials cannot be identical to endpoint credentials; failing closed"
+        )
+
+    token = extract_bearer_token(authorization)
+
+    # Reject endpoint credentials (shared or per-agent) from performing administrative operations
+    if token == endpoint_token.strip():
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Endpoint credentials cannot perform administrative operations"
+        )
+
+    agent_tokens_env = os.getenv("SOC_AGENT_API_TOKENS")
+    if agent_tokens_env:
+        try:
+            tokens_map = json.loads(agent_tokens_env)
+        except Exception:
+            tokens_map = {}
+        if isinstance(tokens_map, dict):
+            for aid, atok in tokens_map.items():
+                if isinstance(atok, str) and atok.strip() == token:
+                    raise HTTPException(
+                        status_code=status.HTTP_403_FORBIDDEN,
+                        detail="Endpoint credentials cannot perform administrative operations"
+                    )
+
+    if token != admin_token.strip():
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid administrator credentials"
+        )
+    return "SOC_ADMIN"
+
+async def _extract_body_bytes(request: Any) -> bytes:
+    if isinstance(request, (bytes, bytearray)):
+        return bytes(request)
+    if isinstance(request, str):
+        return request.encode("utf-8")
+    if hasattr(request, "model_dump_json"):
+        return request.model_dump_json().encode("utf-8")
+    if isinstance(request, dict):
+        return json.dumps(request).encode("utf-8")
+    if hasattr(request, "body"):
+        body = request.body
+        if callable(body):
+            res = body()
+            if asyncio.iscoroutine(res):
+                return await res
+            return res
+        return body
+    return b""
+
+@app.post("/api/v1/detection-events", status_code=status.HTTP_201_CREATED)
+async def ingest_event(request: Request, token: str = Depends(verify_token), db: sqlite3.Connection = Depends(get_db)):
+    try:
+        raw_bytes = await _extract_body_bytes(request)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to read request body: {e}")
+
+    status_code, resp_data = ingest_event_transactional(db, raw_bytes)
+    return JSONResponse(status_code=status_code, content=resp_data)
+
+SUPPORTED_TRANSITION_TYPES = {
+    "EPOCH_ADVANCE",
+    "LOG_CLEARED_SECURITY_REMOTE",
+    "LOG_CLEARED_SYSTEM",
+    "ADMINISTRATIVE_GAP_RESOLUTION",
+    "RECOVERY",
+    "RECOVERY_RELEASE",
+    "GAP_RESOLUTION",
+}
+
+class ChannelTransitionRequest(BaseModel):
+    transition_id: str = Field(..., min_length=1)
+    agent_id: str = Field(..., min_length=1)
+    source_channel: str = Field(..., min_length=1)
+    target_channel: Optional[str] = None
+    target_epoch: int = Field(..., ge=1)
+    transition_type: str = "EPOCH_ADVANCE"
+    witness_payload: Optional[Dict[str, Any]] = None
+    identity_manifest: Optional[Dict[str, Any]] = None
+    recovery_request_id: Optional[str] = None
+    resolution_reason: Optional[str] = None
+    authorized_by: Optional[str] = None
+    status: Optional[str] = None
+    payload: Optional[Any] = None
+
+    class Config:
+        extra = "allow"
+
+    @validator("transition_id", "agent_id", "source_channel")
+    def validate_non_empty_strings(cls, v):
+        if not isinstance(v, str) or not v.strip():
+            raise ValueError("Field must be a non-empty string")
+        return v.strip()
+
+    @validator("transition_type")
+    def validate_transition_type(cls, v):
+        if not isinstance(v, str) or not v.strip():
+            raise ValueError("'transition_type' must be a non-empty string")
+        val_upper = v.strip()
+        if val_upper not in SUPPORTED_TRANSITION_TYPES:
+            raise ValueError(f"Unsupported transition_type '{v}'. Allowed types: {sorted(SUPPORTED_TRANSITION_TYPES)}")
+        return val_upper
+
+@app.post("/api/v1/events/transition")
+async def receive_channel_transition(
+    request: Request,
+    transition: ChannelTransitionRequest,
+    authorization: Optional[str] = Header(None),
+    db: sqlite3.Connection = Depends(get_db)
+):
+    transition_dict = transition.dict()
+    try:
+        raw_bytes = await _extract_body_bytes(request)
+        if raw_bytes:
+            extra_dict = json.loads(raw_bytes.decode("utf-8"))
+            if isinstance(extra_dict, dict):
+                for k, v in extra_dict.items():
+                    if k not in transition_dict or transition_dict[k] is None:
+                        transition_dict[k] = v
     except Exception:
-        raise HTTPException(status_code=500, detail="Internal Server Error")
+        pass
+
+    ttype = transition.transition_type
+    from app.response_bridge import AUTHORIZED_RECOVERY_TRANSITION_TYPES
+
+    # If submitting an administrative recovery transition, require admin authentication
+    if ttype in AUTHORIZED_RECOVERY_TRANSITION_TYPES:
+        try:
+            admin_principal = verify_admin_token(authorization)
+        except HTTPException as he:
+            return JSONResponse(status_code=he.status_code, content={"detail": he.detail})
+        # Server derives authenticated actor; caller-supplied actor/status cannot establish authorization
+        status_code, resp_data = process_channel_transition(
+            db, transition_dict, authenticated_actor=admin_principal
+        )
+    else:
+        # Normal sequential advancement by endpoint agents
+        claimed_agent_id = transition.agent_id
+
+        try:
+            auth_agent, token = derive_authenticated_agent(authorization)
+        except HTTPException as he:
+            return JSONResponse(status_code=he.status_code, content={"detail": he.detail})
+
+        # Strict identity matching: authenticated identity MUST match claimed agent_id
+        if auth_agent != claimed_agent_id:
+            return JSONResponse(
+                status_code=status.HTTP_403_FORBIDDEN,
+                content={"detail": f"Authenticated endpoint identity '{auth_agent}' does not match transition agent '{claimed_agent_id}'"}
+            )
+
+        status_code, resp_data = process_channel_transition(
+            db, transition_dict, authenticated_actor=auth_agent
+        )
+
+    return JSONResponse(status_code=status_code, content=resp_data)
+
+@app.post("/api/v1/agents/{agent_id}/channels/{channel}/allocate_epoch")
+async def allocate_epoch_endpoint(
+    agent_id: str,
+    channel: str,
+    request: Request,
+    authorization: Optional[str] = Header(None),
+    db: sqlite3.Connection = Depends(get_db)
+):
+    admin_token = os.getenv("SOC_ADMIN_API_TOKEN") or os.getenv("SOC_ADMIN_TOKEN")
+    endpoint_token = os.getenv("SOC_API_TOKEN", "dev-token-123")
+    try:
+        tok = extract_bearer_token(authorization)
+    except HTTPException as he:
+        return JSONResponse(status_code=he.status_code, content={"detail": he.detail})
+
+    if not admin_token or not admin_token.strip():
+        return JSONResponse(status_code=500, content={"detail": "Administrative credentials not configured; failing closed"})
+    if not endpoint_token or not endpoint_token.strip():
+        return JSONResponse(status_code=500, content={"detail": "Endpoint credentials not configured; failing closed"})
+    if admin_token.strip() == endpoint_token.strip():
+        return JSONResponse(status_code=500, content={"detail": "Administrative credentials cannot be identical to endpoint credentials; failing closed"})
+
+    is_admin = tok == admin_token.strip()
+    if not is_admin:
+        try:
+            auth_agent, token = derive_authenticated_agent(authorization)
+        except HTTPException as he:
+            return JSONResponse(status_code=he.status_code, content={"detail": he.detail})
+
+        if auth_agent != agent_id:
+            return JSONResponse(
+                status_code=status.HTTP_403_FORBIDDEN,
+                content={"detail": f"Authenticated endpoint identity '{auth_agent}' does not match path agent '{agent_id}'"}
+            )
+
+    raw_bytes = await _extract_body_bytes(request)
+    try:
+        body = json.loads(raw_bytes.decode("utf-8"))
+    except Exception as e:
+        return JSONResponse(status_code=400, content={"detail": f"Invalid JSON: {e}"})
+
+    req_id = body.get("recovery_request_id")
+    reason = body.get("recovery_reason")
+    status_code, resp_data = allocate_recovery_epoch(db, req_id, agent_id, channel, reason)
+    return JSONResponse(status_code=status_code, content=resp_data)
+
+@app.post("/api/v1/agents/{agent_id}/channels/{channel}/resolve_gap")
+async def resolve_gap_endpoint(
+    agent_id: str,
+    channel: str,
+    request: Request,
+    admin_principal: str = Depends(verify_admin_token),
+    db: sqlite3.Connection = Depends(get_db)
+):
+    raw_bytes = await _extract_body_bytes(request)
+    try:
+        body = json.loads(raw_bytes.decode("utf-8"))
+    except Exception as e:
+        return JSONResponse(status_code=400, content={"detail": f"Invalid JSON: {e}"})
+
+    target_epoch = body.get("target_epoch")
+    reason = body.get("resolution_reason", "Administrative gap override")
+    rec_req_id = body.get("recovery_request_id")
+    # Derived from server authentication context (admin_principal), NEVER from caller JSON!
+    status_code, resp_data = resolve_epoch_gap(
+        db, agent_id, channel, target_epoch, reason,
+        authorized_by=admin_principal,
+        recovery_request_id=rec_req_id
+    )
+    return JSONResponse(status_code=status_code, content=resp_data)
+
+@app.get("/api/v1/conflicts")
+def get_all_conflicts_endpoint(
+    token: str = Depends(verify_token),
+    db: sqlite3.Connection = Depends(get_db)
+):
+    return get_conflicts_query(db)
+
+@app.get("/api/v1/conflicts/{event_id}")
+def get_event_conflicts_endpoint(
+    event_id: str,
+    token: str = Depends(verify_token),
+    db: sqlite3.Connection = Depends(get_db)
+):
+    return get_conflicts_query(db, event_id=event_id)
 
 import json
 

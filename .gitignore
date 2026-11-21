@@ -44,10 +44,13 @@ Desktop.ini
 .agent.pid
 agent_identity.json
 
-# Project Exclusions (Internal rules, docs in knowledge repo, and tests)
+# Project Exclusions (Internal rules, docs in knowledge repo)
 .agents/
 docs/
-tests/
-**/tests/
 test_*.js
+
+# Testing & Coverage artifacts
 .pytest_cache/
+.coverage
+htmlcov/
+.tox/

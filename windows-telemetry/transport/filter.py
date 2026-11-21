@@ -1,10 +1,9 @@
-import os
 from typing import Dict, Any
+from config.settings import config
 
-# Threshold for forwarding medium severity events
-# Documentation specifies "sufficient confidence", leaving the exact value to be determined.
-# This parameter is exposed for experimental tuning.
-MEDIUM_CONFIDENCE_THRESHOLD = float(os.getenv("MEDIUM_CONFIDENCE_THRESHOLD", "0.8"))
+# Threshold for forwarding medium severity events centralized in Settings
+# Kept as alias for backward compatibility with existing imports
+MEDIUM_CONFIDENCE_THRESHOLD = config.medium_confidence_threshold
 
 class ImportantEventFilter:
     """
@@ -14,7 +13,7 @@ class ImportantEventFilter:
     - CRITICAL severity events
     - MEDIUM severity events with high confidence
     """
-    
+
     @staticmethod
     def should_forward(detection_event: Dict[str, Any]) -> bool:
         severity = str(detection_event.get("severity", "")).lower()
@@ -25,10 +24,10 @@ class ImportantEventFilter:
 
         if severity in ("high", "critical"):
             return True
-        
+
         if severity == "medium":
-            if confidence >= MEDIUM_CONFIDENCE_THRESHOLD:
+            if confidence >= config.medium_confidence_threshold:
                 return True
-                
+
         # low severity, or medium with low confidence, or unknown
         return False

@@ -29,9 +29,17 @@ class WindowsResponseExecutor:
       - DISABLE_ACCOUNT
     """
 
-    def __init__(self, soc_base_url: str = "", logger: Optional[logging.Logger] = None):
+    def __init__(
+        self,
+        soc_base_url: str = "",
+        logger: Optional[logging.Logger] = None,
+        agent_id: str = "",
+        hostname: str = ""
+    ):
         self.soc_base_url = soc_base_url
         self.logger = logger or logging.getLogger("WindowsResponseExecutor")
+        self.agent_id = str(agent_id).strip()
+        self.hostname = str(hostname).strip()
 
     def execute(self, command_type: str, parameters: Dict[str, Any]) -> Dict[str, Any]:
         """Dispatches mitigation command to specific handler."""
@@ -298,7 +306,46 @@ class WindowsResponseExecutor:
     def disable_account(self, parameters: Dict[str, Any]) -> Dict[str, Any]:
         """
         Disables a local user account on Windows.
+        Strictly enforces endpoint identity verification and domain safety conditions.
         """
+        # 1. Endpoint Identity Verification
+        target_agent_id = parameters.get("target_agent_id")
+        if self.agent_id and (not target_agent_id or str(target_agent_id).strip().lower() != self.agent_id.lower()):
+            if not target_agent_id:
+                raise PermissionError("Missing required target_agent_id")
+            if str(target_agent_id).strip().lower() != self.agent_id.lower():
+                raise PermissionError(
+                    f"Target endpoint mismatch: target_agent_id '{target_agent_id}' "
+                    f"does not match executor agent_id '{self.agent_id}'"
+                )
+
+        target_hostname = parameters.get("target_hostname")
+        if self.hostname and (not target_hostname or str(target_hostname).strip().lower() != self.hostname.lower()):
+            if not target_hostname:
+                raise PermissionError("Missing required target_hostname")
+            if str(target_hostname).strip().lower() != self.hostname.lower():
+                raise PermissionError(
+                    f"Target endpoint mismatch: target_hostname '{target_hostname}' "
+                    f"does not match executor hostname '{self.hostname}'"
+                )
+
+        # 2. Domain Namespace Verification
+        # LOCAL_SAM is the only domain_namespace permitted for local execution.
+        domain = parameters.get("domain")
+        if domain == "OBSERVED_DOMAIN":
+            raise ValueError("Invalid domain namespace: 'OBSERVED_DOMAIN' is a status category, not a qualified namespace")
+        if not domain or domain == "UNVERIFIED":
+            raise ValueError("Cannot disable account with UNVERIFIED domain context")
+        domain_str = str(domain).strip()
+        if domain_str.startswith("DOMAIN:"):
+            raise PermissionError(
+                f"Cannot disable remote Active Directory domain account '{domain_str}' on local endpoint; "
+                "Domain Controller escalation required."
+            )
+        if domain_str != "LOCAL_SAM":
+            raise ValueError(f"Unsupported domain namespace '{domain_str}' for local account disable")
+
+        # 3. Target Username Validation
         raw_user = parameters.get("username")
         if not raw_user:
             raise ValueError("Target 'username' is required for DISABLE_ACCOUNT")
@@ -307,6 +354,21 @@ class WindowsResponseExecutor:
         if not re.match(r"^[a-zA-Z0-9_\-\.]+$", username):
             raise ValueError(f"Invalid username format: {username}")
 
+        # 4. Consistency Assertion
+        target_account_id = parameters.get("target_account_id")
+        if target_account_id:
+            expected_id = f"LOCAL_SAM\\{username.lower()}"
+            if str(target_account_id).strip().lower() != expected_id.lower():
+                raise ValueError(
+                    f"Inconsistent account parameters: target_account_id '{target_account_id}' "
+                    f"does not match domain '{domain}' and username '{username}'"
+                )
+
+        # 5. Machine Account Safeguard
+        if username.endswith("$"):
+            raise ValueError(f"Machine accounts ending in '$' ('{username}') cannot be disabled via DISABLE_ACCOUNT")
+
+        # 6. Protected Accounts Safeguard
         if username.lower() in PROTECTED_WINDOWS_ACCOUNTS:
             raise PermissionError(f"Account '{username}' is protected and cannot be disabled.")
 

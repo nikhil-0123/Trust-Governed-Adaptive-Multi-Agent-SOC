@@ -44,26 +44,38 @@ def get_local_ip():
 
 ATTACKER_IP = os.environ.get("ATTACKER_IP", get_local_ip())
 
-def req(endpoint: str, method: str = "GET", data: dict = None, timeout: float = 8.0):
+def req(endpoint: str, method: str = "GET", data: dict = None, timeout: float = 8.0, silent_404: bool = False):
     url = f"{SOC_BASE_URL}{endpoint}"
     payload = json.dumps(data).encode("utf-8") if data is not None else None
+    proxy_handler = urllib.request.ProxyHandler({})
+    opener = urllib.request.build_opener(proxy_handler)
     request_obj = urllib.request.Request(url, data=payload, headers=HEADERS, method=method)
-    with urllib.request.urlopen(request_obj, timeout=timeout) as resp:
-        body = resp.read().decode("utf-8")
-        return json.loads(body) if body else {}
+    try:
+        with opener.open(request_obj, timeout=timeout) as resp:
+            body = resp.read().decode("utf-8")
+            return json.loads(body) if body else {}
+    except urllib.error.HTTPError as e:
+        err_body = e.read().decode("utf-8", errors="replace")
+        if not (silent_404 and e.code == 404):
+            print(f"     [HTTPError {e.code} on {method} {endpoint}]: {err_body}")
+        raise
 
-def wait_for_incident_resolution(event_id: str, max_wait: int = 15):
+def wait_for_incident_resolution(event_id: str, max_wait: int = 25):
     print("     [+] Pipeline processing: Ingestion -> Fusion -> MITRE -> Multi-Agent -> Governance...")
     start_time = time.time()
     while time.time() - start_time < max_wait:
         try:
-            incidents = req("/api/v1/incidents")
+            incidents = req("/api/v1/incidents", silent_404=True)
             for inc in incidents:
-                evidence = req(f"/api/v1/incidents/{inc['incident_id']}/evidence")
+                evidence = req(f"/api/v1/incidents/{inc['incident_id']}/evidence", silent_404=True)
                 if any(e.get("detection_event_id") == event_id for e in evidence):
                     inc_id = inc["incident_id"]
-                    gov = req(f"/api/v1/incidents/{inc_id}/governance")
-                    return inc, gov
+                    try:
+                        gov = req(f"/api/v1/incidents/{inc_id}/governance", silent_404=True)
+                        if gov and gov.get("decision"):
+                            return inc, gov
+                    except Exception:
+                        pass
         except Exception:
             pass
         time.sleep(1.0)
@@ -114,6 +126,9 @@ def trigger_brute_force(target_agent):
         "severity": "HIGH",
         "detector_name": "LinuxSSHBruteForceDetector",
         "evidence": {
+            "channel": "auth.log" if os_type == "linux" else "Security",
+            "channel_epoch": 1,
+            "schema_version": "2.0",
             "technique_id": "T1110",
             "technique_name": "Brute Force",
             "tactic": "Credential Access",
@@ -160,6 +175,9 @@ def trigger_phishing(target_agent):
         "severity": "HIGH",
         "detector_name": "EmailPhishingDetector",
         "evidence": {
+            "channel": "Application" if os_type == "windows" else "syslog",
+            "channel_epoch": 1,
+            "schema_version": "2.0",
             "technique_id": "T1566",
             "technique_name": "Phishing",
             "tactic": "Initial Access",
@@ -206,6 +224,9 @@ def trigger_ransomware(target_agent):
         "severity": "CRITICAL",
         "detector_name": "RansomwareCanaryDetector",
         "evidence": {
+            "channel": "Security" if os_type == "windows" else "syslog",
+            "channel_epoch": 1,
+            "schema_version": "2.0",
             "technique_id": "T1486",
             "technique_name": "Data Encrypted for Impact",
             "tactic": "Impact",
@@ -252,6 +273,9 @@ def trigger_dos(target_agent):
         "severity": "HIGH",
         "detector_name": "NetworkDosDetector",
         "evidence": {
+            "channel": "Network" if os_type == "windows" else "syslog",
+            "channel_epoch": 1,
+            "schema_version": "2.0",
             "technique_id": "T1498",
             "technique_name": "Network Denial of Service",
             "tactic": "Impact",
@@ -297,6 +321,9 @@ def trigger_dns_tunneling(target_agent):
         "severity": "HIGH",
         "detector_name": "DnsAnomalyDetector",
         "evidence": {
+            "channel": "Network" if os_type == "windows" else "syslog",
+            "channel_epoch": 1,
+            "schema_version": "2.0",
             "technique_id": "T1071.004",
             "technique_name": "Application Layer Protocol: DNS",
             "tactic": "Command and Control",

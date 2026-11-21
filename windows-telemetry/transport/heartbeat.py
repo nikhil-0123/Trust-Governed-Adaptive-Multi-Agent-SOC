@@ -8,11 +8,16 @@ import urllib.error
 from datetime import datetime, timezone
 from typing import Optional, List, Dict, Any
 
+from config.settings import config
 from response.executor import WindowsResponseExecutor
 
 DEFAULT_WINDOWS_CAPABILITIES = [
     "EventLog_4625", "EventLog_4688",
     "BLOCK_SOURCE", "KILL_PROCESS", "ISOLATE_HOST", "DISABLE_ACCOUNT"
+]
+
+SYSMON_CAPABILITIES = [
+    "Sysmon_Event1", "Sysmon_Event3", "Sysmon_Event22"
 ]
 
 class HeartbeatWorker(threading.Thread):
@@ -28,7 +33,8 @@ class HeartbeatWorker(threading.Thread):
         api_token: str,
         logger: logging.Logger,
         capabilities: Optional[List[str]] = None,
-        heartbeat_interval: float = 15.0
+        heartbeat_interval: float = 15.0,
+        agent_version: Optional[str] = None
     ):
         super().__init__(name="HeartbeatWorker", daemon=True)
         self.agent_id = agent_id
@@ -39,12 +45,29 @@ class HeartbeatWorker(threading.Thread):
             self.base_url = soc_api_url.rstrip("/")
         self.api_token = api_token
         self.logger = logger
-        self.capabilities = capabilities or list(DEFAULT_WINDOWS_CAPABILITIES)
+        caps = capabilities if capabilities is not None else list(DEFAULT_WINDOWS_CAPABILITIES)
+        self.capabilities = self._deduplicate_capabilities(caps)
         self.heartbeat_interval = heartbeat_interval
+        self.agent_version = agent_version or config.version
         self._stop_event = threading.Event()
         self._start_time = time.time()
         self._first_heartbeat_sent = False
-        self.executor = WindowsResponseExecutor(soc_base_url=self.base_url, logger=self.logger)
+        self.executor = WindowsResponseExecutor(
+            soc_base_url=self.base_url,
+            logger=self.logger,
+            agent_id=self.agent_id,
+            hostname=socket.gethostname()
+        )
+
+    @staticmethod
+    def _deduplicate_capabilities(capabilities: List[str]) -> List[str]:
+        """Preserves capability order while eliminating any duplicate tags."""
+        seen = set()
+        return [c for c in capabilities if not (c in seen or seen.add(c))]
+
+    def update_capabilities(self, capabilities: List[str]):
+        """Dynamically updates the capability list reported in subsequent heartbeats."""
+        self.capabilities = self._deduplicate_capabilities(capabilities)
 
     def run(self):
         self.logger.info(f"HeartbeatWorker started for agent {self.agent_id} targeting {self.base_url} (interval={self.heartbeat_interval}s).")
@@ -78,7 +101,7 @@ class HeartbeatWorker(threading.Thread):
             "hostname": socket.gethostname(),
             "os": self.os_type,
             "ip_address": self._get_local_ip(),
-            "agent_version": "1.0.0",
+            "agent_version": self.agent_version,
             "capabilities": self.capabilities
         }
         data = json.dumps(payload).encode("utf-8")
@@ -134,7 +157,7 @@ class HeartbeatWorker(threading.Thread):
                     "status": "RUNNING",
                     "agent_id": self.agent_id,
                     "capabilities": self.capabilities,
-                    "agent_version": "1.0.0"
+                    "agent_version": self.agent_version
                 }
             elif cmd_type in (
                 "BLOCK_SOURCE", "BLOCK_SOURCE_IP", "UNBLOCK_SOURCE",

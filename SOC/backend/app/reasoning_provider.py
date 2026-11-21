@@ -140,6 +140,58 @@ class MockLLMProvider(LLMProvider):
                         "status": "CANDIDATE",
                         "agent_id": "AnalysisAgent-v1"
                     })
+                elif "phish" in indicator or "t1566" in indicator or "mail" in indicator:
+                    claims.append({
+                        "claim_id": claim_id,
+                        "incident_id": incident_id,
+                        "claim_type": "INITIAL_ACCESS",
+                        "statement": f"Spearphishing delivery targeting user {username} detected on endpoint {hostname}.",
+                        "reasoning_summary": f"Email/lure telemetry indicates malicious attachment targeting internal recipient with severity {severity}.",
+                        "supporting_evidence": [ev_id],
+                        "mitre_techniques": ["T1566"],
+                        "confidence": min(max(confidence, 0.85), 0.98),
+                        "status": "CANDIDATE",
+                        "agent_id": "AnalysisAgent-v1"
+                    })
+                elif "ransom" in indicator or "t1486" in indicator or "wannacrypt" in indicator or "crypto" in indicator:
+                    claims.append({
+                        "claim_id": claim_id,
+                        "incident_id": incident_id,
+                        "claim_type": "IMPACT_ENCRYPTION",
+                        "statement": f"Ransomware process encryption activity detected on endpoint {hostname}.",
+                        "reasoning_summary": f"Mass file rename/encryption telemetry indicates active ransomware impact with severity {severity}.",
+                        "supporting_evidence": [ev_id],
+                        "mitre_techniques": ["T1486"],
+                        "confidence": min(max(confidence, 0.90), 0.99),
+                        "status": "CANDIDATE",
+                        "agent_id": "AnalysisAgent-v1"
+                    })
+                elif "dos" in indicator or "t1498" in indicator or "flood" in indicator or "syn" in indicator:
+                    claims.append({
+                        "claim_id": claim_id,
+                        "incident_id": incident_id,
+                        "claim_type": "NETWORK_IMPACT",
+                        "statement": f"Denial of Service flood detected from attacking IP {src_ip} targeting endpoint {hostname}.",
+                        "reasoning_summary": f"Network telemetry indicates packet rate spike / SYN flood with severity {severity}.",
+                        "supporting_evidence": [ev_id],
+                        "mitre_techniques": ["T1498"],
+                        "confidence": min(max(confidence, 0.85), 0.98),
+                        "status": "CANDIDATE",
+                        "agent_id": "AnalysisAgent-v1"
+                    })
+                elif "dns" in indicator or "t1071" in indicator or "tunnel" in indicator:
+                    claims.append({
+                        "claim_id": claim_id,
+                        "incident_id": incident_id,
+                        "claim_type": "COMMAND_AND_CONTROL",
+                        "statement": f"DNS Tunneling data exfiltration detected from attacking IP {src_ip} on endpoint {hostname}.",
+                        "reasoning_summary": f"DNS telemetry indicates high entropy query burst indicative of C2 data exfiltration with severity {severity}.",
+                        "supporting_evidence": [ev_id],
+                        "mitre_techniques": ["T1071.004"],
+                        "confidence": min(max(confidence, 0.85), 0.98),
+                        "status": "CANDIDATE",
+                        "agent_id": "AnalysisAgent-v1"
+                    })
                 else:
                     claims.append({
                         "claim_id": claim_id,
@@ -220,22 +272,38 @@ class MockLLMProvider(LLMProvider):
                         "supporting_claims": [vr["claim_id"] for vr in contradicted_vr]
                     })
                 
-                has_ip_claim = any("IP" in str(c.get("statement", "")) or "T1110" in c.get("mitre_techniques", []) for c in verified_claims)
-                has_process_claim = any("process" in str(c.get("statement", "")).lower() or "T1059" in c.get("mitre_techniques", []) for c in verified_claims)
-                
+                has_ip_claim = any("IP" in str(c.get("statement", "")) or any(t in c.get("mitre_techniques", []) for t in ["T1110", "T1498", "T1071", "T1071.004"]) for c in verified_claims)
+                has_process_claim = any("process" in str(c.get("statement", "")).lower() or any(t in c.get("mitre_techniques", []) for t in ["T1059", "T1059.001", "T1486", "T1204"]) for c in verified_claims)
+                has_account_claim = any("phish" in str(c.get("statement", "")).lower() or "T1566" in c.get("mitre_techniques", []) for c in verified_claims)
+                has_ransom_claim = any("ransom" in str(c.get("statement", "")).lower() or "T1486" in c.get("mitre_techniques", []) for c in verified_claims)
+
                 if has_ip_claim:
                     recommendations.append({
                         "type": "BLOCK_SOURCE",
                         "status": "RECOMMENDED",
-                        "reason": "Host firewall isolation of attacking source IP to terminate brute-force intrusion vector.",
-                        "supporting_claims": [c.get("claim_id") for c in verified_claims if "IP" in str(c.get("statement", "")) or "T1110" in c.get("mitre_techniques", [])]
+                        "reason": "Host firewall isolation of attacking source IP to terminate network intrusion vector.",
+                        "supporting_claims": [c.get("claim_id") for c in verified_claims if "IP" in str(c.get("statement", "")) or any(t in c.get("mitre_techniques", []) for t in ["T1110", "T1498", "T1071", "T1071.004"])]
                     })
                 if has_process_claim:
                     recommendations.append({
                         "type": "KILL_PROCESS",
                         "status": "RECOMMENDED",
-                        "reason": "Terminate suspicious process execution tree to prevent lateral payload deployment.",
-                        "supporting_claims": [c.get("claim_id") for c in verified_claims if "process" in str(c.get("statement", "")).lower() or "T1059" in c.get("mitre_techniques", [])]
+                        "reason": "Terminate suspicious process execution tree to prevent malicious payload activity.",
+                        "supporting_claims": [c.get("claim_id") for c in verified_claims if "process" in str(c.get("statement", "")).lower() or any(t in c.get("mitre_techniques", []) for t in ["T1059", "T1059.001", "T1486", "T1204"])]
+                    })
+                if has_account_claim:
+                    recommendations.append({
+                        "type": "DISABLE_ACCOUNT",
+                        "status": "RECOMMENDED",
+                        "reason": "Disable compromised user credentials to halt unauthorized lateral movement.",
+                        "supporting_claims": [c.get("claim_id") for c in verified_claims if "phish" in str(c.get("statement", "")).lower() or "T1566" in c.get("mitre_techniques", [])]
+                    })
+                if has_ransom_claim:
+                    recommendations.append({
+                        "type": "ISOLATE_HOST",
+                        "status": "RECOMMENDED",
+                        "reason": "Isolate host from the network to prevent propagation of active ransomware encryption.",
+                        "supporting_claims": [c.get("claim_id") for c in verified_claims if "ransom" in str(c.get("statement", "")).lower() or "T1486" in c.get("mitre_techniques", [])]
                     })
                 has_collect_claim = any("collect" in str(e.get("evidence", {})).lower() or e.get("severity") == "LOW" for e in evidence_list)
                 if has_collect_claim and not has_ip_claim and not has_process_claim and not contradicted_vr:
