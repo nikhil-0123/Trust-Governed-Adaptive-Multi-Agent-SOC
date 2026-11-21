@@ -8,9 +8,13 @@ import uuid
 from datetime import datetime, timezone
 from typing import Optional, Dict, Any
 
+from fastapi import HTTPException
+from app.models import EndpointCommandCreate
+
 from app.database import init_db, get_db_connection
 from app.main import (
     API_TOKEN,
+    dispatch_command,
     get_incident_governance_status,
     approve_governance_mitigation,
     reject_governance_mitigation,
@@ -359,6 +363,19 @@ class TestGovernanceResponseBridge(unittest.TestCase):
         )
         self.assertEqual(selected.originating_detection_event_id, "det-002")
 
+    def test_direct_account_disable_requires_target_hostname(self):
+        with get_db_connection() as conn:
+            for params in ({}, {"target_hostname": "  "}):
+                with self.subTest(params=params), self.assertRaises(HTTPException) as error:
+                    dispatch_command(
+                        self.agent_id, EndpointCommandCreate(command_type="disable_account", parameters=params),
+                        token=API_TOKEN, db=conn,
+                    )
+                self.assertEqual(error.exception.status_code, 422)
+            self.assertIsNone(conn.execute(
+                "SELECT 1 FROM endpoint_commands WHERE agent_id = ?", (self.agent_id,)
+            ).fetchone())
+
     def test_case_2a_local_sam_permitted_strictly_targeted_not_broadcast(self):
         inc_id = str(uuid.uuid4())
         agent_1 = str(uuid.uuid4())
@@ -376,7 +393,6 @@ class TestGovernanceResponseBridge(unittest.TestCase):
             ev_data = {
                 "detection_event_id": det_id,
                 "agent_id": agent_1,
-                "hostname": "HOST-1",
                 "evidence": {
                     "target_user": "attacker",
                     "target_account_id": "LOCAL_SAM\\attacker",
@@ -390,6 +406,21 @@ class TestGovernanceResponseBridge(unittest.TestCase):
             """, (agent_1, now_str))
             conn.execute("INSERT INTO events (detection_event_id, agent_id, channel, channel_epoch, quarantine_status, data) VALUES (?, ?, 'Security', 1, 'ACTIVE_VERIFIED', ?)", (det_id, agent_1, json.dumps(ev_data)))
             conn.execute("INSERT INTO incident_evidence (incident_id, detection_event_id) VALUES (?, ?)", (inc_id, det_id))
+            conn.commit()
+
+            with self.assertRaisesRegex(ValueError, "Missing target_hostname"):
+                dispatch_governed_response(
+                    conn, inc_id, recommendations=[{"type": "DISABLE_ACCOUNT"}]
+                )
+            self.assertIsNone(conn.execute(
+                "SELECT 1 FROM endpoint_commands WHERE agent_id = ?", (agent_1,)
+            ).fetchone())
+            self.assertIsNone(conn.execute(
+                "SELECT 1 FROM action_leases WHERE incident_id = ?", (inc_id,)
+            ).fetchone())
+
+            ev_data["hostname"] = "HOST-1"
+            conn.execute("UPDATE events SET data = ? WHERE detection_event_id = ?", (json.dumps(ev_data), det_id))
             conn.commit()
 
             dispatched = dispatch_governed_response(

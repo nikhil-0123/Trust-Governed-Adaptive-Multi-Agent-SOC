@@ -875,6 +875,10 @@ def dispatch_governed_response(
                 if not target_agent:
                     raise ValueError(f"Missing target_agent_id for DISABLE_ACCOUNT in incident {incident_id}")
 
+                target_host = params.get("target_hostname")
+                if not isinstance(target_host, str) or not target_host.strip():
+                    raise ValueError(f"Missing target_hostname for DISABLE_ACCOUNT in incident {incident_id}")
+
                 # Savepoint per action to guarantee atomic lease reservation and rollback on conflict
                 sp_name = f"sp_lease_disable_{uuid.uuid4().hex[:8]}"
                 conn.execute(f"SAVEPOINT {sp_name}")
@@ -902,7 +906,6 @@ def dispatch_governed_response(
                     # 3. Create endpoint & command
                     ep_check = conn.execute("SELECT 1 FROM endpoints WHERE agent_id = ?", (target_agent,)).fetchone()
                     if not ep_check:
-                        target_host = params.get("target_hostname") or (targets["hostnames"][0] if targets["hostnames"] else "unknown-host")
                         conn.execute("""
                             INSERT INTO endpoints (agent_id, hostname, os, status, last_heartbeat)
                             VALUES (?, ?, 'windows', 'ONLINE', ?)

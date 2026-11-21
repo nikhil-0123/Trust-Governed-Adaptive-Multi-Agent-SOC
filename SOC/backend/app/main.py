@@ -935,6 +935,12 @@ def dispatch_command(
     if not ep:
         raise HTTPException(status_code=404, detail="Endpoint agent not found")
 
+    command_type = cmd_in.command_type.upper()
+    if command_type == "DISABLE_ACCOUNT":
+        target_host = (cmd_in.parameters or {}).get("target_hostname")
+        if not isinstance(target_host, str) or not target_host.strip():
+            raise HTTPException(status_code=422, detail="Missing target_hostname for DISABLE_ACCOUNT")
+
     cmd_id = str(uuid.uuid4())
     now_str = datetime.now(timezone.utc).isoformat()
     params_json = json.dumps(cmd_in.parameters or {})
@@ -942,13 +948,13 @@ def dispatch_command(
     db.execute("""
         INSERT INTO endpoint_commands (command_id, agent_id, command_type, parameters, status, result, created_at, updated_at)
         VALUES (?, ?, ?, ?, 'PENDING', NULL, ?, ?)
-    """, (cmd_id, agent_id, cmd_in.command_type.upper(), params_json, now_str, now_str))
+    """, (cmd_id, agent_id, command_type, params_json, now_str, now_str))
     db.commit()
 
     return EndpointCommand(
         command_id=cmd_id,
         agent_id=agent_id,
-        command_type=cmd_in.command_type.upper(),
+        command_type=command_type,
         parameters=cmd_in.parameters,
         status="PENDING",
         result=None,

@@ -1990,6 +1990,7 @@ class TestEpochGovernance(unittest.TestCase):
             ev_data_local = {
                 "detection_event_id": det_id,
                 "agent_id": agent_id,
+                "hostname": "WIN-TEST-01",
                 "channel": "Security",
                 "channel_epoch": 1,
                 "evidence": {
@@ -2525,6 +2526,7 @@ class TestEpochGovernance(unittest.TestCase):
             ev_data_local = {
                 "detection_event_id": det_id_local,
                 "agent_id": agent_id,
+                "hostname": "WIN-TEST-01",
                 "channel": "Security",
                 "channel_epoch": 1,
                 "evidence": {
@@ -3143,6 +3145,7 @@ class TestEpochGovernance(unittest.TestCase):
             ev_data_local = {
                 "detection_event_id": det_id_local,
                 "agent_id": agent_id,
+                "hostname": "WIN-TEST-01",
                 "channel": "Security",
                 "channel_epoch": 1,
                 "evidence": {

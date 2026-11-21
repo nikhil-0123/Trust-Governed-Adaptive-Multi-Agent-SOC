@@ -1,5 +1,5 @@
 import platform
-import sys
+import threading
 import time
 from typing import Optional
 import logging
@@ -10,10 +10,25 @@ from .agent_identity import AgentIdentity
 from .health import HealthMonitor
 
 class TelemetryRuntime:
+    _logger_lock = threading.Lock()
+    _logger_users: dict[logging.Logger, int] = {}
+    _owned_handlers: dict[logging.Logger, set[logging.Handler]] = {}
+
     def __init__(self, logger: Optional[logging.Logger] = None):
         self.start_time = time.time()
         self._owns_logger = logger is None
-        self.logger = logger or setup_logger(config.app_name, config.log_level, config.data_dir)
+        self._logger_released = False
+        with self._logger_lock:
+            if self._owns_logger:
+                configured = logging.getLogger(config.app_name)
+                previous_handlers = set(configured.handlers)
+                self.logger = setup_logger(config.app_name, config.log_level, config.data_dir)
+                added = set(self.logger.handlers) - previous_handlers
+                if added:
+                    self._owned_handlers.setdefault(self.logger, set()).update(added)
+            else:
+                self.logger = logger
+            self._logger_users[self.logger] = self._logger_users.get(self.logger, 0) + 1
         self.identity: Optional[AgentIdentity] = None
         self.health: Optional[HealthMonitor] = None
 
@@ -44,14 +59,23 @@ class TelemetryRuntime:
         # Future shutdown hooks for collectors will go here
         self.logger.info("Shutdown complete.")
 
-        # Only close handlers owned by a logger created by this runtime.
-        if not self._owns_logger:
-            return
-        for handler in list(self.logger.handlers):
-            try:
-                handler.flush()
-                if isinstance(handler, logging.FileHandler):
-                    handler.close()
+        with self._logger_lock:
+            if self._logger_released:
+                return
+            self._logger_released = True
+
+            self._logger_users[self.logger] -= 1
+            if self._logger_users[self.logger]:
+                return
+            del self._logger_users[self.logger]
+
+            for handler in self._owned_handlers.pop(self.logger, ()):
                 self.logger.removeHandler(handler)
-            except Exception:
-                pass
+                try:
+                    handler.flush()
+                except Exception:
+                    pass
+                try:
+                    handler.close()
+                except Exception:
+                    pass

@@ -40,6 +40,21 @@ class TestWindowsMainAndPipeline(unittest.TestCase):
         config.detection_output_dir = self.orig_detection
         shutil.rmtree(self.test_dir, ignore_errors=True)
 
+    def test_explicit_invalid_epoch_stops_batch_without_advancing_checkpoint(self):
+        pipeline = WindowsDetectionPipeline(MagicMock())
+        collector = MagicMock(current_epoch=3, log_name="Security")
+        events = [{"record_id": record} for record in (10, 11, 12, 13)]
+        events[1]["epoch"] = 2
+        events[2]["epoch"] = None
+        collector.collect_once.return_value = events
+
+        with patch.object(pipeline.normalizer, "normalize", return_value={}) as normalize:
+            with patch.object(pipeline.engine, "process_event", return_value=[]):
+                pipeline._process_channel_batch(collector, "Security")
+
+        self.assertEqual([call.kwargs["epoch"] for call in normalize.call_args_list], [3, 2])
+        collector.update_checkpoint.assert_called_once_with(11)
+
     def test_pipeline_shutdown_is_safe_without_collector_shutdown_attribute(self):
         logger = MagicMock()
         pipeline = WindowsDetectionPipeline(logger)

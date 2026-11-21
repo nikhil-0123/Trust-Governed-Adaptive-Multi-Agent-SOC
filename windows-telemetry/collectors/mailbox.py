@@ -11,8 +11,11 @@ import os
 import json
 import logging
 import hashlib
+import tempfile
 from datetime import datetime, timezone
 from typing import Dict, Any, List, Optional, Tuple
+
+from .checkpoint import _acquire_kernel_lock, _release_kernel_lock
 
 import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
@@ -151,41 +154,78 @@ class TransitionMailbox:
             envelope["transition_id"] = transition_id
 
         target_file = os.path.join(self.pending_dir, f"{transition_id}.json")
-        temp_file = f"{target_file}.tmp"
+        dst = os.path.join(self.quarantined_dir, f"{transition_id}.json")
+        temp_file = None
 
         self._ensure_dirs()
         try:
-            with open(temp_file, "w", encoding="utf-8") as f:
+            with tempfile.NamedTemporaryFile(
+                mode="w", encoding="utf-8", dir=self.pending_dir, suffix=".tmp", delete=False
+            ) as f:
+                temp_file = f.name
                 json.dump(envelope, f, indent=2)
                 f.flush()
                 os.fsync(f.fileno())
-            try:
-                os.link(temp_file, target_file)
-            except FileExistsError:
+
+            incoming = {key: value for key, value in envelope.items() if key != "created_at"}
+            while True:
+                try:
+                    os.link(temp_file, target_file)
+                    break
+                except FileExistsError:
+                    pass
+
                 try:
                     with open(target_file, "r", encoding="utf-8") as existing:
-                        existing_payload = json.load(existing)
-                    if existing_payload != envelope:
-                        dst = os.path.join(self.quarantined_dir, f"{transition_id}.json")
-                        os.replace(temp_file, dst)
-                        raise ValueError(f"Conflicting transition envelope already exists for {transition_id}")
-                except json.JSONDecodeError:
-                    dst = os.path.join(self.quarantined_dir, f"{transition_id}.json")
+                        existing_stat = os.fstat(existing.fileno())
+                        try:
+                            existing_payload = json.load(existing)
+                        except (json.JSONDecodeError, UnicodeDecodeError):
+                            existing_payload = None
+                except FileNotFoundError:
+                    # The consumer may have moved the pending file after os.link.
+                    continue
+
+                if not isinstance(existing_payload, dict):
+                    self._quarantine_malformed_pending(target_file, dst, existing_stat)
+                    continue
+
+                existing_payload.pop("created_at", None)
+                if existing_payload != incoming:
                     os.replace(temp_file, dst)
-                    raise ValueError(f"Invalid existing transition envelope for {transition_id}")
-                os.remove(temp_file)
-            else:
-                os.remove(temp_file)
+                    temp_file = None
+                    raise ValueError(f"Conflicting transition envelope already exists for {transition_id}")
+                break
+
             self.logger.info(f"Published transition envelope {transition_id} to {target_file}")
             return transition_id
         except Exception as e:
             self.logger.error(f"Failed to publish transition envelope {transition_id}: {e}")
-            if os.path.exists(temp_file):
+            raise
+        finally:
+            if temp_file is not None:
                 try:
                     os.remove(temp_file)
-                except OSError:
+                except FileNotFoundError:
                     pass
-            raise
+                except OSError as e:
+                    self.logger.warning(f"Failed to remove mailbox temporary file {temp_file}: {e}")
+
+    def _quarantine_malformed_pending(self, target_file: str, dst: str, observed: os.stat_result):
+        # Competing recoveries must not move a replacement published after the malformed read.
+        fd = os.open(os.path.join(self.pending_dir, ".recovery.lock"), os.O_CREAT | os.O_RDWR)
+        try:
+            if not _acquire_kernel_lock(fd):
+                raise OSError("Mailbox recovery already in progress; retry publication")
+            try:
+                if os.path.samestat(os.stat(target_file), observed):
+                    os.replace(target_file, dst)
+            except FileNotFoundError:
+                pass
+            finally:
+                _release_kernel_lock(fd)
+        finally:
+            os.close(fd)
 
     def claim_pending_transitions(
         self, target_channel: Optional[str] = None

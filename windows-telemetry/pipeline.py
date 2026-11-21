@@ -1,5 +1,6 @@
 import logging
 from typing import List, Optional, Dict, Any
+from canonical import validate_epoch
 from config.settings import config
 from normalizer.windows_event_normalizer import WindowsEventNormalizer
 from detection.detector import DetectionEngine
@@ -182,7 +183,7 @@ class WindowsDetectionPipeline:
             record_id = raw_event.get("record_id", -1)
             try:
                 # 1. Normalize with authoritative channel epoch and log_name
-                event_epoch = raw_event["epoch"] if "epoch" in raw_event else current_epoch
+                event_epoch = validate_epoch(raw_event["epoch"]) if "epoch" in raw_event else current_epoch
                 normalized_event = self.normalizer.normalize(
                     raw_event, log_name=channel_log_name, epoch=event_epoch
                 )

@@ -111,6 +111,26 @@ class TransportClient:
             return SendResult(False, False, str(sanitized_e), status_code=0, response_body="", headers={})
 
 
+def validate_transition_ack(
+    transition_id: Optional[str], status_code: int, data: Any
+) -> Tuple[bool, bool]:
+    """Return whether the response acknowledges this transition and whether it was a duplicate."""
+    if (
+        not isinstance(transition_id, str)
+        or not transition_id.strip()
+        or not isinstance(data, dict)
+        or data.get("transition_id") != transition_id
+    ):
+        return False, False
+    if status_code == 200:
+        status = data.get("status")
+        if status in ("APPLIED", "ALREADY_APPLIED", "OBSOLETE"):
+            return True, bool(data.get("duplicate")) or status in ("ALREADY_APPLIED", "OBSOLETE")
+    if status_code == 409 and data.get("duplicate") is True and data.get("accepted") is True:
+        return True, True
+    return False, False
+
+
 class TransitionTransportClient:
     """
     Authenticated HTTP transport client delivering ChannelTransition envelopes
@@ -157,7 +177,6 @@ class TransitionTransportClient:
 
         data = json.dumps(transition).encode('utf-8')
         transition_id = transition.get("transition_id") if isinstance(transition, dict) else None
-        is_valid_tid = bool(transition_id) and isinstance(transition_id, str) and bool(transition_id.strip())
 
         try:
             with urllib.request.urlopen(req, data=data, timeout=self.timeout) as response:
@@ -167,10 +186,8 @@ class TransitionTransportClient:
                 if response.status == 200:
                     try:
                         resp_data = json.loads(resp_body)
-                        status_str = resp_data.get("status") if isinstance(resp_data, dict) else ""
-                        echoed_tid = resp_data.get("transition_id") if isinstance(resp_data, dict) else None
-                        is_dup = bool(resp_data.get("duplicate", False)) or status_str in ("ALREADY_APPLIED", "OBSOLETE")
-                        if status_str in ("APPLIED", "ALREADY_APPLIED", "OBSOLETE") and is_valid_tid and echoed_tid == transition_id:
+                        accepted, is_dup = validate_transition_ack(transition_id, 200, resp_data)
+                        if accepted:
                             return SendResult(True, is_dup, "", status_code=200, response_body=resp_body, headers=resp_headers)
                         sanitized_body = sanitize_error_message(resp_body)
                         return SendResult(False, False, f"Unexpected response contract on HTTP 200: {sanitized_body}", status_code=200, response_body=resp_body, headers=resp_headers)
@@ -193,14 +210,8 @@ class TransitionTransportClient:
             if e.code == 409:
                 try:
                     resp_data = json.loads(err_msg)
-                    echoed_tid = resp_data.get("transition_id") if isinstance(resp_data, dict) else None
-                    if (
-                        isinstance(resp_data, dict)
-                        and resp_data.get("duplicate") is True
-                        and resp_data.get("accepted") is True
-                        and echoed_tid == transition_id
-                        and is_valid_tid
-                    ):
+                    accepted, _ = validate_transition_ack(transition_id, 409, resp_data)
+                    if accepted:
                         return SendResult(True, True, "", status_code=409, response_body=err_msg, headers=e_headers)
                 except Exception:
                     pass

@@ -15,7 +15,7 @@ from .outbox import (
     parse_retry_after,
     sanitize_error_message
 )
-from .client import TransportClient
+from .client import TransportClient, validate_transition_ack
 
 def evaluate_delivery_outcome(
     event_id: str,
@@ -213,7 +213,9 @@ def evaluate_transition_delivery_outcome(
     current_attempts: int,
     headers: Optional[Dict[str, str]] = None,
     error_msg: str = "",
-    max_retries: int = 10
+    max_retries: int = 10,
+    *,
+    client_acknowledged: bool = True
 ) -> Dict[str, Any]:
     """
     Evaluates the channel transition delivery outcome and determines the precise outbox state transition.
@@ -227,22 +229,16 @@ def evaluate_transition_delivery_outcome(
         'error': str
     }
     """
-    is_valid_tid = bool(transition_id) and isinstance(transition_id, str) and bool(transition_id.strip())
+    valid_ack, is_dup = False, False
+    if client_acknowledged and status_code in (200, 409):
+        try:
+            data = json.loads(resp_body) if isinstance(resp_body, str) else resp_body
+            valid_ack, is_dup = validate_transition_ack(transition_id, status_code, data)
+        except ValueError:
+            pass
 
     # 1. HTTP 200 OK (Success: APPLIED, ALREADY_APPLIED, OBSOLETE)
     if status_code == 200:
-        valid_ack = False
-        is_dup = False
-        try:
-            data = json.loads(resp_body) if isinstance(resp_body, str) else resp_body
-            if isinstance(data, dict):
-                st = data.get("status")
-                if st in ("APPLIED", "ALREADY_APPLIED", "OBSOLETE") and is_valid_tid:
-                    valid_ack = True
-                    is_dup = bool(data.get("duplicate", False)) or st in ("ALREADY_APPLIED", "OBSOLETE")
-        except Exception:
-            pass
-
         if valid_ack:
             return {
                 "action": "DELIVER",
@@ -274,15 +270,7 @@ def evaluate_transition_delivery_outcome(
 
     # 2. HTTP 409 Conflict
     if status_code == 409:
-        valid_dup_ack = False
-        try:
-            data = json.loads(resp_body) if isinstance(resp_body, str) else resp_body
-            if isinstance(data, dict) and data.get("duplicate") is True:
-                valid_dup_ack = True
-        except Exception:
-            pass
-
-        if valid_dup_ack:
+        if valid_ack:
             return {
                 "action": "DELIVER",
                 "is_duplicate": True,
@@ -522,6 +510,8 @@ class DeliveryManager:
                 t_data = json.loads(raw_data) if isinstance(raw_data, str) else raw_data
                 if not isinstance(t_data, dict):
                     raise ValueError("Payload is not a valid JSON object")
+                if t_data.get("transition_id") != transition_id:
+                    raise ValueError("Transition payload ID does not match the outbox row")
             except Exception as e:
                 sanitized_e = sanitize_error_message(f"JSON parse error: {e}")
                 self.logger.error(f"Corrupt transition data in outbox for {transition_id}: {sanitized_e}")
@@ -549,7 +539,8 @@ class DeliveryManager:
                 current_attempts=current_attempts,
                 headers=headers,
                 error_msg=error_msg,
-                max_retries=self.max_retries
+                max_retries=self.max_retries,
+                client_acknowledged=getattr(send_result, "success", False) is True,
             )
 
             action = outcome["action"]
