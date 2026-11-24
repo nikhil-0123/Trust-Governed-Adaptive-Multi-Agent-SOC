@@ -15,11 +15,12 @@ class BruteForceRule:
         window_seconds: int = 60,
         max_state_keys: Optional[int] = None,
         cleanup_interval_seconds: Optional[float] = None,
-        logger: Optional[logging.Logger] = None
+        logger: Optional[logging.Logger] = None,
+        detector_version: Optional[str] = None,
     ):
         self.name = "windows_bruteforce_rule"
         self.detector_name = "windows_bruteforce_rule"
-        self.detector_version = "1.0.0"
+        self.detector_version = str(detector_version) if detector_version is not None else "1.0.0"
 
         # Validate failure_threshold
         if isinstance(failure_threshold, bool) or not isinstance(failure_threshold, int) or failure_threshold < 3:
@@ -435,10 +436,10 @@ class SuspiciousPowerShellRule:
     Detects obfuscated PowerShell, Base64 EncodedCommands, and download cradles.
     MITRE ATT&CK: T1059.001 (Command and Scripting Interpreter: PowerShell)
     """
-    def __init__(self):
+    def __init__(self, detector_version: Optional[str] = None):
         self.name = "windows_powershell_execution"
         self.detector_name = "windows_powershell_rule"
-        self.detector_version = "1.0.0"
+        self.detector_version = str(detector_version) if detector_version is not None else "1.0.0"
         self.patterns = [
             (r'(?i)-(?:e|enc|encodedcommand)\s+[a-zA-Z0-9+/=]{6,}', "Base64 EncodedCommand"),
             (r'(?i)downloadstring|downloadfile|net\.webclient', "WebClient Download Cradle"),
@@ -513,10 +514,10 @@ class SuspiciousLolbinsDownloadRule:
     Detects Living-off-the-Land Binaries (LOLBins) used for ingress tool transfer and malware staging.
     MITRE ATT&CK: T1105 (Ingress Tool Transfer)
     """
-    def __init__(self):
+    def __init__(self, detector_version: Optional[str] = None):
         self.name = "windows_lolbin_download"
         self.detector_name = "windows_lolbin_rule"
-        self.detector_version = "1.0.0"
+        self.detector_version = str(detector_version) if detector_version is not None else "1.0.0"
         self.patterns = [
             (r'(?i)\bcertutil(?:\.exe)?\b.*[-/](?:urlcache|split)', "Certutil URLCache Stager"),
             (r'(?i)\bbitsadmin(?:\.exe)?\b.*[/-](?:transfer|create|addfile|resume)', "Bitsadmin Transfer"),
@@ -587,10 +588,10 @@ class ReconnaissanceCommandsRule:
     Detects discovery and enumeration commands executed after initial access.
     MITRE ATT&CK: T1082 (System Information Discovery), T1087 (Account Discovery)
     """
-    def __init__(self):
+    def __init__(self, detector_version: Optional[str] = None):
         self.name = "windows_reconnaissance"
         self.detector_name = "windows_reconnaissance_rule"
-        self.detector_version = "1.0.0"
+        self.detector_version = str(detector_version) if detector_version is not None else "1.0.0"
         self.patterns = [
             (r'(?i)\bwhoami(?:\.exe)?\s+/(?:all|priv)\b', "Whoami Privilege Enumeration", "T1033"),
             (r'(?i)\bnet(?:\.exe)?\s+localgroup\s+administrators\b', "Local Admin Discovery", "T1087"),
@@ -656,10 +657,10 @@ class DefenseEvasionRule:
     Detects attempts to disable Windows Defender, clear event logs, or delete volume shadow copies.
     MITRE ATT&CK: T1562.001 (Impair Defenses), T1070.001 (Clear Event Logs)
     """
-    def __init__(self):
+    def __init__(self, detector_version: Optional[str] = None):
         self.name = "windows_defense_evasion"
         self.detector_name = "windows_defense_evasion_rule"
-        self.detector_version = "1.0.0"
+        self.detector_version = str(detector_version) if detector_version is not None else "1.0.0"
         self.patterns = [
             (r'(?i)\b(?:sc|net)(?:\.exe)?\s+stop\s+windefend\b', "Stop Windows Defender Service", "T1562.001"),
             (r'(?i)set-mppreference.*-disablerealtime', "Disable Defender Real-time Protection", "T1562.001"),

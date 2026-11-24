@@ -300,8 +300,27 @@ class TestProcessHashValidation(unittest.TestCase):
 
 class TestMalformedSysmonXmlAndCollectionHardening(unittest.TestCase):
     def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.orig_chk = config._checkpoint_dir
+        self.orig_data = config.data_dir
+        self.orig_outbox = config._outbox_db_path
+        self.orig_detection = config._detection_output_dir
+
+        config.checkpoint_dir = os.path.join(self.temp_dir.name, "checkpoints")
+        config.data_dir = self.temp_dir.name
+        config.outbox_db_path = os.path.join(self.temp_dir.name, "outbox.db")
+        config.detection_output_dir = os.path.join(self.temp_dir.name, "detections")
+
         self.logger = logging.getLogger("TestXmlHardening")
         self.collector = WindowsEventCollector(self.logger, log_name="Microsoft-Windows-Sysmon/Operational")
+        self.collector.initialize()
+
+    def tearDown(self):
+        config._checkpoint_dir = self.orig_chk
+        config.data_dir = self.orig_data
+        config._outbox_db_path = self.orig_outbox
+        config._detection_output_dir = self.orig_detection
+        self.temp_dir.cleanup()
 
     def test_truncated_xml_gracefully_handled(self):
         truncated_xml = "<Event><System><EventID>1</EventID><EventRecordID>50</EventRecordID>"
@@ -744,6 +763,16 @@ class TestCrossVersionReplayAndPayloadFingerprints(unittest.TestCase):
     def setUp(self):
         self.logger = logging.getLogger("TestCrossVersionReplay")
         self.temp_dir = tempfile.TemporaryDirectory()
+        self.orig_chk = config._checkpoint_dir
+        self.orig_data = config.data_dir
+        self.orig_outbox = config._outbox_db_path
+        self.orig_detection = config._detection_output_dir
+
+        config.checkpoint_dir = os.path.join(self.temp_dir.name, "checkpoints")
+        config.data_dir = self.temp_dir.name
+        config.outbox_db_path = os.path.join(self.temp_dir.name, "outbox.db")
+        config.detection_output_dir = os.path.join(self.temp_dir.name, "detections")
+
         self.identity = AgentIdentity(data_dir=self.temp_dir.name)
         self.normalizer = WindowsEventNormalizer(self.identity, self.logger)
 
@@ -771,6 +800,10 @@ class TestCrossVersionReplayAndPayloadFingerprints(unittest.TestCase):
         self.headers = {"Authorization": f"Bearer {auth_tok}"}
 
     def tearDown(self):
+        config._checkpoint_dir = self.orig_chk
+        config.data_dir = self.orig_data
+        config._outbox_db_path = self.orig_outbox
+        config._detection_output_dir = self.orig_detection
         import app.database as database
         database.DB_PATH = self.orig_db_path
         if os.path.exists(self.temp_db_path):
@@ -918,6 +951,66 @@ class TestCrossVersionReplayAndPayloadFingerprints(unittest.TestCase):
         self.assertTrue(res_bumped.json()["accepted"])
         self.assertFalse(res_bumped.json()["duplicate"])
 
+    def test_backend_incident_fusion_single_incident_on_reevaluation(self):
+        _, _, payload_v1, _, payload_v2_bumped = self._build_payloads()
+        import app.database as database
+        import sqlite3
+
+        # 1. Ingest original baseline v1 payload
+        res1 = self.client.post("/api/v1/detection-events", json=payload_v1, headers=self.headers)
+        self.assertEqual(res1.status_code, 201)
+
+        # Run EvidenceFusionEngine on the ingested event
+        from app.fusion import EvidenceFusionEngine
+        conn = sqlite3.connect(database.DB_PATH)
+        conn.row_factory = sqlite3.Row
+        engine = EvidenceFusionEngine(conn)
+        engine.process_event(payload_v1["detection_event_id"])
+        conn.commit()
+
+        # 2. Check incident count in database
+        incidents = conn.execute("SELECT incident_id, max_severity FROM incidents").fetchall()
+        self.assertEqual(len(incidents), 1)
+        orig_inc_id = incidents[0]["incident_id"]
+
+        anchors = conn.execute("SELECT agent_id, source_event_id, incident_id FROM incident_anchors").fetchall()
+        self.assertEqual(len(anchors), 1)
+        self.assertEqual(anchors[0]["source_event_id"], payload_v1["source_event_id"])
+        self.assertEqual(anchors[0]["incident_id"], orig_inc_id)
+
+        evidence_pre = conn.execute("SELECT detection_event_id, classification FROM incident_evidence WHERE incident_id = ?", (orig_inc_id,)).fetchall()
+        self.assertEqual(len(evidence_pre), 1)
+        self.assertEqual(evidence_pre[0]["classification"], "PRIMARY_DETECTION")
+
+        # 3. Ingest upgraded bumped v2 payload (historical re-evaluation)
+        res2 = self.client.post("/api/v1/detection-events", json=payload_v2_bumped, headers=self.headers)
+        self.assertEqual(res2.status_code, 201)
+
+        # Run EvidenceFusionEngine on the replayed bumped event
+        engine.process_event(payload_v2_bumped["detection_event_id"])
+        conn.commit()
+
+        # 4. Verify no duplicate incident was created
+        incidents_post = conn.execute("SELECT incident_id, max_severity FROM incidents").fetchall()
+        self.assertEqual(len(incidents_post), 1)
+        self.assertEqual(incidents_post[0]["incident_id"], orig_inc_id)
+
+        # 5. Verify the re-evaluated event was attached as HISTORICAL_RE_EVALUATION
+        evidence_post = conn.execute("SELECT detection_event_id, classification FROM incident_evidence WHERE incident_id = ? ORDER BY classification", (orig_inc_id,)).fetchall()
+        self.assertEqual(len(evidence_post), 2)
+        classifications = {r["classification"] for r in evidence_post}
+        self.assertIn("PRIMARY_DETECTION", classifications)
+        self.assertIn("HISTORICAL_RE_EVALUATION", classifications)
+
+        conn.close()
+
+    def test_production_pipeline_detector_revision_default(self):
+        from pipeline import WindowsDetectionPipeline
+        pl = WindowsDetectionPipeline(self.logger)
+        self.assertEqual(pl.engine.detector_version, "1.1.0")
+        for r in pl.engine.rules:
+            self.assertEqual(r.detector_version, "1.1.0")
+
 
 class TestMalformedXmlAndPipelineDurability(unittest.TestCase):
     """
@@ -993,6 +1086,11 @@ class TestMalformedXmlAndPipelineDurability(unittest.TestCase):
         self.assertEqual(events[1]["record_id"], 1002)
         self.assertEqual(events[1]["process_name"], "powershell.exe")
 
+        # Verify corrupted record was durably quarantined to disk
+        self.assertTrue(os.path.isdir(self.collector.malformed_events_dir))
+        q_files = os.listdir(self.collector.malformed_events_dir)
+        self.assertGreaterEqual(len(q_files), 1)
+
     def test_truncated_xml_batch_graceful_handling(self):
         truncated = (
             '<Event xmlns="http://schemas.microsoft.com/win/2004/08/events/event">'
@@ -1001,6 +1099,10 @@ class TestMalformedXmlAndPipelineDurability(unittest.TestCase):
         )
         events = self.collector._parse_wevtutil_xml(truncated)
         self.assertEqual(events, [])
+        # Verify parse failure was durably quarantined
+        self.assertTrue(os.path.isdir(self.collector.malformed_events_dir))
+        q_files = os.listdir(self.collector.malformed_events_dir)
+        self.assertGreaterEqual(len(q_files), 1)
 
     def test_missing_system_metadata_handling(self):
         no_system = (
@@ -1010,6 +1112,10 @@ class TestMalformedXmlAndPipelineDurability(unittest.TestCase):
         )
         events = self.collector._parse_wevtutil_xml(no_system)
         self.assertEqual(events, [])
+        # Verify missing System event was durably quarantined
+        self.assertTrue(os.path.isdir(self.collector.malformed_events_dir))
+        q_files = os.listdir(self.collector.malformed_events_dir)
+        self.assertGreaterEqual(len(q_files), 1)
 
     def test_embedded_null_character_sanitization(self):
         null_xml = (
@@ -1055,6 +1161,25 @@ class TestMalformedXmlAndPipelineDurability(unittest.TestCase):
         col2 = WindowsEventCollector(self.logger, log_name="Security", agent_id="AGT-WIN-01")
         col2.initialize()
         self.assertEqual(col2.current_checkpoint, 750)
+
+    def test_oversized_batch_adaptive_reduction_and_quarantine(self):
+        # Indivisible oversized record quarantine and checkpoint advancement
+        huge_event = (
+            "<Event xmlns='http://schemas.microsoft.com/win/2004/08/events/event'>"
+            "<System><EventID>1</EventID><EventRecordID>8888</EventRecordID></System>"
+            "<EventData><Data Name='Payload'>" + ("A" * (10 * 1024 * 1024 + 500)) + "</Data></EventData>"
+            "</Event>"
+        )
+        rec_id = self.collector._extract_record_id_from_raw_xml(huge_event)
+        self.assertEqual(rec_id, 8888)
+
+        q_path = self.collector.quarantine_oversized_record(huge_event, record_id=rec_id)
+        self.assertTrue(os.path.isfile(q_path))
+        self.assertGreater(os.path.getsize(q_path), 10 * 1024 * 1024)
+
+        # Advance checkpoint past oversized record to prevent deadlock
+        self.collector.checkpoint_manager.save_checkpoint(rec_id)
+        self.assertEqual(self.collector.checkpoint_manager.load_state()["last_record_id"], 8888)
 
 
 class TestDownstreamEvidenceCompatibility(unittest.TestCase):

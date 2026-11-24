@@ -26,7 +26,7 @@ class WindowsDetectionPipeline:
         self.execution_mode = (execution_mode or getattr(config, "execution_mode", "PRODUCTION")).upper().strip()
         self.identity = AgentIdentity(config.data_dir)
         self.normalizer = WindowsEventNormalizer(self.identity, logger)
-        self.engine = DetectionEngine(logger)
+        self.engine = DetectionEngine(logger, detector_version=getattr(config, "detector_version", "1.1.0"))
         writer_filename = "detections_eval.jsonl" if self.execution_mode == "EVALUATION" else "detections.jsonl"
         self.writer = DetectionEventWriter(config.detection_output_dir, logger, filename=writer_filename)
         

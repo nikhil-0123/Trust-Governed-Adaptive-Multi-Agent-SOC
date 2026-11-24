@@ -3,6 +3,8 @@ import subprocess
 import xml.etree.ElementTree as ET
 import logging
 import json
+import uuid
+import re
 from datetime import datetime, timezone
 from typing import List, Dict, Any, Optional, Tuple
 from config.settings import config
@@ -60,6 +62,12 @@ class WindowsEventCollector:
         self.remainder_file = os.path.join(
             self.journal_dir, f"{safe_channel}_remainder.json"
         )
+        self.malformed_events_dir = os.path.join(
+            self.journal_dir, "malformed_events", safe_channel
+        )
+        self.oversized_events_dir = os.path.join(
+            self.journal_dir, "oversized_events", safe_channel
+        )
         self._serving_remainder = False
         self._in_flight_simulated_files = []
 
@@ -79,6 +87,8 @@ class WindowsEventCollector:
     def initialize(self):
         self.logger.info(f"Initializing WindowsEventCollector for channel: {self.log_name}")
         os.makedirs(self.journal_dir, exist_ok=True)
+        os.makedirs(self.malformed_events_dir, exist_ok=True)
+        os.makedirs(self.oversized_events_dir, exist_ok=True)
         os.makedirs(self.simulated_events_dir, exist_ok=True)
         os.makedirs(self.simulated_events_channel_dir, exist_ok=True)
 
@@ -468,6 +478,24 @@ class WindowsEventCollector:
                 for filename in files[: self.batch_size]:
                     filepath = os.path.join(sdir, filename)
                     try:
+                        file_size = os.path.getsize(filepath)
+                        if file_size > 10 * 1024 * 1024:
+                            self.logger.warning(
+                                f"Oversized simulated event file {filepath} ({file_size} bytes). Quarantining."
+                            )
+                            with open(filepath, "r", encoding="utf-8") as f:
+                                raw_content = f.read()
+                            rec_id = self._extract_record_id_from_raw_xml(raw_content)
+                            self.quarantine_oversized_record(raw_content, record_id=rec_id)
+                            if rec_id is not None and rec_id > self.current_checkpoint:
+                                self.checkpoint_manager.save_checkpoint(rec_id)
+                                self.current_checkpoint = rec_id
+                            try:
+                                os.remove(filepath)
+                            except OSError:
+                                pass
+                            continue
+
                         with open(filepath, "r", encoding="utf-8") as f:
                             content = f.read()
                         parsed = self._parse_wevtutil_xml(content)
@@ -1001,12 +1029,54 @@ class WindowsEventCollector:
                 result = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=30)
                 xml_output = result.stdout.strip()
                 if xml_output:
-                    live_events = self._parse_wevtutil_xml(xml_output)
-                    if live_events:
-                        truncated, remainder = self._truncate_batch_at_clear(live_events)
-                        if remainder:
-                            self.persist_durable_remainder(remainder)
-                        events = truncated
+                    # Oversized XML handling & adaptive batch reduction (Task 3)
+                    if len(xml_output) > 10 * 1024 * 1024:
+                        self.logger.warning(
+                            f"Oversized XML batch ({len(xml_output)} bytes) returned by {self.log_name} with batch_size={self.batch_size}. "
+                            "Initiating adaptive batch reduction recovery."
+                        )
+                        recovery_batches = [10, 1] if self.batch_size > 10 else [1]
+                        recovered = False
+                        for reduced_size in recovery_batches:
+                            r_cmd = ["wevtutil", "qe", self.log_name, f"/q:{query}", f"/c:{reduced_size}", "/f:xml"]
+                            try:
+                                r_res = subprocess.run(r_cmd, capture_output=True, text=True, check=True, timeout=30)
+                                r_xml = r_res.stdout.strip()
+                                if r_xml and len(r_xml) <= 10 * 1024 * 1024:
+                                    live_events = self._parse_wevtutil_xml(r_xml)
+                                    if live_events:
+                                        truncated, remainder = self._truncate_batch_at_clear(live_events)
+                                        if remainder:
+                                            self.persist_durable_remainder(remainder)
+                                        events = truncated
+                                        recovered = True
+                                        self.logger.info(f"Adaptive batch reduction succeeded on {self.log_name} with /c:{reduced_size}.")
+                                        break
+                            except Exception as re:
+                                self.logger.warning(f"Adaptive batch reduction query failed with /c:{reduced_size}: {re}")
+
+                        if not recovered:
+                            # Indivisible single event or record batch exceeds 10MB
+                            self.logger.error(
+                                f"Indivisible oversized record (>10MB) detected on {self.log_name}. "
+                                "Durably quarantining oversized payload to prevent channel deadlock."
+                            )
+                            rec_id = self._extract_record_id_from_raw_xml(xml_output)
+                            q_path = self.quarantine_oversized_record(xml_output, record_id=rec_id)
+                            if rec_id is not None and rec_id > self.current_checkpoint:
+                                self.checkpoint_manager.save_checkpoint(rec_id)
+                                self.current_checkpoint = rec_id
+                                self.logger.warning(
+                                    f"Advanced checkpoint for {self.log_name} past oversized record {rec_id} "
+                                    f"after durable quarantine at {q_path}."
+                                )
+                    else:
+                        live_events = self._parse_wevtutil_xml(xml_output)
+                        if live_events:
+                            truncated, remainder = self._truncate_batch_at_clear(live_events)
+                            if remainder:
+                                self.persist_durable_remainder(remainder)
+                            events = truncated
             except (subprocess.CalledProcessError, FileNotFoundError) as e:
                 if not self._warned_permission:
                     self.logger.warning(
@@ -1155,6 +1225,87 @@ class WindowsEventCollector:
                     parsed[k] = v
         return parsed
 
+    def quarantine_malformed_record(
+        self,
+        raw_xml: str,
+        reason: str,
+        record_id: Optional[int] = None,
+        error_details: Optional[str] = None,
+    ) -> str:
+        """
+        Durably persists malformed raw XML and diagnostic metadata to disk.
+        Never silently discards forensic evidence.
+        Uses atomic temp file, flush, fsync, and replace.
+        """
+        try:
+            os.makedirs(self.malformed_events_dir, exist_ok=True)
+            now_iso = datetime.now(timezone.utc).isoformat()
+            rec_label = str(record_id) if record_id is not None and record_id >= 0 else "unknown"
+            token = uuid.uuid4().hex[:8]
+            filename = f"malformed_{rec_label}_{token}.json"
+            target_path = os.path.join(self.malformed_events_dir, filename)
+            payload = {
+                "channel": self.log_name,
+                "quarantined_at": now_iso,
+                "record_id": record_id,
+                "reason": reason,
+                "error_details": error_details,
+                "raw_xml": raw_xml,
+            }
+            temp_file = f"{target_path}.tmp"
+            with open(temp_file, "w", encoding="utf-8") as f:
+                json.dump(payload, f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(temp_file, target_path)
+            self.logger.warning(
+                f"Durably quarantined malformed event in {self.log_name} (record_id={record_id}): {reason} -> {target_path}"
+            )
+            return target_path
+        except OSError as e:
+            self.logger.warning(f"Could not persist malformed event quarantine file on {self.log_name}: {e}")
+            return ""
+
+    def quarantine_oversized_record(
+        self,
+        raw_xml: str,
+        record_id: Optional[int] = None,
+    ) -> str:
+        """
+        Durably persists an oversized XML record to disk to prevent channel stall.
+        Uses atomic temp file, flush, fsync, and replace.
+        """
+        try:
+            os.makedirs(self.oversized_events_dir, exist_ok=True)
+            rec_label = str(record_id) if record_id is not None and record_id >= 0 else "unknown"
+            token = uuid.uuid4().hex[:8]
+            filename = f"oversized_{rec_label}_{token}.xml"
+            target_path = os.path.join(self.oversized_events_dir, filename)
+            temp_file = f"{target_path}.tmp"
+            with open(temp_file, "w", encoding="utf-8") as f:
+                f.write(raw_xml)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(temp_file, target_path)
+            self.logger.warning(
+                f"Durably quarantined oversized record in {self.log_name} (record_id={record_id}, {len(raw_xml)} bytes) -> {target_path}"
+            )
+            return target_path
+        except OSError as e:
+            self.logger.warning(f"Could not persist oversized record quarantine file on {self.log_name}: {e}")
+            return ""
+
+    @staticmethod
+    def _extract_record_id_from_raw_xml(xml_str: str) -> Optional[int]:
+        """Extracts EventRecordID using regex from raw XML when parsing is bypassed or fails."""
+        m = re.search(r"<EventRecordID[^>]*>\s*(\d+)\s*</EventRecordID>", xml_str[:8192])
+        if m:
+            try:
+                return int(m.group(1))
+            except ValueError:
+                return None
+        return None
+
     def _parse_wevtutil_xml(self, xml_string: str) -> List[Dict[str, Any]]:
         """Parses multiple concatenated Event XML tags returned by wevtutil."""
         if not xml_string or not isinstance(xml_string, str):
@@ -1182,6 +1333,12 @@ class WindowsEventCollector:
                         system = elem
                         break
                 if system is None:
+                    raw_event_str = ET.tostring(event, encoding="unicode")
+                    self.quarantine_malformed_record(
+                        raw_xml=raw_event_str,
+                        reason="Missing System element in event payload",
+                        record_id=None
+                    )
                     continue
 
                 event_data = {
@@ -1237,6 +1394,22 @@ class WindowsEventCollector:
                         event_data["record_id"] = int(record_id_elem.text.strip())
                     except ValueError:
                         self.logger.warning(f"Malformed EventRecordID text: '{record_id_elem.text}'")
+                        raw_event_str = ET.tostring(event, encoding="unicode")
+                        self.quarantine_malformed_record(
+                            raw_xml=raw_event_str,
+                            reason=f"Malformed EventRecordID text: '{record_id_elem.text}'",
+                            record_id=None
+                        )
+                        continue
+                else:
+                    self.logger.warning("Missing EventRecordID in event element")
+                    raw_event_str = ET.tostring(event, encoding="unicode")
+                    self.quarantine_malformed_record(
+                        raw_xml=raw_event_str,
+                        reason="Missing EventRecordID in event element",
+                        record_id=None
+                    )
+                    continue
 
                 if time_created_elem is not None:
                     event_data["timestamp"] = time_created_elem.get("SystemTime")
@@ -1510,6 +1683,11 @@ class WindowsEventCollector:
                     parsed_events.append(event_data)
 
         except ET.ParseError as e:
-            self.logger.error(f"XML parse error in event batch: {e}")
+            self.logger.error(f"XML parse error in event batch on {self.log_name}: {e}")
+            self.quarantine_malformed_record(
+                raw_xml=xml_string,
+                reason=f"XML parse error: {e}",
+                error_details=str(e),
+            )
 
         return parsed_events

@@ -1,4 +1,6 @@
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
+import os
+import logging
 from .models import DetectionResult
 from .rules import (
     BruteForceRule,
@@ -8,18 +10,24 @@ from .rules import (
     DefenseEvasionRule
 )
 from .xgboost_detector import XGBoostDetector, ModelNotAvailableError
-import logging
 
 class DetectionEngine:
-    def __init__(self, logger: logging.Logger):
+    def __init__(self, logger: logging.Logger, detector_version: Optional[str] = None):
         self.logger = logger
+        if detector_version is not None:
+            self.detector_version = str(detector_version)
+        elif "WINDOWS_DETECTOR_VERSION" in os.environ:
+            self.detector_version = os.environ["WINDOWS_DETECTOR_VERSION"].strip()
+        else:
+            self.detector_version = "1.0.0"
+
         # Rules and models initialized here
         self.rules = [
-            BruteForceRule(logger=logger),
-            SuspiciousPowerShellRule(),
-            SuspiciousLolbinsDownloadRule(),
-            ReconnaissanceCommandsRule(),
-            DefenseEvasionRule()
+            BruteForceRule(logger=logger, detector_version=self.detector_version),
+            SuspiciousPowerShellRule(detector_version=self.detector_version),
+            SuspiciousLolbinsDownloadRule(detector_version=self.detector_version),
+            ReconnaissanceCommandsRule(detector_version=self.detector_version),
+            DefenseEvasionRule(detector_version=self.detector_version)
         ]
         self.ml_detector = XGBoostDetector(logger)
 
@@ -42,7 +50,7 @@ class DetectionEngine:
                         result.thresholds = rule.get_thresholds()
                     if result.detector_config is None and hasattr(rule, "get_detector_config"):
                         result.detector_config = rule.get_detector_config()
-                    if hasattr(rule, "detector_version") and getattr(result, "detector_version", "1.0.0") == "1.0.0":
+                    if hasattr(rule, "detector_version"):
                         result.detector_version = rule.detector_version
                     if hasattr(rule, "detector_name") and not getattr(result, "detector_name", None):
                         result.detector_name = rule.detector_name

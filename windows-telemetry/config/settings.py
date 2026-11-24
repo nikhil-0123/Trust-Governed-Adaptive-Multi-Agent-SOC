@@ -51,7 +51,8 @@ class Settings:
         self._detection_output_dir = os.getenv("DETECTION_OUTPUT_DIR")
         self._outbox_db_path = os.getenv("OUTBOX_DB_PATH")
 
-        # Step 4: Detection Engine Configuration (Phase 1)
+        # Step 4: Detection Engine Configuration (Phase 1 & Phase 2)
+        self.detector_version = os.getenv("WINDOWS_DETECTOR_VERSION", "1.1.0").strip()
         val_max_keys = int(os.getenv("WINDOWS_DETECTION_MAX_STATE_KEYS", "10000"))
         if val_max_keys < 2:
             raise ValueError(f"WINDOWS_DETECTION_MAX_STATE_KEYS must be an integer >= 2, got {val_max_keys}")
