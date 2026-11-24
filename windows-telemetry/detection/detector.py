@@ -14,9 +14,9 @@ from .xgboost_detector import XGBoostDetector, ModelNotAvailableError
 class DetectionEngine:
     def __init__(self, logger: logging.Logger, detector_version: Optional[str] = None):
         self.logger = logger
-        if detector_version is not None:
-            self.detector_version = str(detector_version)
-        elif "WINDOWS_DETECTOR_VERSION" in os.environ:
+        if detector_version is not None and str(detector_version).strip():
+            self.detector_version = str(detector_version).strip()
+        elif "WINDOWS_DETECTOR_VERSION" in os.environ and os.environ["WINDOWS_DETECTOR_VERSION"].strip():
             self.detector_version = os.environ["WINDOWS_DETECTOR_VERSION"].strip()
         else:
             self.detector_version = "1.0.0"

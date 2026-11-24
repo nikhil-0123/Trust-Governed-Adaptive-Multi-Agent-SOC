@@ -1,4 +1,6 @@
 import logging
+import time
+import dataclasses
 from typing import List, Optional, Dict, Any
 from config.settings import config
 from normalizer.windows_event_normalizer import WindowsEventNormalizer
@@ -6,20 +8,37 @@ from detection.detector import DetectionEngine
 from output.builder import DetectionEventBuilder
 from output.writer import DetectionEventWriter
 from core.agent_identity import AgentIdentity
-from collectors.windows_event_collector import WindowsEventCollector
+from collectors.windows_event_collector import (
+    WindowsEventCollector,
+    ChannelQueryError,
+    UnverifiedDiscontinuityError
+)
 from transport.outbox import Outbox, OutboxPayloadConflictError, TransitionOutbox
 from transport.client import TransportClient, TransitionTransportClient
 from transport.delivery import DeliveryManager
 from transport.filter import ImportantEventFilter
 from transport.worker import DeliveryWorker
 from transport.heartbeat import HeartbeatWorker
-import dataclasses
+
+
+@dataclasses.dataclass
+class ChannelScheduleState:
+    """Tracks per-channel polling intervals, execution timestamps, and exponential backoff states."""
+    channel_name: str
+    collector: Any
+    poll_interval: float
+    last_poll_monotonic: float = 0.0
+    backoff_until_monotonic: float = 0.0
+    consecutive_failures: int = 0
+    last_error: Optional[str] = None
+
 
 class WindowsDetectionPipeline:
     """
     Orchestrates the local endpoint pipeline:
     Collect -> Normalize -> Detect -> Build -> Write -> Checkpoint.
-    Supports multichannel collection across Windows Security and Sysmon operational logs.
+    Supports multichannel collection across Windows Security, System, and Sysmon operational logs
+    with fair round-robin scheduling, channel-level failure isolation, and graceful recovery.
     """
     def __init__(self, logger: logging.Logger, execution_mode: Optional[str] = None):
         self.logger = logger
@@ -49,6 +68,21 @@ class WindowsDetectionPipeline:
             self.sysmon_collector = WindowsEventCollector(
                 logger, log_name=config.windows_sysmon_log_name, agent_id=self.identity.agent_id
             )
+
+        # Per-channel fair schedule states (Phase 2.2)
+        self.schedules: Dict[str, ChannelScheduleState] = {}
+        if self.system_collector:
+            self.schedules["System"] = ChannelScheduleState(
+                "System", self.system_collector, getattr(config, "windows_system_poll_interval", 5.0)
+            )
+        self.schedules["Security"] = ChannelScheduleState(
+            "Security", self.collector, getattr(config, "windows_security_poll_interval", 5.0)
+        )
+        if self.sysmon_collector:
+            self.schedules["Sysmon"] = ChannelScheduleState(
+                "Sysmon", self.sysmon_collector, getattr(config, "windows_sysmon_poll_interval", 5.0)
+            )
+        self._shutdown_requested = False
 
         mode_str = getattr(config, "outbox_auto_vacuum_mode", "NONE")
         auto_vac_mode_int = 1 if mode_str == "FULL" else (2 if mode_str == "INCREMENTAL" else 0)
@@ -99,7 +133,7 @@ class WindowsDetectionPipeline:
         )
         # Daemon delivery worker
         self.delivery_worker = DeliveryWorker(self.delivery_manager, logger, poll_interval=1.0)
-        # Daemon heartbeat worker - initialized with effective capabilities
+        # Daemon heartbeat worker - initialized with effective capabilities and channel health provider
         self.heartbeat_worker = HeartbeatWorker(
             agent_id=self.identity.agent_id,
             os_type="windows",
@@ -107,7 +141,8 @@ class WindowsDetectionPipeline:
             api_token=config.soc_api_token,
             logger=logger,
             capabilities=self.get_effective_capabilities(),
-            heartbeat_interval=15.0
+            heartbeat_interval=15.0,
+            channel_health_provider=self.get_channel_health_summaries
         )
 
     def get_effective_capabilities(self) -> List[str]:
@@ -178,11 +213,79 @@ class WindowsDetectionPipeline:
         self.delivery_worker.start()
         self.heartbeat_worker.start()
 
+    def get_channel_health_summaries(self) -> List[Dict[str, Any]]:
+        """Returns health summaries across all monitored channels with backpressure state."""
+        summaries = []
+        bp_active = False
+        if self.outbox and hasattr(self.outbox, "check_backpressure"):
+            try:
+                bp = self.outbox.check_backpressure(
+                    max_pending=getattr(self, "max_pending_records", 50000),
+                    disk_watermark_mb=getattr(self, "disk_watermark_mb", 500)
+                )
+                bp_active = bp.get("active", False)
+            except Exception:
+                pass
+
+        for name, sched in self.schedules.items():
+            col = getattr(self, "collector" if name == "Security" else f"{name.lower()}_collector", None)
+            if col and hasattr(col, "get_health_status"):
+                h = col.get_health_status()
+                h["backpressure_active"] = bp_active
+                h["in_backoff"] = time.monotonic() < sched.backoff_until_monotonic
+                summaries.append(h)
+        return summaries
+
+    def _record_channel_failure(self, channel_name: str, error: str):
+        """Records a channel failure and places the channel in bounded exponential retry backoff."""
+        sched = self.schedules.get(channel_name)
+        if sched:
+            sched.consecutive_failures += 1
+            sched.last_error = error
+            base = getattr(config, "channel_retry_backoff_base_seconds", 2.0)
+            max_bo = getattr(config, "channel_retry_backoff_max_seconds", 60.0)
+            backoff_duration = min(max_bo, base * (2 ** min(sched.consecutive_failures - 1, 8)))
+            sched.backoff_until_monotonic = time.monotonic() + backoff_duration
+            self.logger.warning(
+                f"Channel {channel_name} failure recorded ({error}); retry backoff active for {backoff_duration:.1f}s."
+            )
+
+    def _record_channel_success(self, channel_name: str):
+        """Resets consecutive failures and lifts backoff after successful channel collection."""
+        sched = self.schedules.get(channel_name)
+        if sched:
+            sched.consecutive_failures = 0
+            sched.backoff_until_monotonic = 0.0
+            sched.last_error = None
+
     def _process_channel_batch(self, collector, channel_name: str):
         if collector is None:
             return
 
-        raw_events = collector.collect_once()
+        try:
+            if hasattr(collector, "collect_once"):
+                import inspect
+                sig = inspect.signature(collector.collect_once)
+                if "raise_on_error" in sig.parameters:
+                    raw_events = collector.collect_once(raise_on_error=True)
+                else:
+                    raw_events = collector.collect_once()
+            else:
+                return
+        except UnverifiedDiscontinuityError as ude:
+            self.logger.error(f"Channel {channel_name} halted due to unverified discontinuity: {ude}")
+            self._record_channel_failure(channel_name, str(ude))
+            return
+        except ChannelQueryError as cqe:
+            self.logger.warning(f"Channel {channel_name} query failed: {cqe}")
+            self._record_channel_failure(channel_name, str(cqe))
+            return
+        except Exception as e:
+            self.logger.error(f"Unexpected collection error on channel {channel_name}: {e}")
+            self._record_channel_failure(channel_name, str(e))
+            return
+
+        self._record_channel_success(channel_name)
         if not raw_events:
             return
 
@@ -274,31 +377,68 @@ class WindowsDetectionPipeline:
                         f"Error draining checkpoint notifications for {getattr(col, 'log_name', 'unknown')}: {e}"
                     )
 
-    def process_batch(self):
-        # 1. Process System events first so cross-channel clear witnesses (Event 104) publish transitions
-        if self.system_collector and getattr(self.system_collector, "is_initialized", False):
+    def process_batch(self, force_all: bool = False, respect_intervals: bool = False):
+        """
+        Executes a multichannel polling cycle with fair round-robin scheduling,
+        failure isolation, and retry backoff.
+        Priority order: System -> Security -> Sysmon.
+        """
+        if self._shutdown_requested:
+            return
+
+        now = time.monotonic()
+        ordered_channels = ["System", "Security", "Sysmon"]
+
+        for ch_name in ordered_channels:
+            if self._shutdown_requested:
+                break
+            sched = self.schedules.get(ch_name)
+            if not sched:
+                continue
+            # Keep collector instance in sync if patched or replaced on pipeline
+            if ch_name == "Security":
+                sched.collector = self.collector
+            elif ch_name == "System":
+                sched.collector = self.system_collector
+            elif ch_name == "Sysmon":
+                sched.collector = self.sysmon_collector
+
+            if not sched.collector:
+                continue
+            is_init = getattr(sched.collector, "is_initialized", True if ch_name == "Security" else False)
+            if not is_init:
+                continue
+
+            # Fairness check: if channel is in retry backoff, skip it so healthy channels continue without delay
+            if not force_all and now < sched.backoff_until_monotonic:
+                self.logger.debug(
+                    f"Channel {ch_name} is in retry backoff ({sched.backoff_until_monotonic - now:.1f}s remaining); skipping."
+                )
+                continue
+
+            # Optional interval check when respect_intervals is requested and no pending simulated events exist
+            has_sim = (
+                sched.collector.has_pending_simulated_events()
+                if hasattr(sched.collector, "has_pending_simulated_events")
+                else False
+            )
+            if respect_intervals and not has_sim and sched.last_poll_monotonic > 0:
+                if (now - sched.last_poll_monotonic) < sched.poll_interval:
+                    continue
+
+            sched.last_poll_monotonic = now
             try:
-                channel_name = getattr(self.system_collector, "log_name", "System")
-                self._process_channel_batch(self.system_collector, channel_name)
+                self._process_channel_batch(sched.collector, sched.channel_name)
             except Exception as e:
-                self.logger.error(f"System batch processing error: {e}")
+                self.logger.error(f"Channel {ch_name} batch error: {e}")
 
-        # 2. Process Security events second (claims pending transitions before collecting)
-        self._process_channel_batch(self.collector, "Security")
-
-        # 3. Process Sysmon events third (only when initialized)
-        if self.sysmon_collector and getattr(self.sysmon_collector, "is_initialized", False):
-            try:
-                channel_name = getattr(self.sysmon_collector, "log_name", "Sysmon")
-                self._process_channel_batch(self.sysmon_collector, channel_name)
-            except Exception as e:
-                self.logger.error(f"Sysmon batch processing error: {e}")
-
-        # 4. Drain pending outbox notifications across all initialized collectors
+        # Drain pending outbox notifications across all initialized collectors
         self._drain_all_checkpoint_notifications()
 
     def shutdown(self, worker_join_timeout: float = 10.0):
-        """Gracefully terminates delivery worker and flushes pending outbox events."""
+        """Gracefully terminates delivery worker, heartbeat worker, and flushes pending outbox events."""
+        self._shutdown_requested = True
+
         if self.delivery_worker:
             self.delivery_worker.stop(timeout=worker_join_timeout)
 

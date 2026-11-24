@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import patch
 import os
 import tempfile
 from config.settings import Settings
@@ -15,6 +16,16 @@ class TestConfig(unittest.TestCase):
         self.assertEqual(settings.medium_confidence_threshold, 0.8)
         self.assertEqual(settings.windows_detection_max_state_keys, 10000)
         self.assertEqual(settings.windows_detection_cleanup_interval_seconds, 5.0)
+        self.assertEqual(settings.windows_security_poll_interval, 5.0)
+        self.assertEqual(settings.windows_system_poll_interval, 5.0)
+        self.assertEqual(settings.windows_sysmon_poll_interval, 5.0)
+        self.assertEqual(settings.windows_security_batch_size, 100)
+        self.assertEqual(settings.windows_system_batch_size, 100)
+        self.assertEqual(settings.windows_sysmon_batch_size, 100)
+        self.assertEqual(settings.wevtutil_subprocess_timeout_seconds, 30.0)
+        self.assertEqual(settings.channel_max_consecutive_failures, 5)
+        self.assertEqual(settings.channel_retry_backoff_base_seconds, 2.0)
+        self.assertEqual(settings.channel_retry_backoff_max_seconds, 60.0)
 
     def test_settings_initialization_has_no_filesystem_side_effects(self):
         with tempfile.TemporaryDirectory() as base_tmp:
@@ -57,6 +68,48 @@ class TestConfig(unittest.TestCase):
                 Settings()
         finally:
             os.environ.pop("WINDOWS_DETECTION_CLEANUP_INTERVAL_SECONDS", None)
+
+    def test_invalid_channel_timeout_env_var(self):
+        os.environ["WEVTUTIL_SUBPROCESS_TIMEOUT_SECONDS"] = "2.0"
+        try:
+            with self.assertRaises(ValueError):
+                Settings()
+        finally:
+            os.environ.pop("WEVTUTIL_SUBPROCESS_TIMEOUT_SECONDS", None)
+
+    def test_invalid_channel_max_failures_env_var(self):
+        os.environ["CHANNEL_MAX_CONSECUTIVE_FAILURES"] = "0"
+        try:
+            with self.assertRaises(ValueError):
+                Settings()
+        finally:
+            os.environ.pop("CHANNEL_MAX_CONSECUTIVE_FAILURES", None)
+
+    def test_invalid_channel_backoff_max_less_than_base(self):
+        os.environ["CHANNEL_RETRY_BACKOFF_BASE_SECONDS"] = "10.0"
+        os.environ["CHANNEL_RETRY_BACKOFF_MAX_SECONDS"] = "5.0"
+        try:
+            with self.assertRaises(ValueError):
+                Settings()
+        finally:
+            os.environ.pop("CHANNEL_RETRY_BACKOFF_BASE_SECONDS", None)
+            os.environ.pop("CHANNEL_RETRY_BACKOFF_MAX_SECONDS", None)
+
+    def test_invalid_batch_size_upper_and_lower_bounds(self):
+        with patch.dict(os.environ, {"WINDOWS_SECURITY_BATCH_SIZE": "1001"}):
+            with self.assertRaises(ValueError):
+                Settings()
+        with patch.dict(os.environ, {"WINDOWS_SECURITY_BATCH_SIZE": "0"}):
+            with self.assertRaises(ValueError):
+                Settings()
+
+    def test_invalid_poll_interval_bounds(self):
+        with patch.dict(os.environ, {"WINDOWS_SECURITY_POLL_INTERVAL_SECONDS": "0.05"}):
+            with self.assertRaises(ValueError):
+                Settings()
+        with patch.dict(os.environ, {"WINDOWS_SECURITY_POLL_INTERVAL_SECONDS": "301.0"}):
+            with self.assertRaises(ValueError):
+                Settings()
 
 if __name__ == "__main__":
     unittest.main()

@@ -6,7 +6,7 @@ import logging
 import urllib.request
 import urllib.error
 from datetime import datetime, timezone
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Callable
 
 from config.settings import config
 from response.executor import WindowsResponseExecutor
@@ -34,7 +34,8 @@ class HeartbeatWorker(threading.Thread):
         logger: logging.Logger,
         capabilities: Optional[List[str]] = None,
         heartbeat_interval: float = 15.0,
-        agent_version: Optional[str] = None
+        agent_version: Optional[str] = None,
+        channel_health_provider: Optional[Callable[[], List[Dict[str, Any]]]] = None
     ):
         super().__init__(name="HeartbeatWorker", daemon=True)
         self.agent_id = agent_id
@@ -49,6 +50,7 @@ class HeartbeatWorker(threading.Thread):
         self.capabilities = self._deduplicate_capabilities(caps)
         self.heartbeat_interval = heartbeat_interval
         self.agent_version = agent_version or config.version
+        self.channel_health_provider = channel_health_provider
         self._stop_event = threading.Event()
         self._start_time = time.time()
         self._first_heartbeat_sent = False
@@ -104,6 +106,12 @@ class HeartbeatWorker(threading.Thread):
             "agent_version": self.agent_version,
             "capabilities": self.capabilities
         }
+        if self.channel_health_provider:
+            try:
+                payload["channels"] = self.channel_health_provider()
+            except Exception as e:
+                self.logger.warning(f"Could not retrieve channel health for heartbeat: {e}")
+
         data = json.dumps(payload).encode("utf-8")
         req = urllib.request.Request(
             url,
@@ -145,10 +153,18 @@ class HeartbeatWorker(threading.Thread):
                     "timestamp": datetime.now(timezone.utc).isoformat()
                 }
             elif cmd_type == "GET_HEALTH":
+                channels_health = []
+                if self.channel_health_provider:
+                    try:
+                        channels_health = self.channel_health_provider()
+                    except Exception as e:
+                        self.logger.warning(f"Could not retrieve channel health for GET_HEALTH: {e}")
+                all_healthy = all(c.get("status") == "HEALTHY" for c in channels_health) if channels_health else True
                 result = {
-                    "status": "HEALTHY",
+                    "status": "HEALTHY" if all_healthy else "DEGRADED",
                     "hostname": socket.gethostname(),
                     "os": self.os_type,
+                    "channels": channels_health,
                     "uptime_seconds": round(time.time() - self._start_time, 2),
                     "local_ip": self._get_local_ip()
                 }

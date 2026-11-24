@@ -38,9 +38,63 @@ class Settings:
         self.windows_sysmon_log_name = os.getenv("WINDOWS_SYSMON_LOG_NAME", "Microsoft-Windows-Sysmon/Operational")
         self.enable_system_collection = os.getenv("ENABLE_SYSTEM_COLLECTION", "true").lower() == "true"
         self.enable_sysmon_collection = os.getenv("ENABLE_SYSMON_COLLECTION", "true").lower() == "true"
-        self.windows_event_batch_size = int(os.getenv("WINDOWS_EVENT_BATCH_SIZE", "100"))
+        val_batch = int(os.getenv("WINDOWS_EVENT_BATCH_SIZE", "100"))
+        if val_batch < 1 or val_batch > 1000:
+            raise ValueError(f"WINDOWS_EVENT_BATCH_SIZE must be an integer between 1 and 1000, got {val_batch}")
+        self.windows_event_batch_size = val_batch
         self.windows_event_poll_interval = int(os.getenv("WINDOWS_EVENT_POLL_INTERVAL_SECONDS", "5"))
         self.windows_initial_lookback_minutes = int(os.getenv("WINDOWS_INITIAL_LOOKBACK_MINUTES", "10"))
+
+        # Step 2a: Per-Channel Scheduling & Resilience Configuration (Phase 2.2)
+        val_sec_poll = float(os.getenv("WINDOWS_SECURITY_POLL_INTERVAL_SECONDS", str(self.windows_event_poll_interval)))
+        if not math.isfinite(val_sec_poll) or val_sec_poll < 0.1 or val_sec_poll > 300.0:
+            raise ValueError(f"WINDOWS_SECURITY_POLL_INTERVAL_SECONDS must be finite and between 0.1 and 300.0, got {val_sec_poll}")
+        self.windows_security_poll_interval = val_sec_poll
+
+        val_sys_poll = float(os.getenv("WINDOWS_SYSTEM_POLL_INTERVAL_SECONDS", str(self.windows_event_poll_interval)))
+        if not math.isfinite(val_sys_poll) or val_sys_poll < 0.1 or val_sys_poll > 300.0:
+            raise ValueError(f"WINDOWS_SYSTEM_POLL_INTERVAL_SECONDS must be finite and between 0.1 and 300.0, got {val_sys_poll}")
+        self.windows_system_poll_interval = val_sys_poll
+
+        val_sysmon_poll = float(os.getenv("WINDOWS_SYSMON_POLL_INTERVAL_SECONDS", str(self.windows_event_poll_interval)))
+        if not math.isfinite(val_sysmon_poll) or val_sysmon_poll < 0.1 or val_sysmon_poll > 300.0:
+            raise ValueError(f"WINDOWS_SYSMON_POLL_INTERVAL_SECONDS must be finite and between 0.1 and 300.0, got {val_sysmon_poll}")
+        self.windows_sysmon_poll_interval = val_sysmon_poll
+
+        val_sec_batch = int(os.getenv("WINDOWS_SECURITY_BATCH_SIZE", str(self.windows_event_batch_size)))
+        if val_sec_batch < 1 or val_sec_batch > 1000:
+            raise ValueError(f"WINDOWS_SECURITY_BATCH_SIZE must be an integer between 1 and 1000, got {val_sec_batch}")
+        self.windows_security_batch_size = val_sec_batch
+
+        val_sys_batch = int(os.getenv("WINDOWS_SYSTEM_BATCH_SIZE", str(self.windows_event_batch_size)))
+        if val_sys_batch < 1 or val_sys_batch > 1000:
+            raise ValueError(f"WINDOWS_SYSTEM_BATCH_SIZE must be an integer between 1 and 1000, got {val_sys_batch}")
+        self.windows_system_batch_size = val_sys_batch
+
+        val_sysmon_batch = int(os.getenv("WINDOWS_SYSMON_BATCH_SIZE", str(self.windows_event_batch_size)))
+        if val_sysmon_batch < 1 or val_sysmon_batch > 1000:
+            raise ValueError(f"WINDOWS_SYSMON_BATCH_SIZE must be an integer between 1 and 1000, got {val_sysmon_batch}")
+        self.windows_sysmon_batch_size = val_sysmon_batch
+
+        val_timeout = float(os.getenv("WEVTUTIL_SUBPROCESS_TIMEOUT_SECONDS", "30.0"))
+        if not math.isfinite(val_timeout) or val_timeout < 5.0 or val_timeout > 120.0:
+            raise ValueError(f"WEVTUTIL_SUBPROCESS_TIMEOUT_SECONDS must be finite and between 5.0 and 120.0, got {val_timeout}")
+        self.wevtutil_subprocess_timeout_seconds = val_timeout
+
+        val_max_failures = int(os.getenv("CHANNEL_MAX_CONSECUTIVE_FAILURES", "5"))
+        if val_max_failures < 1 or val_max_failures > 50:
+            raise ValueError(f"CHANNEL_MAX_CONSECUTIVE_FAILURES must be an integer between 1 and 50, got {val_max_failures}")
+        self.channel_max_consecutive_failures = val_max_failures
+
+        val_backoff_base = float(os.getenv("CHANNEL_RETRY_BACKOFF_BASE_SECONDS", "2.0"))
+        if not math.isfinite(val_backoff_base) or val_backoff_base < 0.5 or val_backoff_base > 60.0:
+            raise ValueError(f"CHANNEL_RETRY_BACKOFF_BASE_SECONDS must be finite and between 0.5 and 60.0, got {val_backoff_base}")
+        self.channel_retry_backoff_base_seconds = val_backoff_base
+
+        val_backoff_max = float(os.getenv("CHANNEL_RETRY_BACKOFF_MAX_SECONDS", "60.0"))
+        if not math.isfinite(val_backoff_max) or val_backoff_max < 1.0 or val_backoff_max > 300.0 or val_backoff_max < val_backoff_base:
+            raise ValueError(f"CHANNEL_RETRY_BACKOFF_MAX_SECONDS must be finite, between 1.0 and 300.0, and >= base ({val_backoff_base}), got {val_backoff_max}")
+        self.channel_retry_backoff_max_seconds = val_backoff_max
 
         # Default data directory to local user profile if not explicitly set
         default_data_dir = os.path.join(os.path.expanduser("~"), ".tgam_soc", "telemetry")
@@ -52,14 +106,14 @@ class Settings:
         self._outbox_db_path = os.getenv("OUTBOX_DB_PATH")
 
         # Step 4: Detection Engine Configuration (Phase 1 & Phase 2)
-        self.detector_version = os.getenv("WINDOWS_DETECTOR_VERSION", "1.1.0").strip()
+        raw_det_ver = os.getenv("WINDOWS_DETECTOR_VERSION", "1.1.0").strip()
+        self.detector_version = raw_det_ver if raw_det_ver else "1.1.0"
         val_max_keys = int(os.getenv("WINDOWS_DETECTION_MAX_STATE_KEYS", "10000"))
         if val_max_keys < 2:
             raise ValueError(f"WINDOWS_DETECTION_MAX_STATE_KEYS must be an integer >= 2, got {val_max_keys}")
         self.windows_detection_max_state_keys = val_max_keys
 
         val_cleanup_sec = float(os.getenv("WINDOWS_DETECTION_CLEANUP_INTERVAL_SECONDS", "5.0"))
-        import math
         if not math.isfinite(val_cleanup_sec) or val_cleanup_sec <= 0:
             raise ValueError(f"WINDOWS_DETECTION_CLEANUP_INTERVAL_SECONDS must be finite and > 0, got {val_cleanup_sec}")
         self.windows_detection_cleanup_interval_seconds = val_cleanup_sec

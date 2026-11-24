@@ -5,6 +5,7 @@ import logging
 import json
 import uuid
 import re
+import hashlib
 from datetime import datetime, timezone
 from typing import List, Dict, Any, Optional, Tuple
 from config.settings import config
@@ -18,6 +19,24 @@ from canonical import generate_source_event_id_v2, validate_epoch
 
 class UnverifiedDiscontinuityError(Exception):
     """Raised when an unverified record ID drop occurs without an authoritative log clear."""
+    pass
+
+
+class ChannelQueryError(Exception):
+    """Raised when a live wevtutil query fails or channel is unavailable."""
+    def __init__(self, message: str, channel: str, error_type: str = "QUERY_FAILED"):
+        super().__init__(message)
+        self.channel = channel
+        self.error_type = error_type
+
+
+class ChannelUnavailableError(ChannelQueryError):
+    """Raised when a channel is missing, not installed, or access is denied."""
+    pass
+
+
+class ChannelTimeoutError(ChannelQueryError):
+    """Raised when a live wevtutil query times out."""
     pass
 
 
@@ -37,7 +56,31 @@ class WindowsEventCollector:
         self.logger = logger
         self.log_name = (log_name or config.windows_security_log_name).strip()
         self.agent_id = (agent_id or "AGT-WIN-01").strip()
-        self.batch_size = config.windows_event_batch_size
+
+        # Channel-specific batch size and timeout resolution (Phase 2.2)
+        if self.log_name == getattr(config, "windows_security_log_name", "Security"):
+            self.batch_size = getattr(config, "windows_security_batch_size", config.windows_event_batch_size)
+            self.poll_interval = getattr(config, "windows_security_poll_interval", config.windows_event_poll_interval)
+        elif self.log_name == getattr(config, "windows_system_log_name", "System"):
+            self.batch_size = getattr(config, "windows_system_batch_size", config.windows_event_batch_size)
+            self.poll_interval = getattr(config, "windows_system_poll_interval", config.windows_event_poll_interval)
+        elif self.log_name == getattr(config, "windows_sysmon_log_name", "Microsoft-Windows-Sysmon/Operational"):
+            self.batch_size = getattr(config, "windows_sysmon_batch_size", config.windows_event_batch_size)
+            self.poll_interval = getattr(config, "windows_sysmon_poll_interval", config.windows_event_poll_interval)
+        else:
+            self.batch_size = config.windows_event_batch_size
+            self.poll_interval = config.windows_event_poll_interval
+
+        self.timeout_seconds = getattr(config, "wevtutil_subprocess_timeout_seconds", 30.0)
+
+        # Operational health & metrics tracking (Phase 2.2)
+        self.status = "HEALTHY"
+        self.consecutive_failures = 0
+        self.timeout_count = 0
+        self.events_collected_total = 0
+        self.quarantined_count = 0
+        self.last_successful_collection: Optional[str] = None
+        self.last_error: Optional[str] = None
 
         # Channel-bound CheckpointManager instance
         self.checkpoint_manager = CheckpointManager(
@@ -278,16 +321,41 @@ class WindowsEventCollector:
                 remaining_files.append((fp, max_rec_id))
         self._in_flight_simulated_files = remaining_files
 
+    def has_pending_simulated_events(self) -> bool:
+        """Checks if there are pending unconsumed simulated XML events waiting for this channel."""
+        if not os.path.isdir(self.simulated_events_channel_dir):
+            return False
+        try:
+            return any(f.endswith(".xml") for f in os.listdir(self.simulated_events_channel_dir))
+        except OSError:
+            return False
+
+    def get_health_status(self) -> Dict[str, Any]:
+        """Returns comprehensive operational health metrics for this channel (Phase 2.2)."""
+        effective_status = "QUARANTINED" if self.is_channel_quarantined() else self.status
+        return {
+            "channel": self.log_name,
+            "status": effective_status,
+            "current_checkpoint": self.current_checkpoint,
+            "current_epoch": self.current_epoch,
+            "consecutive_failures": self.consecutive_failures,
+            "timeout_count": self.timeout_count,
+            "events_collected_total": self.events_collected_total,
+            "quarantined_count": self.quarantined_count,
+            "last_successful_collection": self.last_successful_collection,
+            "last_error": self.last_error,
+        }
+
     def _probe_newest_record_id(self) -> Tuple[Optional[int], Optional[str]]:
         """
         Executes a reverse query for the newest record ID:
         wevtutil qe <Channel> /c:1 /rd:true /f:xml
         Returns (newest_record_id, error_code).
-        error_code can be None, 'EMPTY_LOG', 'COMMAND_UNAVAILABLE', or 'PARSE_ERROR'.
+        error_code can be None, 'EMPTY_LOG', 'COMMAND_UNAVAILABLE', 'TIMEOUT', or 'PARSE_ERROR'.
         """
         cmd = ["wevtutil", "qe", self.log_name, "/c:1", "/rd:true", "/f:xml"]
         try:
-            result = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=15)
+            result = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=self.timeout_seconds)
             xml_output = result.stdout.strip()
             if not xml_output:
                 return None, "EMPTY_LOG"
@@ -306,7 +374,7 @@ class WindowsEventCollector:
             return None, "COMMAND_UNAVAILABLE"
         except subprocess.TimeoutExpired as e:
             self.logger.error(f"Timeout probing newest record on {self.log_name}: {e}")
-            return None, "COMMAND_UNAVAILABLE"
+            return None, "TIMEOUT"
         except Exception as e:
             self.logger.error(f"Unexpected error probing newest record on {self.log_name}: {e}")
             return None, "PARSE_ERROR"
@@ -322,7 +390,7 @@ class WindowsEventCollector:
             query = "*[System[(EventID=1102)]]"
             cmd = ["wevtutil", "qe", "Security", f"/q:{query}", "/c:10", "/rd:true", "/f:xml"]
             try:
-                result = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=15)
+                result = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=self.timeout_seconds)
                 xml_output = result.stdout.strip()
                 if xml_output:
                     events = self._parse_wevtutil_xml(xml_output)
@@ -339,7 +407,7 @@ class WindowsEventCollector:
             query = "*[System[(EventID=104)]]"
             cmd = ["wevtutil", "qe", "System", f"/q:{query}", "/c:10", "/rd:true", "/f:xml"]
             try:
-                result = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=15)
+                result = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=self.timeout_seconds)
                 xml_output = result.stdout.strip()
                 if xml_output:
                     events = self._parse_wevtutil_xml(xml_output)
@@ -486,7 +554,12 @@ class WindowsEventCollector:
                             with open(filepath, "r", encoding="utf-8") as f:
                                 raw_content = f.read()
                             rec_id = self._extract_record_id_from_raw_xml(raw_content)
-                            self.quarantine_oversized_record(raw_content, record_id=rec_id)
+                            q_path = self.quarantine_oversized_record(raw_content, record_id=rec_id)
+                            if not q_path:
+                                self.logger.error(
+                                    f"Failed to quarantine oversized record {filepath}; halting batch without advancing checkpoint."
+                                )
+                                return events
                             if rec_id is not None and rec_id > self.current_checkpoint:
                                 self.checkpoint_manager.save_checkpoint(rec_id)
                                 self.current_checkpoint = rec_id
@@ -945,7 +1018,7 @@ class WindowsEventCollector:
             self.checkpoint_manager.save_checkpoint(record_id, target_channel="System")
             self.current_checkpoint = record_id
 
-    def collect_once(self) -> List[Dict[str, Any]]:
+    def collect_once(self, raise_on_error: bool = False) -> List[Dict[str, Any]]:
         """
         Performs a single batch retrieval of events newer than the checkpoint.
         Checks durable remainder first, then simulated events, then live wevtutil with dual-probe.
@@ -990,8 +1063,24 @@ class WindowsEventCollector:
             # Dual-probe query: Probe 1 (reverse query for newest record ID)
             newest_record_id, probe_err = self._probe_newest_record_id()
             if probe_err == "EMPTY_LOG":
+                self.status = "HEALTHY"
+                self.consecutive_failures = 0
+                self.last_error = None
                 return []
             if probe_err == "COMMAND_UNAVAILABLE":
+                self.status = "UNAVAILABLE"
+                self.consecutive_failures += 1
+                self.last_error = f"Live wevtutil query on '{self.log_name}' unavailable"
+                if raise_on_error:
+                    raise ChannelUnavailableError(self.last_error, channel=self.log_name, error_type="COMMAND_UNAVAILABLE")
+                return []
+            if probe_err == "TIMEOUT":
+                self.status = "DEGRADED"
+                self.consecutive_failures += 1
+                self.timeout_count += 1
+                self.last_error = f"Timeout probing newest record on {self.log_name}"
+                if raise_on_error:
+                    raise ChannelTimeoutError(self.last_error, channel=self.log_name)
                 return []
 
             query_checkpoint = self.current_checkpoint
@@ -1026,7 +1115,7 @@ class WindowsEventCollector:
 
             cmd = ["wevtutil", "qe", self.log_name, f"/q:{query}", f"/c:{self.batch_size}", "/f:xml"]
             try:
-                result = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=30)
+                result = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=self.timeout_seconds)
                 xml_output = result.stdout.strip()
                 if xml_output:
                     # Oversized XML handling & adaptive batch reduction (Task 3)
@@ -1040,7 +1129,7 @@ class WindowsEventCollector:
                         for reduced_size in recovery_batches:
                             r_cmd = ["wevtutil", "qe", self.log_name, f"/q:{query}", f"/c:{reduced_size}", "/f:xml"]
                             try:
-                                r_res = subprocess.run(r_cmd, capture_output=True, text=True, check=True, timeout=30)
+                                r_res = subprocess.run(r_cmd, capture_output=True, text=True, check=True, timeout=self.timeout_seconds)
                                 r_xml = r_res.stdout.strip()
                                 if r_xml and len(r_xml) <= 10 * 1024 * 1024:
                                     live_events = self._parse_wevtutil_xml(r_xml)
@@ -1063,12 +1152,17 @@ class WindowsEventCollector:
                             )
                             rec_id = self._extract_record_id_from_raw_xml(xml_output)
                             q_path = self.quarantine_oversized_record(xml_output, record_id=rec_id)
-                            if rec_id is not None and rec_id > self.current_checkpoint:
+                            if q_path and rec_id is not None and rec_id > self.current_checkpoint:
                                 self.checkpoint_manager.save_checkpoint(rec_id)
                                 self.current_checkpoint = rec_id
                                 self.logger.warning(
                                     f"Advanced checkpoint for {self.log_name} past oversized record {rec_id} "
                                     f"after durable quarantine at {q_path}."
+                                )
+                            elif not q_path:
+                                self.logger.error(
+                                    f"Quarantine write failed for oversized record in {self.log_name}; "
+                                    "refusing to advance checkpoint to prevent silent data loss."
                                 )
                     else:
                         live_events = self._parse_wevtutil_xml(xml_output)
@@ -1078,21 +1172,40 @@ class WindowsEventCollector:
                                 self.persist_durable_remainder(remainder)
                             events = truncated
             except (subprocess.CalledProcessError, FileNotFoundError) as e:
+                self.consecutive_failures += 1
+                self.status = "UNAVAILABLE"
+                self.last_error = f"Live wevtutil query on '{self.log_name}' unavailable ({e})"
                 if not self._warned_permission:
                     self.logger.warning(
                         f"Live wevtutil query on '{self.log_name}' unavailable ({e}). "
                         "Running in waiting mode. Drop XML files into simulated_events for offline/lab simulation."
                     )
                     self._warned_permission = True
+                if raise_on_error:
+                    raise ChannelUnavailableError(self.last_error, channel=self.log_name, error_type="COMMAND_UNAVAILABLE") from e
                 return []
             except subprocess.TimeoutExpired as e:
-                self.logger.error(f"Timeout querying {self.log_name}: {e}")
-                raise RuntimeError(f"wevtutil timeout: {e}") from e
+                self.timeout_count += 1
+                self.consecutive_failures += 1
+                self.status = "DEGRADED"
+                self.last_error = f"Timeout querying {self.log_name} ({self.timeout_seconds}s): {e}"
+                self.logger.error(self.last_error)
+                if raise_on_error:
+                    raise ChannelTimeoutError(self.last_error, channel=self.log_name) from e
+                return []
 
         if not events:
+            self.status = "HEALTHY"
+            self.consecutive_failures = 0
+            self.last_error = None
             return []
 
         # Tag events with current epoch if not already tagged
+        self.status = "HEALTHY"
+        self.consecutive_failures = 0
+        self.last_error = None
+        self.events_collected_total += len(events)
+        self.last_successful_collection = datetime.now(timezone.utc).isoformat()
         for ev in events:
             if "epoch" not in ev:
                 ev["epoch"] = self.current_epoch
@@ -1235,13 +1348,29 @@ class WindowsEventCollector:
         """
         Durably persists malformed raw XML and diagnostic metadata to disk.
         Never silently discards forensic evidence.
+        Uses deterministic content digest for idempotent storage without unbounded duplication.
         Uses atomic temp file, flush, fsync, and replace.
         """
         try:
+            import shutil
             os.makedirs(self.malformed_events_dir, exist_ok=True)
+            watermark_mb = getattr(config, "outbox_disk_watermark_mb", 500)
+            try:
+                usage = shutil.disk_usage(self.malformed_events_dir)
+                free_mb = usage.free / (1024 * 1024)
+                if free_mb < watermark_mb:
+                    self.logger.error(
+                        f"Quarantine write rejected on {self.log_name}: free disk space ({free_mb:.1f}MB) "
+                        f"is below watermark ({watermark_mb}MB)."
+                    )
+                    return ""
+            except OSError as e:
+                self.logger.warning(f"Could not determine disk usage for quarantine: {e}")
+
             now_iso = datetime.now(timezone.utc).isoformat()
             rec_label = str(record_id) if record_id is not None and record_id >= 0 else "unknown"
-            token = uuid.uuid4().hex[:8]
+            content_bytes = raw_xml.encode("utf-8", errors="replace")
+            token = hashlib.sha256(content_bytes).hexdigest()[:16]
             filename = f"malformed_{rec_label}_{token}.json"
             target_path = os.path.join(self.malformed_events_dir, filename)
             payload = {
@@ -1258,6 +1387,7 @@ class WindowsEventCollector:
                 f.flush()
                 os.fsync(f.fileno())
             os.replace(temp_file, target_path)
+            self.quarantined_count += 1
             self.logger.warning(
                 f"Durably quarantined malformed event in {self.log_name} (record_id={record_id}): {reason} -> {target_path}"
             )
@@ -1273,12 +1403,28 @@ class WindowsEventCollector:
     ) -> str:
         """
         Durably persists an oversized XML record to disk to prevent channel stall.
+        Uses deterministic content digest for idempotent storage without unbounded duplication.
         Uses atomic temp file, flush, fsync, and replace.
         """
         try:
+            import shutil
             os.makedirs(self.oversized_events_dir, exist_ok=True)
+            watermark_mb = getattr(config, "outbox_disk_watermark_mb", 500)
+            try:
+                usage = shutil.disk_usage(self.oversized_events_dir)
+                free_mb = usage.free / (1024 * 1024)
+                if free_mb < watermark_mb:
+                    self.logger.error(
+                        f"Oversized quarantine write rejected on {self.log_name}: free disk space ({free_mb:.1f}MB) "
+                        f"is below watermark ({watermark_mb}MB)."
+                    )
+                    return ""
+            except OSError as e:
+                self.logger.warning(f"Could not determine disk usage for quarantine: {e}")
+
             rec_label = str(record_id) if record_id is not None and record_id >= 0 else "unknown"
-            token = uuid.uuid4().hex[:8]
+            content_bytes = raw_xml.encode("utf-8", errors="replace")
+            token = hashlib.sha256(content_bytes).hexdigest()[:16]
             filename = f"oversized_{rec_label}_{token}.xml"
             target_path = os.path.join(self.oversized_events_dir, filename)
             temp_file = f"{target_path}.tmp"
@@ -1287,6 +1433,7 @@ class WindowsEventCollector:
                 f.flush()
                 os.fsync(f.fileno())
             os.replace(temp_file, target_path)
+            self.quarantined_count += 1
             self.logger.warning(
                 f"Durably quarantined oversized record in {self.log_name} (record_id={record_id}, {len(raw_xml)} bytes) -> {target_path}"
             )
