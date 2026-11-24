@@ -9,6 +9,12 @@ from canonical import (
     validate_epoch,
     validate_record_id,
 )
+from .evidence_enhancer import (
+    canonicalize_ip_address,
+    validate_network_port,
+    extract_dns_features,
+    validate_process_hashes,
+)
 
 class WindowsEventNormalizer:
     def __init__(self, agent_identity: AgentIdentity, logger: logging.Logger):
@@ -180,7 +186,7 @@ class WindowsEventNormalizer:
         if is_sysmon and win_event_id is not None:
             evidence["sysmon_event_id"] = win_event_id
 
-        # Copy Sysmon/Process/Network/DNS evidence fields if present
+        # Copy Sysmon/Process/Network/DNS baseline evidence fields if present
         for fld in (
             "parent_command_line", "parent_user", "process_guid", "parent_process_guid",
             "parent_process_id", "integrity_level", "current_directory", "user",
@@ -193,6 +199,112 @@ class WindowsEventNormalizer:
         ):
             if fld in raw_event and raw_event[fld] is not None:
                 evidence[fld] = raw_event[fld]
+
+        # -----------------------------------------------------------------
+        # Phase 2.1: Task 2 — IP Address Canonicalization
+        # -----------------------------------------------------------------
+        raw_source_ip = raw_event.get("source_ip")
+        canon_src = canonicalize_ip_address(raw_source_ip)
+        if canon_src["is_valid"]:
+            normalized_source_ip = canon_src["canonical_ip"]
+            evidence["source_ip"] = canon_src["canonical_ip"]
+            evidence["source_ip_canonical"] = canon_src["canonical_ip"]
+            evidence["source_ip_version"] = canon_src["ip_version"]
+            if canon_src["scope_id"]:
+                evidence["source_ip_scope"] = canon_src["scope_id"]
+            if canon_src["is_ipv4_mapped"]:
+                evidence["source_ip_mapped_ipv4"] = canon_src["mapped_ipv4"]
+        else:
+            normalized_source_ip = None
+            if raw_source_ip and str(raw_source_ip).strip() not in ("", "-"):
+                evidence["source_ip_raw"] = raw_source_ip
+                evidence["source_ip_status"] = canon_src["validation_status"]
+
+        raw_dst_ip = raw_event.get("destination_ip")
+        if raw_dst_ip is not None:
+            canon_dst = canonicalize_ip_address(raw_dst_ip)
+            if canon_dst["is_valid"]:
+                evidence["destination_ip"] = canon_dst["canonical_ip"]
+                evidence["destination_ip_canonical"] = canon_dst["canonical_ip"]
+                evidence["destination_ip_version"] = canon_dst["ip_version"]
+                if canon_dst["scope_id"]:
+                    evidence["destination_ip_scope"] = canon_dst["scope_id"]
+                if canon_dst["is_ipv4_mapped"]:
+                    evidence["destination_ip_mapped_ipv4"] = canon_dst["mapped_ipv4"]
+            else:
+                evidence["destination_ip"] = raw_dst_ip
+                evidence["destination_ip_raw"] = raw_dst_ip
+                evidence["destination_ip_status"] = canon_dst["validation_status"]
+
+        # -----------------------------------------------------------------
+        # Phase 2.1: Task 3 — Network Port Validation
+        # -----------------------------------------------------------------
+        raw_src_port = raw_event.get("source_port")
+        if raw_src_port is not None:
+            port_src = validate_network_port(raw_src_port)
+            evidence["source_port"] = port_src["port"]
+            if not port_src["is_valid"]:
+                evidence["source_port_raw"] = port_src["raw_port"]
+                evidence["source_port_status"] = port_src["status"]
+
+        raw_dst_port = raw_event.get("destination_port")
+        if raw_dst_port is not None:
+            port_dst = validate_network_port(raw_dst_port)
+            evidence["destination_port"] = port_dst["port"]
+            if not port_dst["is_valid"]:
+                evidence["destination_port_raw"] = port_dst["raw_port"]
+                evidence["destination_port_status"] = port_dst["status"]
+
+        # -----------------------------------------------------------------
+        # Phase 2.1: Task 4 — Process Hash Validation
+        # -----------------------------------------------------------------
+        if "hashes" in raw_event or "hashes_parsed" in raw_event:
+            hash_res = validate_process_hashes(
+                raw_event.get("hashes"),
+                raw_event.get("hashes_parsed")
+            )
+            if hash_res["hashes_raw"]:
+                evidence["hashes"] = hash_res["hashes_raw"]
+            if hash_res["hashes_validated"]:
+                evidence["hashes_validated"] = hash_res["hashes_validated"]
+                for algo in ("sha256", "md5", "sha1", "imphash"):
+                    # Preserve raw casing in primary field if available, otherwise canonical lowercase
+                    if algo in raw_event and raw_event[algo] is not None:
+                        evidence[algo] = raw_event[algo]
+                    elif algo in hash_res["hashes_validated"]:
+                        evidence[algo] = hash_res["hashes_validated"][algo]
+            else:
+                for algo in ("sha256", "md5", "sha1", "imphash"):
+                    if algo in raw_event and raw_event[algo] is not None:
+                        evidence[algo] = raw_event[algo]
+
+            if hash_res["invalid_hashes"]:
+                evidence["invalid_hashes"] = hash_res["invalid_hashes"]
+            if hash_res["duplicate_hashes"]:
+                evidence["duplicate_hashes"] = hash_res["duplicate_hashes"]
+            if hash_res["unknown_hashes"]:
+                evidence["unknown_hashes"] = hash_res["unknown_hashes"]
+
+        # -----------------------------------------------------------------
+        # Phase 2.1: Task 1 — DNS Feature Extraction (Sysmon Event ID 22)
+        # -----------------------------------------------------------------
+        if (is_sysmon and win_event_id == 22) or "query_name" in raw_event:
+            dns_res = extract_dns_features(
+                raw_event.get("query_name"),
+                raw_event.get("query_status"),
+                raw_event.get("query_results")
+            )
+            evidence["query_name"] = dns_res["query_name"]
+            evidence["query_name_normalized"] = dns_res["query_name_normalized"]
+            evidence["dns_query_length"] = dns_res["dns_query_length"]
+            evidence["dns_label_count"] = dns_res["dns_label_count"]
+            evidence["dns_max_label_length"] = dns_res["dns_max_label_length"]
+            evidence["dns_query_entropy"] = dns_res["dns_query_entropy"]
+            evidence["dns_max_label_entropy"] = dns_res["dns_max_label_entropy"]
+            if "query_status" in dns_res and dns_res["query_status"] is not None:
+                evidence["query_status"] = dns_res["query_status"]
+            if "query_results" in dns_res and dns_res["query_results"] is not None:
+                evidence["query_results"] = dns_res["query_results"]
 
         if is_sysmon and win_event_id == 1:
             event_type = "windows_process_event"
@@ -210,7 +322,7 @@ class WindowsEventNormalizer:
             "hostname": hostname,
             "os": "Windows",
             "event_type": event_type,
-            "source_ip": raw_event.get("source_ip", None),
+            "source_ip": normalized_source_ip,
             "username": username,
             "severity": severity,
             "detection_type": None,

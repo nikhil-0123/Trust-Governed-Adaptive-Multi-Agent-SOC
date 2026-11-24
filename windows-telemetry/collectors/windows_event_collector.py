@@ -1138,13 +1138,14 @@ class WindowsEventCollector:
     def _parse_hashes(raw_hashes: Optional[str]) -> Dict[str, str]:
         """
         Parses Sysmon Hashes string into algorithm:hash dictionary.
-        Handles comma or comma-space separated pairs like:
+        Handles comma or semicolon separated pairs like:
         'SHA1=...,MD5=...,SHA256=...,IMPHASH=...'
         """
         if not raw_hashes or not raw_hashes.strip() or raw_hashes.strip() == "-":
             return {}
         parsed = {}
-        for token in raw_hashes.split(","):
+        normalized_str = raw_hashes.replace(";", ",")
+        for token in normalized_str.split(","):
             token = token.strip()
             if "=" in token:
                 k, v = token.split("=", 1)
@@ -1156,7 +1157,18 @@ class WindowsEventCollector:
 
     def _parse_wevtutil_xml(self, xml_string: str) -> List[Dict[str, Any]]:
         """Parses multiple concatenated Event XML tags returned by wevtutil."""
-        wrapped_xml = f"<Events>{xml_string}</Events>"
+        if not xml_string or not isinstance(xml_string, str):
+            return []
+
+        # Bound processing of unusually large inputs to prevent resource exhaustion (Task 5)
+        if len(xml_string) > 10 * 1024 * 1024:
+            self.logger.warning(f"Oversized XML batch ({len(xml_string)} bytes); rejecting to prevent resource exhaustion.")
+            return []
+
+        # Sanitize null characters that would cause XML parse failures
+        cleaned_xml = xml_string.replace("\x00", "")
+
+        wrapped_xml = f"<Events>{cleaned_xml}</Events>"
         parsed_events = []
         try:
             root = ET.fromstring(wrapped_xml)
@@ -1214,11 +1226,17 @@ class WindowsEventCollector:
                 if provider is not None:
                     event_data["provider"] = provider.get("Name")
 
-                if event_id_elem is not None and event_id_elem.text:
-                    event_data["event_id"] = int(event_id_elem.text)
+                if event_id_elem is not None and event_id_elem.text and event_id_elem.text.strip():
+                    try:
+                        event_data["event_id"] = int(event_id_elem.text.strip())
+                    except ValueError:
+                        self.logger.warning(f"Malformed EventID text: '{event_id_elem.text}'")
 
-                if record_id_elem is not None and record_id_elem.text:
-                    event_data["record_id"] = int(record_id_elem.text)
+                if record_id_elem is not None and record_id_elem.text and record_id_elem.text.strip():
+                    try:
+                        event_data["record_id"] = int(record_id_elem.text.strip())
+                    except ValueError:
+                        self.logger.warning(f"Malformed EventRecordID text: '{record_id_elem.text}'")
 
                 if time_created_elem is not None:
                     event_data["timestamp"] = time_created_elem.get("SystemTime")
@@ -1228,11 +1246,17 @@ class WindowsEventCollector:
                 else:
                     event_data["computer"] = None
 
-                if level_elem is not None and level_elem.text:
-                    event_data["level"] = int(level_elem.text)
+                if level_elem is not None and level_elem.text and level_elem.text.strip():
+                    try:
+                        event_data["level"] = int(level_elem.text.strip())
+                    except ValueError:
+                        pass
 
-                if task_elem is not None and task_elem.text:
-                    event_data["task"] = int(task_elem.text)
+                if task_elem is not None and task_elem.text and task_elem.text.strip():
+                    try:
+                        event_data["task"] = int(task_elem.text.strip())
+                    except ValueError:
+                        pass
 
                 if keywords_elem is not None and keywords_elem.text:
                     event_data["keywords"] = keywords_elem.text
