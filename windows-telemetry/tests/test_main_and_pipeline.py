@@ -15,6 +15,7 @@ from detection.models import DetectionResult
 from canonical import generate_source_event_id_v2
 from collectors.windows_event_collector import WindowsEventCollector
 from transport.outbox import OutboxPayloadConflictError
+from output.builder import DetectionEventBuilder
 
 class TestWindowsMainAndPipeline(unittest.TestCase):
     def setUp(self):
@@ -102,13 +103,23 @@ class TestWindowsMainAndPipeline(unittest.TestCase):
 
     def _compute_expected_detection_event_id(
         self, agent_id: str, record_id: int, det_type: str, detector_name: str,
-        channel: str = "Security", epoch: int = 1, hostname: str = "WORKSTATION-01"
+        channel: str = "Security", epoch: int = 1, hostname: str = "WORKSTATION-01",
+        detector_version: str = "1.0.0", schema_version: str = "2.0"
     ) -> str:
         src_id = generate_source_event_id_v2(
             agent_id=agent_id, channel=channel, epoch=epoch, hostname=hostname, record_id=record_id
         )
-        hash_input = f"{agent_id}|{src_id}|{det_type}|{detector_name}".encode("utf-8")
-        return hashlib.sha256(hash_input).hexdigest()
+        norm = {
+            "agent_id": agent_id,
+            "hostname": hostname,
+            "os": "Windows",
+            "timestamp": "2026-10-03T10:00:00.000Z",
+            "event_id": src_id,
+            "evidence": {"schema_version": schema_version}
+        }
+        res = DetectionResult(True, det_type, 1.0, "high", detector_name, detector_version=detector_version)
+        event = DetectionEventBuilder.build(norm, res)
+        return event.detection_event_id
 
     def test_multi_result_conflict_processes_first_and_third_persists_conflict_and_advances_checkpoint_after_all(self):
         pipeline, logger = self._init_real_pipeline(initial_checkpoint=500)

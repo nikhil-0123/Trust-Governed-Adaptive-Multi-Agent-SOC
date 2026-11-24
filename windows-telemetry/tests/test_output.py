@@ -1,6 +1,7 @@
 import unittest
 import os
 import json
+import hashlib
 import tempfile
 import copy
 from typing import Dict, Any
@@ -48,7 +49,9 @@ class TestOutputPipeline(unittest.TestCase):
         self.assertEqual(event.source_event_id, "test-source-id")
         self.assertEqual(event.detection_type, "test_rule")
         self.assertEqual(event.confidence, 1.0)
-        self.assertEqual(event.evidence, {"detector_key": "val"})
+        self.assertEqual(event.evidence["detector_key"], "val")
+        self.assertEqual(event.evidence["detector_version"], "1.0.0")
+        self.assertIn("detector_revision", event.evidence)
         self.assertTrue(len(event.detection_event_id) == 64) # SHA256
 
     def test_builder_identity_fields_passthrough(self):
@@ -144,6 +147,297 @@ class TestOutputPipeline(unittest.TestCase):
         event = DetectionEventBuilder.build(self.valid_normalized, self.valid_result)
         with self.assertRaises(RuntimeError):
             bad_writer.write(event)
+
+    def test_phase5_detector_version_revision_identity(self):
+        """
+        WP-1E Phase 5: Verify that upgrading detector_version yields a deterministic,
+        unique detection_event_id and correctly stamps detector_version and detector_revision.
+        """
+        v2_norm = copy.deepcopy(self.valid_normalized)
+        v2_norm["evidence"] = {"schema_version": "2.0"}
+
+        res_v1 = DetectionResult(
+            detected=True,
+            detection_type="test_rule",
+            confidence=1.0,
+            severity="high",
+            detector_name="test_detector",
+            detector_version="1.0.0",
+            model_artifact_digest="abc123hash"
+        )
+        res_v2 = DetectionResult(
+            detected=True,
+            detection_type="test_rule",
+            confidence=1.0,
+            severity="high",
+            detector_name="test_detector",
+            detector_version="2.0.0",
+            model_artifact_digest="abc123hash"
+        )
+
+        event_v1 = DetectionEventBuilder.build(v2_norm, res_v1)
+        event_v2 = DetectionEventBuilder.build(v2_norm, res_v2)
+
+        self.assertNotEqual(event_v1.detection_event_id, event_v2.detection_event_id)
+        self.assertEqual(event_v1.detector_version, "1.0.0")
+        self.assertEqual(event_v2.detector_version, "2.0.0")
+        self.assertEqual(event_v1.evidence["detector_version"], "1.0.0")
+        self.assertEqual(event_v2.evidence["detector_version"], "2.0.0")
+        self.assertIsNotNone(event_v1.evidence.get("detector_revision"))
+        self.assertIsNotNone(event_v2.evidence.get("detector_revision"))
+        self.assertNotEqual(event_v1.evidence["detector_revision"], event_v2.evidence["detector_revision"])
+
+    def test_phase5_detector_manifest_and_revision_hashing(self):
+        """
+        WP-1E Phase 5: Test canonical detector manifest hashing:
+        - Same manifest produces same revision hash.
+        - Threshold change produces a different revision hash.
+        - Rule change produces a different revision hash.
+        - Model artifact change produces a different revision hash.
+        """
+        from detection.manifest import build_detector_revision_manifest, compute_detector_revision_hash
+
+        base_manifest = build_detector_revision_manifest(
+            detector_name="bruteforce_detector",
+            detector_version="1.0.0",
+            rules_digest="rule_sha256_base",
+            thresholds={"failure_threshold": 5, "window_seconds": 60},
+            detector_config={"max_state_keys": 10000},
+            model_artifact_digest="model_sha256_base",
+        )
+        base_hash = compute_detector_revision_hash(base_manifest)
+
+        # 1. Same manifest produces same revision hash (deterministic across calls)
+        manifest_copy = build_detector_revision_manifest(
+            detector_name="bruteforce_detector",
+            detector_version="1.0.0",
+            rules_digest="rule_sha256_base",
+            thresholds={"failure_threshold": 5, "window_seconds": 60},
+            detector_config={"max_state_keys": 10000},
+            model_artifact_digest="model_sha256_base",
+        )
+        self.assertEqual(compute_detector_revision_hash(manifest_copy), base_hash)
+
+        # 2. Threshold change produces different revision hash
+        thresh_manifest = build_detector_revision_manifest(
+            detector_name="bruteforce_detector",
+            detector_version="1.0.0",
+            rules_digest="rule_sha256_base",
+            thresholds={"failure_threshold": 6, "window_seconds": 60},
+            detector_config={"max_state_keys": 10000},
+            model_artifact_digest="model_sha256_base",
+        )
+        self.assertNotEqual(compute_detector_revision_hash(thresh_manifest), base_hash)
+
+        # 3. Rule change produces different revision hash
+        rule_manifest = build_detector_revision_manifest(
+            detector_name="bruteforce_detector",
+            detector_version="1.0.0",
+            rules_digest="rule_sha256_updated",
+            thresholds={"failure_threshold": 5, "window_seconds": 60},
+            detector_config={"max_state_keys": 10000},
+            model_artifact_digest="model_sha256_base",
+        )
+        self.assertNotEqual(compute_detector_revision_hash(rule_manifest), base_hash)
+
+        # 4. Model artifact change produces different revision hash
+        model_manifest = build_detector_revision_manifest(
+            detector_name="bruteforce_detector",
+            detector_version="1.0.0",
+            rules_digest="rule_sha256_base",
+            thresholds={"failure_threshold": 5, "window_seconds": 60},
+            detector_config={"max_state_keys": 10000},
+            model_artifact_digest="model_sha256_v2",
+        )
+        self.assertNotEqual(compute_detector_revision_hash(model_manifest), base_hash)
+
+    def test_phase5_v1_legacy_vs_v2_identity_selection(self):
+        """
+        WP-1E Phase 5:
+        - V1 historical identity preserves exact legacy formula: SHA256(agent_id|source_event_id|detection_type|detector_name)
+        - V2 identity incorporates complete detector_revision_hash: SHA256(agent_id|source_event_id|detection_type|detector_revision_hash)
+        """
+        # V1 Event (schema_version = "1.0")
+        v1_norm = copy.deepcopy(self.valid_normalized)
+        v1_norm["evidence"] = {"schema_version": "1.0"}
+        res_v1 = DetectionResult(True, "test_rule", 1.0, "high", "test_detector", detector_version="1.0.0")
+        event_v1 = DetectionEventBuilder.build(v1_norm, res_v1)
+
+        expected_v1_id = hashlib.sha256(
+            f"{v1_norm['agent_id']}|{v1_norm['event_id']}|test_rule|test_detector".encode("utf-8")
+        ).hexdigest()
+        self.assertEqual(event_v1.detection_event_id, expected_v1_id)
+
+        # V2 Event (schema_version = "2.0")
+        v2_norm = copy.deepcopy(self.valid_normalized)
+        v2_norm["evidence"] = {"schema_version": "2.0"}
+        res_v2 = DetectionResult(True, "test_rule", 1.0, "high", "test_detector", detector_version="2.0.0")
+        event_v2 = DetectionEventBuilder.build(v2_norm, res_v2)
+
+        rev_hash = event_v2.evidence["detector_revision"]
+        expected_v2_id = hashlib.sha256(
+            f"{v2_norm['agent_id']}|{v2_norm['event_id']}|test_rule|{rev_hash}".encode("utf-8")
+        ).hexdigest()
+        self.assertEqual(event_v2.detection_event_id, expected_v2_id)
+        self.assertNotEqual(event_v1.detection_event_id, event_v2.detection_event_id)
+
+    def test_phase5_production_rule_manifest_population(self):
+        """
+        WP-1E Phase 5: Production Rule Manifest Population & Revision Sensitivity.
+        - Default BruteForceRule metadata is populated.
+        - Changing failure_threshold changes the revision hash.
+        - Changing window_seconds changes the revision hash.
+        - Changing rule signatures changes the revision hash.
+        - Same configuration produces the same hash.
+        - Other production rules populate their relevant configuration.
+        - V1 identity remains unchanged.
+        - Production V2 identity uses the completed revision hash.
+        - Existing evaluation-mode isolation remains intact.
+        """
+        from detection.rules import (
+            BruteForceRule,
+            SuspiciousPowerShellRule,
+            SuspiciousLolbinsDownloadRule,
+            ReconnaissanceCommandsRule,
+            DefenseEvasionRule,
+        )
+        from detection.detector import DetectionEngine
+
+        # 1. Default BruteForceRule metadata is populated
+        bf_default = BruteForceRule()
+        self.assertEqual(bf_default.detector_name, "windows_bruteforce_rule")
+        self.assertEqual(bf_default.detector_version, "1.0.0")
+        self.assertEqual(bf_default.get_thresholds()["failure_threshold"], 5.0)
+        self.assertEqual(bf_default.get_thresholds()["window_seconds"], 60.0)
+        self.assertIn("max_state_keys", bf_default.get_detector_config())
+        self.assertTrue(len(bf_default.get_rules_digest()) == 64)
+
+        def make_failed_logon(i, username="victim"):
+            return {
+                "agent_id": "AGT-WIN-01",
+                "hostname": "WORKSTATION-01",
+                "os": "Windows",
+                "timestamp": f"2026-10-03T10:00:{i:02d}Z",
+                "event_id": f"src-{i}",
+                "username": username,
+                "evidence": {
+                    "schema_version": "2.0",
+                    "windows_event_id": 4625,
+                    "target_account_id": f"LOCAL_SAM\\{username}",
+                    "domain_status": "LOCAL_SAM"
+                }
+            }
+
+        res_default = None
+        for i in range(5):
+            res_default = bf_default.evaluate(make_failed_logon(i))
+
+        self.assertIsNotNone(res_default)
+        self.assertEqual(res_default.detector_name, "windows_bruteforce_rule")
+        self.assertEqual(res_default.detector_version, "1.0.0")
+        self.assertEqual(res_default.thresholds["failure_threshold"], 5.0)
+        self.assertEqual(res_default.thresholds["window_seconds"], 60.0)
+        self.assertEqual(res_default.rules_digest, bf_default.get_rules_digest())
+        self.assertIsNotNone(res_default.detector_config)
+
+        # Build DetectionEvent and verify V2 identity
+        norm_ev = make_failed_logon(4)
+        event_default = DetectionEventBuilder.build(norm_ev, res_default)
+        rev_hash_default = event_default.evidence["detector_revision"]
+        self.assertTrue(len(rev_hash_default) == 64)
+
+        src_id = res_default.source_event_id or norm_ev["event_id"]
+        expected_v2_id = hashlib.sha256(
+            f"{norm_ev['agent_id']}|{src_id}|windows_bruteforce_rule|{rev_hash_default}".encode("utf-8")
+        ).hexdigest()
+        self.assertEqual(event_default.detection_event_id, expected_v2_id)
+
+        # 2. Same configuration produces the same hash
+        bf_same = BruteForceRule()
+        res_same = None
+        for i in range(5):
+            res_same = bf_same.evaluate(make_failed_logon(i))
+        event_same = DetectionEventBuilder.build(norm_ev, res_same)
+        self.assertEqual(event_same.evidence["detector_revision"], rev_hash_default)
+
+        # 3. Changing failure_threshold changes the revision hash
+        bf_t10 = BruteForceRule(failure_threshold=10)
+        res_t10 = None
+        for i in range(10):
+            res_t10 = bf_t10.evaluate(make_failed_logon(i))
+        event_t10 = DetectionEventBuilder.build(norm_ev, res_t10)
+        self.assertNotEqual(event_t10.evidence["detector_revision"], rev_hash_default)
+
+        # 4. Changing window_seconds changes the revision hash
+        bf_w120 = BruteForceRule(window_seconds=120)
+        res_w120 = None
+        for i in range(5):
+            res_w120 = bf_w120.evaluate(make_failed_logon(i))
+        event_w120 = DetectionEventBuilder.build(norm_ev, res_w120)
+        self.assertNotEqual(event_w120.evidence["detector_revision"], rev_hash_default)
+
+        # 5. Other production rules populate their relevant configuration via DetectionEngine
+        engine = DetectionEngine(self.logger)
+        ps_ev = {
+            "agent_id": "AGT-WIN-01",
+            "hostname": "WORKSTATION-01",
+            "os": "Windows",
+            "timestamp": "2026-10-03T10:00:00Z",
+            "event_id": "src-ps",
+            "evidence": {
+                "schema_version": "2.0",
+                "command_line": "powershell.exe -ExecutionPolicy Bypass -enc SQBYAFgA"
+            }
+        }
+        ps_results = engine.process_event(ps_ev)
+        self.assertTrue(len(ps_results) >= 1)
+        ps_res = ps_results[0]
+        self.assertEqual(ps_res.detector_name, "windows_powershell_rule")
+        self.assertEqual(ps_res.detector_version, "1.0.0")
+        self.assertEqual(ps_res.thresholds["confidence"], 0.95)
+        self.assertEqual(ps_res.detector_config["technique_id"], "T1059.001")
+        self.assertTrue(len(ps_res.rules_digest) == 64)
+
+        event_ps = DetectionEventBuilder.build(ps_ev, ps_res)
+        rev_hash_ps = event_ps.evidence["detector_revision"]
+        self.assertTrue(len(rev_hash_ps) == 64)
+
+        # 6. Changing rule signatures changes the revision hash
+        ps_rule_custom = SuspiciousPowerShellRule()
+        ps_rule_custom.patterns.append((r"(?i)new_malicious_cradle", "New Cradle"))
+        res_custom = ps_rule_custom.evaluate(ps_ev)
+        event_custom = DetectionEventBuilder.build(ps_ev, res_custom)
+        self.assertNotEqual(event_custom.evidence["detector_revision"], rev_hash_ps)
+
+        # 7. Check Lolbins, Recon, Defense Evasion rules populate config
+        lolbin_rule = SuspiciousLolbinsDownloadRule()
+        self.assertEqual(lolbin_rule.detector_name, "windows_lolbin_rule")
+        self.assertEqual(lolbin_rule.get_thresholds()["confidence"], 0.90)
+        self.assertEqual(lolbin_rule.get_detector_config()["technique_id"], "T1105")
+        self.assertTrue(len(lolbin_rule.get_rules_digest()) == 64)
+
+        recon_rule = ReconnaissanceCommandsRule()
+        self.assertEqual(recon_rule.detector_name, "windows_reconnaissance_rule")
+        self.assertEqual(recon_rule.get_thresholds()["confidence"], 0.85)
+        self.assertEqual(recon_rule.get_detector_config()["technique_id"], "T1082")
+        self.assertTrue(len(recon_rule.get_rules_digest()) == 64)
+
+        evasion_rule = DefenseEvasionRule()
+        self.assertEqual(evasion_rule.detector_name, "windows_defense_evasion_rule")
+        self.assertEqual(evasion_rule.get_thresholds()["confidence"], 0.98)
+        self.assertEqual(evasion_rule.get_detector_config()["technique_id"], "T1562.001")
+        self.assertTrue(len(evasion_rule.get_rules_digest()) == 64)
+
+        # 8. V1 identity remains unchanged
+        v1_norm = make_failed_logon(4)
+        v1_norm["evidence"]["schema_version"] = "1.0"
+        event_v1 = DetectionEventBuilder.build(v1_norm, res_default)
+        src_id_v1 = res_default.source_event_id or v1_norm["event_id"]
+        expected_v1_id = hashlib.sha256(
+            f"{v1_norm['agent_id']}|{src_id_v1}|windows_bruteforce_rule|windows_bruteforce_rule".encode("utf-8")
+        ).hexdigest()
+        self.assertEqual(event_v1.detection_event_id, expected_v1_id)
+
 
 class MockCollector:
     def __init__(self):
@@ -385,3 +679,56 @@ class TestPipelineIntegration(unittest.TestCase):
             self.assertEqual(det["confidence"], 1.0)
             self.assertEqual(det["evidence"]["username"], "security_admin")
             self.assertEqual(det["evidence"]["source_ip"], "192.168.1.200")
+
+    def test_phase5_evaluation_mode_bypasses_outbox(self):
+        """
+        WP-1E Phase 5: Verify that evaluation/replay mode routes events to detections_eval.jsonl
+        and bypasses the Outbox queue to avoid polluting the central dispatch queue.
+        """
+        eval_temp_dir = tempfile.TemporaryDirectory()
+        try:
+            import config.settings as s_module
+            orig_data = s_module.config.data_dir
+            orig_out = s_module.config.detection_output_dir
+            orig_outbox = s_module.config.outbox_db_path
+            s_module.config.data_dir = eval_temp_dir.name
+            s_module.config.detection_output_dir = eval_temp_dir.name
+            s_module.config.outbox_db_path = os.path.join(eval_temp_dir.name, "outbox.db")
+            s_module.config.ensure_directories()
+
+            eval_pipeline = WindowsDetectionPipeline(self.logger, execution_mode="EVALUATION")
+            try:
+                eval_pipeline.collector = MockCollector()
+
+                # Seed 5 brute-force failure events
+                base_time = "2026-10-12T15:00:0"
+                eval_pipeline.collector.events = [
+                    {
+                        "record_id": 100 + i,
+                        "event_id": 4625,
+                        "timestamp": f"{base_time}{i}.000Z",
+                        "provider": "p",
+                        "computer": "c",
+                        "username": "eval_admin",
+                        "target_domain": "."
+                    }
+                    for i in range(5)
+                ]
+
+                eval_pipeline.process_batch()
+
+                # Detections should exist in detections_eval.jsonl
+                eval_file = os.path.join(eval_temp_dir.name, "detections_eval.jsonl")
+                prod_file = os.path.join(eval_temp_dir.name, "detections.jsonl")
+                self.assertTrue(os.path.exists(eval_file))
+                self.assertFalse(os.path.exists(prod_file))
+
+                # Outbox must have ZERO pending events
+                self.assertEqual(len(eval_pipeline.outbox.get_pending_events()), 0)
+            finally:
+                eval_pipeline.shutdown()
+        finally:
+            s_module.config.data_dir = orig_data
+            s_module.config.detection_output_dir = orig_out
+            s_module.config.outbox_db_path = orig_outbox
+            eval_temp_dir.cleanup()

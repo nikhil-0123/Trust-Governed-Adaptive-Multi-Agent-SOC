@@ -46,7 +46,8 @@ agent_identity.json
 
 # Project Exclusions (Internal rules, docs in knowledge repo)
 .agents/
-docs/
+docs/*
+!docs/contracts/
 test_*.js
 
 # Testing & Coverage artifacts

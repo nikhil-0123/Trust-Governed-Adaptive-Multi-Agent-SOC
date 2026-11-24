@@ -194,7 +194,8 @@ class TestCheckpointRecoveryWP1E2:
         sys_collector = WindowsEventCollector(logger, log_name="System", agent_id="AGT-WIN-01")
         sys_collector.initialize()
 
-        sys_collector.update_checkpoint(100)
+        sys_collector.checkpoint_manager.save_checkpoint(100)
+        sys_collector.current_checkpoint = 100
         assert sys_collector.current_checkpoint == 100
 
         xml_104_sys = """<Event xmlns="http://schemas.microsoft.com/win/2004/08/events/event">

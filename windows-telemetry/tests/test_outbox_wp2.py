@@ -2806,7 +2806,7 @@ class TestOutboxWP2(unittest.TestCase):
         manager = DeliveryManager(outbox, mock_client, self.logger)
 
         call_count = 0
-        def exploding_process_outbox():
+        def exploding_process_outbox(*args, **kwargs):
             nonlocal call_count
             call_count += 1
             raise RuntimeError("Simulated network/DB crash in delivery loop")
@@ -2842,7 +2842,7 @@ class TestOutboxWP2(unittest.TestCase):
 
         outbox.checkpoint = counting_checkpoint
 
-        def slow_process_outbox():
+        def slow_process_outbox(*args, **kwargs):
             # Simulate delivery batch taking 0.15s
             time.sleep(0.15)
 
