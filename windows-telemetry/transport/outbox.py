@@ -7,6 +7,8 @@ import random
 import email.utils
 import threading
 import time
+import shutil
+import math
 try:
     import msvcrt
 except ImportError:
@@ -643,10 +645,15 @@ class Outbox:
         logger: logging.Logger,
         busy_timeout_ms: int = 5000,
         synchronous_mode: str = "NORMAL",
-        wal_autocheckpoint: int = 1000
+        wal_autocheckpoint: int = 1000,
+        initial_auto_vacuum_mode: Optional[int] = None
     ):
         self.db_path = db_path
         self.logger = logger
+        self._last_vacuum_monotonic: float = 0.0
+        self._last_compaction_utc_str: Optional[str] = None
+        self._loaded_from_metadata: bool = False
+        self.initial_auto_vacuum_mode = initial_auto_vacuum_mode
 
         if not isinstance(busy_timeout_ms, int) or busy_timeout_ms < 1000:
             raise ValueError(f"busy_timeout_ms must be an integer >= 1000, got: {busy_timeout_ms}")
@@ -761,8 +768,16 @@ class Outbox:
         os.makedirs(os.path.dirname(os.path.abspath(self.db_path)), exist_ok=True)
         conn = self._get_connection()
         try:
+            if self.initial_auto_vacuum_mode is not None:
+                cur = conn.execute("SELECT count(*) FROM sqlite_master WHERE type='table';")
+                row = cur.fetchone()
+                if row and row[0] == 0:
+                    conn.execute(f"PRAGMA auto_vacuum = {int(self.initial_auto_vacuum_mode)};")
+                    conn.execute("VACUUM;")
             self._validate_or_migrate_schema(conn)
             self._ensure_conflicts_table(conn)
+            self._ensure_metadata_table(conn)
+            self._load_last_compaction_time(conn)
         finally:
             conn.close()
 
@@ -780,6 +795,59 @@ class Outbox:
             );
         """)
         conn.execute("CREATE INDEX IF NOT EXISTS idx_outbox_conflicts_event_id ON outbox_conflicts(detection_event_id);")
+
+    def _ensure_metadata_table(self, conn: sqlite3.Connection):
+        """Ensures the companion outbox_metadata table exists for durable state tracking."""
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS outbox_metadata (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL,
+                updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+            );
+        """)
+
+    def _load_last_compaction_time(self, conn: sqlite3.Connection):
+        """Loads persistent last compaction timestamp and synchronizes monotonic scheduling."""
+        try:
+            cur = conn.execute("SELECT value FROM outbox_metadata WHERE key = 'last_compaction_at';")
+            row = cur.fetchone()
+            if row and row[0]:
+                self._last_compaction_utc_str = str(row[0]).strip()
+                try:
+                    dt = datetime.fromisoformat(self._last_compaction_utc_str.replace("Z", "+00:00"))
+                    now_utc = datetime.now(timezone.utc)
+                    elapsed_wall = (now_utc - dt).total_seconds()
+                    if elapsed_wall >= 0:
+                        self._last_vacuum_monotonic = time.monotonic() - elapsed_wall
+                    else:
+                        self._last_vacuum_monotonic = time.monotonic()
+                    self._loaded_from_metadata = True
+                except Exception as ex:
+                    self.logger.warning(f"Failed to parse last_compaction_at '{self._last_compaction_utc_str}': {ex}")
+        except Exception as e:
+            self.logger.warning(f"Could not load last_compaction_at from metadata: {e}")
+
+    def get_metadata(self, key: str) -> Optional[str]:
+        conn = self._get_connection()
+        try:
+            self._ensure_metadata_table(conn)
+            cur = conn.execute("SELECT value FROM outbox_metadata WHERE key = ?;", (key,))
+            row = cur.fetchone()
+            return str(row[0]) if row and row[0] is not None else None
+        finally:
+            conn.close()
+
+    def set_metadata(self, key: str, value: str):
+        def _op(conn: sqlite3.Connection):
+            self._ensure_metadata_table(conn)
+            conn.execute("""
+                INSERT INTO outbox_metadata (key, value, updated_at)
+                VALUES (?, ?, strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+                ON CONFLICT(key) DO UPDATE SET
+                    value = excluded.value,
+                    updated_at = excluded.updated_at;
+            """, (key, value))
+        self._execute_transaction_with_retry(_op)
 
     def _validate_or_migrate_schema(self, conn: sqlite3.Connection):
         cur = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='schema_migrations'")
@@ -952,6 +1020,8 @@ class Outbox:
         validate_v2_check_constraints(tbl_row[0])
 
     def _init_fresh_db(self, conn: sqlite3.Connection):
+        if getattr(self, "initial_auto_vacuum_mode", None) in (0, 1, 2):
+            conn.execute(f"PRAGMA auto_vacuum = {self.initial_auto_vacuum_mode};")
         conn.execute("BEGIN IMMEDIATE")
         try:
             conn.execute("""
@@ -963,6 +1033,7 @@ class Outbox:
             """)
             conn.execute(CANONICAL_V2_TABLE_DDL)
             self._create_indexes(conn)
+            self._ensure_metadata_table(conn)
             conn.execute("""
                 INSERT INTO schema_migrations (version, applied_at, description)
                 VALUES (2, strftime('%Y-%m-%dT%H:%M:%SZ', 'now'), 'Initial canonical V2 outbox schema');
@@ -1296,6 +1367,393 @@ class Outbox:
 
         return self._execute_transaction_with_retry(_op)
 
+    def get_freelist_count(self) -> int:
+        """Returns the number of unused pages on the SQLite freelist."""
+        conn = self._get_connection()
+        try:
+            cur = conn.execute("PRAGMA freelist_count;")
+            row = cur.fetchone()
+            return int(row[0]) if row and row[0] is not None else 0
+        finally:
+            conn.close()
+
+    def get_auto_vacuum_mode(self) -> int:
+        """
+        Returns SQLite auto_vacuum mode:
+        0 = NONE, 1 = FULL, 2 = INCREMENTAL.
+        """
+        conn = self._get_connection()
+        try:
+            cur = conn.execute("PRAGMA auto_vacuum;")
+            row = cur.fetchone()
+            return int(row[0]) if row and row[0] is not None else 0
+        finally:
+            conn.close()
+
+    def get_db_stats(self) -> Dict[str, Any]:
+        """Returns diagnostic statistics for the outbox database, including WAL measurements."""
+        conn = self._get_connection()
+        try:
+            page_count_cur = conn.execute("PRAGMA page_count;")
+            row_pc = page_count_cur.fetchone()
+            page_count = int(row_pc[0]) if row_pc and row_pc[0] is not None else 0
+
+            page_size_cur = conn.execute("PRAGMA page_size;")
+            row_ps = page_size_cur.fetchone()
+            page_size = int(row_ps[0]) if row_ps and row_ps[0] is not None else 4096
+
+            freelist_cur = conn.execute("PRAGMA freelist_count;")
+            row_fl = freelist_cur.fetchone()
+            freelist_count = int(row_fl[0]) if row_fl and row_fl[0] is not None else 0
+
+            auto_vac_cur = conn.execute("PRAGMA auto_vacuum;")
+            row_av = auto_vac_cur.fetchone()
+            auto_vacuum = int(row_av[0]) if row_av and row_av[0] is not None else 0
+
+            db_size_bytes = 0
+            wal_size_bytes = 0
+            if self.db_path != ":memory:" and os.path.isfile(self.db_path):
+                try:
+                    db_size_bytes = os.path.getsize(self.db_path)
+                except Exception:
+                    pass
+                wal_path = self.db_path + "-wal"
+                if os.path.isfile(wal_path):
+                    try:
+                        wal_size_bytes = os.path.getsize(wal_path)
+                    except Exception:
+                        pass
+
+            return {
+                "page_count": page_count,
+                "page_size": page_size,
+                "freelist_count": freelist_count,
+                "auto_vacuum": auto_vacuum,
+                "db_size_bytes": db_size_bytes,
+                "wal_size_bytes": wal_size_bytes,
+                "total_size_bytes": db_size_bytes + wal_size_bytes,
+            }
+        finally:
+            conn.close()
+
+    def get_pending_count(self) -> int:
+        """Returns the current number of pending events awaiting delivery."""
+        conn = self._get_connection()
+        try:
+            cur = conn.execute("SELECT COUNT(*) FROM outbox WHERE status = 'pending';")
+            row = cur.fetchone()
+            return int(row[0]) if row and row[0] is not None else 0
+        finally:
+            conn.close()
+
+    def get_quarantined_count(self) -> int:
+        """Returns the current number of quarantined events."""
+        conn = self._get_connection()
+        try:
+            cur = conn.execute("SELECT COUNT(*) FROM outbox WHERE status = 'quarantined';")
+            row = cur.fetchone()
+            return int(row[0]) if row and row[0] is not None else 0
+        finally:
+            conn.close()
+
+    def check_backpressure(self, max_pending: int = 50000, disk_watermark_mb: int = 500) -> Dict[str, Any]:
+        """
+        Monitors pending backlog size (detections + transitions), quarantined records,
+        database/WAL storage footprint, and physical volume free disk space.
+        Enforces safe backpressure without deleting any forensic records.
+        """
+        pending_detections = self.get_pending_count()
+        quarantined_detections = self.get_quarantined_count()
+
+        pending_transitions = 0
+        quarantined_transitions = 0
+        conn = self._get_connection()
+        try:
+            cur = conn.execute("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='transition_outbox';")
+            if cur.fetchone()[0] > 0:
+                cur_pt = conn.execute("SELECT COUNT(*) FROM transition_outbox WHERE status = 'pending';")
+                row_pt = cur_pt.fetchone()
+                if row_pt:
+                    pending_transitions = int(row_pt[0])
+                cur_qt = conn.execute("SELECT COUNT(*) FROM transition_outbox WHERE status = 'quarantined';")
+                row_qt = cur_qt.fetchone()
+                if row_qt:
+                    quarantined_transitions = int(row_qt[0])
+        except Exception as e:
+            self.logger.warning(f"Could not query transition_outbox counts for backpressure: {e}")
+        finally:
+            conn.close()
+
+        total_pending = pending_detections + pending_transitions
+        total_quarantined = quarantined_detections + quarantined_transitions
+
+        # Measure DB and WAL storage
+        stats = {}
+        try:
+            stats = self.get_db_stats()
+        except Exception:
+            pass
+        db_size_bytes = stats.get("db_size_bytes", 0)
+        wal_size_bytes = stats.get("wal_size_bytes", 0)
+        total_storage_bytes = stats.get("total_size_bytes", db_size_bytes + wal_size_bytes)
+
+        db_dir = os.path.dirname(os.path.abspath(self.db_path))
+        free_mb = None
+        try:
+            disk_usage = shutil.disk_usage(db_dir)
+            free_mb = disk_usage.free / (1024 * 1024)
+        except Exception as e:
+            self.logger.warning(f"Could not check disk usage on {db_dir}: {e}")
+
+        reasons = []
+        if total_pending >= max_pending:
+            reasons.append(f"pending_count_exceeded ({total_pending} >= {max_pending})")
+        if free_mb is not None and free_mb < disk_watermark_mb:
+            reasons.append(f"disk_watermark_breached ({free_mb:.1f}MB < {disk_watermark_mb}MB)")
+
+        active = len(reasons) > 0
+        return {
+            "active": active,
+            "reasons": reasons,
+            "pending_count": pending_detections,
+            "pending_transitions": pending_transitions,
+            "total_pending": total_pending,
+            "quarantined_count": quarantined_detections,
+            "quarantined_transitions": quarantined_transitions,
+            "total_quarantined": total_quarantined,
+            "max_pending": max_pending,
+            "db_size_bytes": db_size_bytes,
+            "wal_size_bytes": wal_size_bytes,
+            "total_storage_bytes": total_storage_bytes,
+            "free_disk_mb": free_mb,
+            "disk_watermark_mb": disk_watermark_mb
+        }
+
+    def compact(
+        self,
+        freelist_threshold: Optional[int] = 50,
+        min_interval_seconds: Optional[float] = 86400.0,
+        force: bool = False,
+        disk_space_multiplier: float = 2.0,
+        active_lock: Optional[OutboxLock] = None
+    ) -> Dict[str, Any]:
+        """
+        Executes threshold-driven SQLite compaction with interval throttling,
+        disk-space guardrails, persistent cooldown tracking, WAL measurements,
+        and failure-safe handling.
+
+        - Respects auto_vacuum configuration (NONE, FULL, INCREMENTAL).
+        - Reclaims unused freelist pages under verified mutual exclusion.
+        - Fails closed/safe without raising on lock contention or transient errors.
+        """
+        if self.db_path == ":memory:":
+            return {"status": "skipped", "reason": "in_memory"}
+
+        now_mono = time.monotonic()
+        effective_min_interval = 0.0 if force else (
+            min_interval_seconds if min_interval_seconds is not None else 86400.0
+        )
+        if not force:
+            # 1. In-process monotonic elapsed check
+            if self._last_vacuum_monotonic > 0.0:
+                elapsed = now_mono - self._last_vacuum_monotonic
+                if elapsed < effective_min_interval:
+                    source = "persistent_metadata" if self._loaded_from_metadata else "in_memory_monotonic"
+                    return {
+                        "status": "skipped",
+                        "reason": "interval_not_elapsed",
+                        "elapsed_seconds": elapsed,
+                        "min_interval_seconds": effective_min_interval,
+                        "cooldown_source": source
+                    }
+
+            # 2. Persistent UTC wall-clock check (guarantees cooldown across restarts)
+            last_ts = self.get_metadata("last_compaction_at")
+            if last_ts:
+                try:
+                    dt = datetime.fromisoformat(last_ts.replace("Z", "+00:00"))
+                    now_utc = datetime.now(timezone.utc)
+                    elapsed_utc = (now_utc - dt).total_seconds()
+                    if 0 <= elapsed_utc < effective_min_interval:
+                        self._last_vacuum_monotonic = now_mono - elapsed_utc
+                        return {
+                            "status": "skipped",
+                            "reason": "interval_not_elapsed",
+                            "elapsed_seconds": elapsed_utc,
+                            "min_interval_seconds": effective_min_interval,
+                            "cooldown_source": "persistent_metadata"
+                        }
+                except Exception as ex:
+                    self.logger.warning(f"Error evaluating persistent compaction timestamp: {ex}")
+
+        # Query database statistics before compaction
+        try:
+            stats_before = self.get_db_stats()
+        except Exception as e:
+            if is_sqlite_busy_or_locked(e):
+                self.logger.warning(f"Outbox database busy or locked during stats query: {e}. Skipping.")
+                return {"status": "skipped", "reason": "database_busy", "error": sanitize_error_message(e)}
+            self.logger.warning(f"Could not retrieve outbox database stats before compaction: {e}")
+            return {"status": "failed", "reason": "stats_error", "error": sanitize_error_message(e)}
+
+        freelist_before = stats_before["freelist_count"]
+        effective_threshold = 1 if force else (
+            freelist_threshold if freelist_threshold is not None else 50
+        )
+
+        # Determine auto_vacuum capability and explicit policy
+        auto_vac_mode = stats_before["auto_vacuum"]
+        if auto_vac_mode == 1:
+            # Mode 1 (FULL): SQLite automatically recovers pages on commit.
+            if freelist_before == 0:
+                return {
+                    "status": "skipped",
+                    "reason": "auto_vacuum_full_active",
+                    "mode": "auto_vacuum_full",
+                    "freelist_count": 0,
+                    "message": "SQLite engine full auto-vacuum is active; no freelist pages require compaction."
+                }
+            compaction_mode = "vacuum"
+        elif auto_vac_mode == 2:
+            # Mode 2 (INCREMENTAL): PRAGMA incremental_vacuum
+            compaction_mode = "incremental_vacuum"
+        else:
+            # Mode 0 (NONE): full rebuild via VACUUM
+            compaction_mode = "vacuum"
+
+        if not force and freelist_before < effective_threshold:
+            return {
+                "status": "skipped",
+                "reason": "below_freelist_threshold",
+                "freelist_count": freelist_before,
+                "threshold": effective_threshold
+            }
+
+        # Disk space safety verification
+        db_dir = os.path.dirname(os.path.abspath(self.db_path))
+        free_bytes = None
+        try:
+            disk_usage = shutil.disk_usage(db_dir)
+            free_bytes = disk_usage.free
+        except Exception as e:
+            self.logger.warning(f"Could not verify disk space on {db_dir}: {e}")
+
+        if free_bytes is not None:
+            db_file_size = stats_before["db_size_bytes"]
+            required_bytes = int(db_file_size * disk_space_multiplier) + (10 * 1024 * 1024)
+            if free_bytes < required_bytes:
+                msg = (
+                    f"Insufficient disk space for outbox compaction: {free_bytes} bytes free, "
+                    f"{required_bytes} bytes required. Compaction skipped."
+                )
+                self.logger.warning(msg)
+                return {
+                    "status": "skipped",
+                    "reason": "insufficient_disk_space",
+                    "free_bytes": free_bytes,
+                    "required_bytes": required_bytes
+                }
+
+        # Concurrency & Lock Guard with Verified Ownership Transfer
+        lock_to_release = None
+        can_db_path = canonicalize_db_path(self.db_path)
+        if (
+            active_lock is not None
+            and getattr(active_lock, "canonical_db_path", None) == can_db_path
+            and active_lock.is_held_by_current_thread()
+        ):
+            self.logger.debug("Compaction running under verified caller-provided active lock.")
+        else:
+            try:
+                lock = OutboxLock(self.db_path, logger=self.logger)
+                if not lock.is_held_by_current_thread():
+                    acquired = lock.acquire(timeout=0.1)
+                    if not acquired:
+                        self.logger.info("Outbox lock currently held by another worker; skipping compaction.")
+                        return {"status": "skipped", "reason": "lock_contention"}
+                    lock_to_release = lock
+            except Exception as e:
+                self.logger.warning(f"Error checking outbox lock for compaction: {e}")
+
+        try:
+            # 1. Inspect WAL checkpoint prior to compaction
+            cp_before = self.checkpoint("PASSIVE")
+            uncheckpointed_before = max(0, cp_before.log - cp_before.checkpointed)
+            self.logger.debug(
+                f"Pre-compaction WAL checkpoint: busy={cp_before.busy}, "
+                f"log={cp_before.log}, checkpointed={cp_before.checkpointed}, "
+                f"uncheckpointed={uncheckpointed_before}"
+            )
+
+            # 2. Execute compaction according to explicit auto_vacuum policy
+            conn = self._get_connection()
+            try:
+                if compaction_mode == "incremental_vacuum":
+                    conn.execute("PRAGMA incremental_vacuum;")
+                else:
+                    conn.execute("VACUUM;")
+            finally:
+                conn.close()
+
+            # 3. Synchronize post-compaction WAL state
+            cp_after = self.checkpoint("PASSIVE")
+            uncheckpointed_after = max(0, cp_after.log - cp_after.checkpointed)
+            self.logger.debug(
+                f"Post-compaction WAL checkpoint: busy={cp_after.busy}, "
+                f"log={cp_after.log}, checkpointed={cp_after.checkpointed}, "
+                f"uncheckpointed={uncheckpointed_after}"
+            )
+
+            stats_after = self.get_db_stats()
+            now_utc_str = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            self._last_vacuum_monotonic = time.monotonic()
+            self._last_compaction_utc_str = now_utc_str
+            self._loaded_from_metadata = False
+            self.set_metadata("last_compaction_at", now_utc_str)
+
+            pages_reclaimed = max(0, freelist_before - stats_after["freelist_count"])
+
+            result = {
+                "status": "compacted",
+                "mode": compaction_mode,
+                "freelist_before": freelist_before,
+                "freelist_after": stats_after["freelist_count"],
+                "pages_reclaimed": pages_reclaimed,
+                "size_before": stats_before["total_size_bytes"],
+                "size_after": stats_after["total_size_bytes"],
+                "compacted_at": now_utc_str,
+                "wal_checkpoint_before": {
+                    "busy": cp_before.busy,
+                    "log": cp_before.log,
+                    "checkpointed": cp_before.checkpointed,
+                    "uncheckpointed": uncheckpointed_before
+                },
+                "wal_checkpoint_after": {
+                    "busy": cp_after.busy,
+                    "log": cp_after.log,
+                    "checkpointed": cp_after.checkpointed,
+                    "uncheckpointed": uncheckpointed_after
+                }
+            }
+            self.logger.info(f"Outbox compaction completed: {result}")
+            return result
+
+        except sqlite3.OperationalError as e:
+            if is_sqlite_busy_or_locked(e):
+                self.logger.warning(f"Outbox database busy or locked during compaction: {e}. Skipping.")
+                return {"status": "skipped", "reason": "database_busy", "error": sanitize_error_message(e)}
+            self.logger.error(f"SQLite operational error during compaction: {e}")
+            return {"status": "failed", "error": sanitize_error_message(e)}
+        except Exception as e:
+            self.logger.error(f"Unexpected error during outbox compaction: {e}")
+            return {"status": "failed", "error": sanitize_error_message(e)}
+        finally:
+            if lock_to_release is not None:
+                try:
+                    lock_to_release.release()
+                except Exception:
+                    pass
+
     def add_transition(self, transition: Dict[str, Any]):
         """Directs ChannelTransition to the dedicated transition_outbox table."""
         if not hasattr(self, "_transition_outbox") or self._transition_outbox is None:
@@ -1338,6 +1796,7 @@ class TransitionOutbox:
     ):
         self.db_path = db_path
         self.logger = logger
+        self._last_vacuum_monotonic: float = 0.0
         if not isinstance(busy_timeout_ms, int) or busy_timeout_ms < 1000:
             raise ValueError(f"busy_timeout_ms must be an integer >= 1000, got: {busy_timeout_ms}")
         self.busy_timeout_ms = busy_timeout_ms
@@ -1376,6 +1835,28 @@ class TransitionOutbox:
                 except Exception:
                     pass
             raise
+
+    def checkpoint(self, mode: str = "PASSIVE") -> CheckpointResult:
+        """
+        Executes a WAL checkpoint operation on the outbox database.
+        Defaults to PASSIVE mode to avoid blocking concurrent readers/writers.
+        Returns CheckpointResult(busy=..., log=..., checkpointed=...).
+        """
+        mode_upper = mode.upper().strip()
+        if mode_upper not in ("PASSIVE", "FULL", "RESTART", "TRUNCATE"):
+            raise ValueError(f"Invalid checkpoint mode: {mode}")
+
+        conn = self._get_connection()
+        try:
+            cur = conn.execute(f"PRAGMA wal_checkpoint({mode_upper});")
+            row = cur.fetchone()
+            if row:
+                busy, log, checkpointed = int(row[0]), int(row[1]), int(row[2])
+            else:
+                busy, log, checkpointed = 0, 0, 0
+            return CheckpointResult(busy=busy, log=log, checkpointed=checkpointed)
+        finally:
+            conn.close()
 
     def _execute_transaction_with_retry(self, fn, max_retries: int = 5):
         attempt = 0
@@ -1649,3 +2130,54 @@ class TransitionOutbox:
             ''', (cutoff_time,))
             return cur.rowcount
         return self._execute_transaction_with_retry(_op)
+
+    def get_freelist_count(self) -> int:
+        """Returns the number of unused pages on the SQLite freelist."""
+        return Outbox(self.db_path, self.logger).get_freelist_count()
+
+    def get_auto_vacuum_mode(self) -> int:
+        """
+        Returns SQLite auto_vacuum mode:
+        0 = NONE, 1 = FULL, 2 = INCREMENTAL.
+        """
+        return Outbox(self.db_path, self.logger).get_auto_vacuum_mode()
+
+    def get_db_stats(self) -> Dict[str, Any]:
+        """Returns diagnostic statistics for the outbox database, including WAL measurements."""
+        return Outbox(self.db_path, self.logger).get_db_stats()
+
+    def get_pending_count(self) -> int:
+        """Returns the current number of pending transitions awaiting delivery."""
+        conn = self._get_connection()
+        try:
+            cur = conn.execute("SELECT COUNT(*) FROM transition_outbox WHERE status = 'pending';")
+            row = cur.fetchone()
+            return int(row[0]) if row and row[0] is not None else 0
+        finally:
+            conn.close()
+
+    def get_quarantined_count(self) -> int:
+        """Returns the current number of quarantined transitions."""
+        conn = self._get_connection()
+        try:
+            cur = conn.execute("SELECT COUNT(*) FROM transition_outbox WHERE status = 'quarantined';")
+            row = cur.fetchone()
+            return int(row[0]) if row and row[0] is not None else 0
+        finally:
+            conn.close()
+
+    def check_backpressure(self, max_pending: int = 50000, disk_watermark_mb: int = 500) -> Dict[str, Any]:
+        """Enforces safe backpressure without deleting any forensic records."""
+        return Outbox(self.db_path, self.logger).check_backpressure(
+            max_pending=max_pending, disk_watermark_mb=disk_watermark_mb
+        )
+
+    def compact(self, *args, **kwargs) -> Dict[str, Any]:
+        """Delegates SQLite compaction to Outbox engine."""
+        return Outbox(self.db_path, self.logger).compact(*args, **kwargs)
+
+    def get_metadata(self, key: str) -> Optional[str]:
+        return Outbox(self.db_path, self.logger).get_metadata(key)
+
+    def set_metadata(self, key: str, value: str) -> None:
+        return Outbox(self.db_path, self.logger).set_metadata(key, value)

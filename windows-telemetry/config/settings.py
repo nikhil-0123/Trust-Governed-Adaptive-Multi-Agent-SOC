@@ -1,4 +1,5 @@
 import os
+import math
 
 def _load_env_file():
     candidates = [
@@ -84,6 +85,47 @@ class Settings:
         if val_autocheckpoint < 10:
             raise ValueError(f"OUTBOX_WAL_AUTOCHECKPOINT must be an integer >= 10, got {val_autocheckpoint}")
         self.outbox_wal_autocheckpoint = val_autocheckpoint
+
+        # Step 8: Outbox Retention & Compaction (Phase 1)
+        val_retention = int(os.getenv("OUTBOX_RETENTION_HOURS", "72"))
+        if val_retention < 1:
+            raise ValueError(f"OUTBOX_RETENTION_HOURS must be an integer >= 1, got {val_retention}")
+        self.outbox_retention_hours = val_retention
+
+        val_purge_interval = float(os.getenv("OUTBOX_PURGE_INTERVAL_SECONDS", "3600.0"))
+        if not math.isfinite(val_purge_interval) or val_purge_interval < 1.0:
+            raise ValueError(f"OUTBOX_PURGE_INTERVAL_SECONDS must be finite and >= 1.0, got {val_purge_interval}")
+        self.outbox_purge_interval_seconds = val_purge_interval
+
+        val_freelist_thresh = int(os.getenv("OUTBOX_VACUUM_FREELIST_THRESHOLD", "50"))
+        if val_freelist_thresh < 1:
+            raise ValueError(f"OUTBOX_VACUUM_FREELIST_THRESHOLD must be an integer >= 1, got {val_freelist_thresh}")
+        self.outbox_vacuum_freelist_threshold = val_freelist_thresh
+
+        val_vacuum_interval = float(os.getenv("OUTBOX_VACUUM_MIN_INTERVAL_SECONDS", "86400.0"))
+        if not math.isfinite(val_vacuum_interval) or val_vacuum_interval < 60.0:
+            raise ValueError(f"OUTBOX_VACUUM_MIN_INTERVAL_SECONDS must be finite and >= 60.0, got {val_vacuum_interval}")
+        self.outbox_vacuum_min_interval_seconds = val_vacuum_interval
+
+        self.outbox_vacuum_enabled = os.getenv("OUTBOX_VACUUM_ENABLED", "true").lower() == "true"
+
+        # Step 9: Outbox Backpressure Quotas & Auto-Vacuum Policy (Phase 1 Remediation)
+        val_max_pending = int(os.getenv("OUTBOX_MAX_PENDING_RECORDS", "50000"))
+        if val_max_pending < 100:
+            raise ValueError(f"OUTBOX_MAX_PENDING_RECORDS must be an integer >= 100, got {val_max_pending}")
+        self.outbox_max_pending_records = val_max_pending
+
+        val_disk_watermark = int(os.getenv("OUTBOX_DISK_WATERMARK_MB", "500"))
+        if val_disk_watermark < 10:
+            raise ValueError(f"OUTBOX_DISK_WATERMARK_MB must be an integer >= 10, got {val_disk_watermark}")
+        self.outbox_disk_watermark_mb = val_disk_watermark
+
+        self.outbox_backpressure_enabled = os.getenv("OUTBOX_BACKPRESSURE_ENABLED", "true").lower() == "true"
+
+        val_auto_vacuum = os.getenv("OUTBOX_AUTO_VACUUM_MODE", "NONE").strip().upper()
+        if val_auto_vacuum not in ("NONE", "FULL", "INCREMENTAL"):
+            raise ValueError(f"OUTBOX_AUTO_VACUUM_MODE must be NONE, FULL, or INCREMENTAL, got {val_auto_vacuum}")
+        self.outbox_auto_vacuum_mode = val_auto_vacuum
 
     @property
     def checkpoint_dir(self) -> str:

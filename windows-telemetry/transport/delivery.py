@@ -1,6 +1,7 @@
 import logging
 import json
 import re
+import time
 from datetime import datetime, timezone, timedelta
 from typing import Dict, Any, Optional
 
@@ -386,6 +387,10 @@ class DeliveryManager:
         logger: logging.Logger,
         max_retries: int = 10,
         retention_hours: int = 72,
+        purge_interval_seconds: float = 3600.0,
+        vacuum_freelist_threshold: int = 50,
+        vacuum_min_interval_seconds: float = 86400.0,
+        vacuum_enabled: bool = True,
         transition_outbox: Optional[Any] = None,
         transition_client: Optional[Any] = None,
         lock: Optional[OutboxLock] = None,
@@ -395,11 +400,18 @@ class DeliveryManager:
         self.client = client
         self.logger = logger
         self.max_retries = max_retries
-        self.retention_hours = retention_hours
+        self.retention_hours = max(1, int(retention_hours))
+        self.purge_interval_seconds = max(1.0, float(purge_interval_seconds))
+        self.vacuum_freelist_threshold = max(1, int(vacuum_freelist_threshold))
+        self.vacuum_min_interval_seconds = max(60.0, float(vacuum_min_interval_seconds))
+        self.vacuum_enabled = bool(vacuum_enabled)
         self.transition_outbox = transition_outbox
         self.transition_client = transition_client
         self.allow_unlocked_for_testing = allow_unlocked_for_testing
         self._lock = lock
+        self._active_lock: Optional[OutboxLock] = None
+        self._last_purge_monotonic: float = 0.0
+        self._last_vacuum_monotonic: float = 0.0
 
         if self._lock is None and not self.allow_unlocked_for_testing:
             db_path = getattr(outbox, "db_path", None)
@@ -408,14 +420,73 @@ class DeliveryManager:
                     self._lock = OutboxLock(db_path.strip(), logger=logger)
                 except Exception as e:
                     self.logger.warning(f"Could not initialize OutboxLock for delivery manager: {e}")
-        
-    def _process_detection_outbox(self):
-        # 1. Purge expired delivered events older than retention_hours (default 72h)
+
+    def _should_purge(self, force: bool = False) -> bool:
+        if force:
+            return True
+        now = time.monotonic()
+        if self._last_purge_monotonic == 0.0:
+            return True
+        return (now - self._last_purge_monotonic) >= self.purge_interval_seconds
+
+    def purge_expired_records(self, force: bool = False) -> Dict[str, Any]:
+        """
+        Executes throttled purge of expired delivered events and transitions.
+        """
+        if not force and not self._should_purge():
+            return {"detections": 0, "transitions": 0, "status": "throttled"}
+
+        detections_purged = 0
+        transitions_purged = 0
+
         try:
-            self.outbox.purge_delivered_events(retention_hours=self.retention_hours)
+            detections_purged = self.outbox.purge_delivered_events(retention_hours=self.retention_hours)
         except Exception as e:
             sanitized_e = sanitize_error_message(e)
             self.logger.warning(f"Failed to purge expired delivered events: {sanitized_e}")
+
+        if self.transition_outbox and hasattr(self.transition_outbox, "purge_delivered_transitions"):
+            try:
+                transitions_purged = self.transition_outbox.purge_delivered_transitions(retention_hours=self.retention_hours)
+            except Exception as e:
+                sanitized_e = sanitize_error_message(e)
+                self.logger.warning(f"Failed to purge expired delivered transitions: {sanitized_e}")
+
+        self._last_purge_monotonic = time.monotonic()
+        return {"detections": detections_purged, "transitions": transitions_purged, "status": "purged"}
+
+    def maybe_compact(self, force: bool = False) -> Optional[Dict[str, Any]]:
+        """
+        Conditionally executes SQLite compaction if vacuum_enabled is True,
+        freelist threshold is met, and min_interval_seconds has elapsed.
+        """
+        if not self.vacuum_enabled and not force:
+            return None
+        if not hasattr(self.outbox, "compact"):
+            return None
+
+        now = time.monotonic()
+        if not force and self._last_vacuum_monotonic > 0.0:
+            if (now - self._last_vacuum_monotonic) < self.vacuum_min_interval_seconds:
+                return {"status": "skipped", "reason": "interval_not_elapsed"}
+
+        active_lock = getattr(self, "_active_lock", None) or self._lock
+        result = self.outbox.compact(
+            freelist_threshold=self.vacuum_freelist_threshold,
+            min_interval_seconds=self.vacuum_min_interval_seconds,
+            force=force,
+            active_lock=active_lock
+        )
+        if result and result.get("status") == "compacted":
+            self._last_vacuum_monotonic = time.monotonic()
+            self.logger.info(f"Outbox database compacted: {result}")
+        return result
+
+    def _process_detection_outbox(self):
+        # 1. Throttled purge of expired delivered events
+        purge_res = self.purge_expired_records()
+        if purge_res.get("status") == "purged" and (purge_res.get("detections", 0) > 0 or purge_res.get("transitions", 0) > 0):
+            self.maybe_compact()
 
         # 2. Retrieve eligible pending events (where next_attempt_at <= now)
         try:
@@ -491,13 +562,9 @@ class DeliveryManager:
         if not self.transition_client or not self.transition_outbox:
             return
 
-        # 1. Purge expired delivered transitions
-        try:
-            if hasattr(self.transition_outbox, "purge_delivered_transitions"):
-                self.transition_outbox.purge_delivered_transitions(retention_hours=self.retention_hours)
-        except Exception as e:
-            sanitized_e = sanitize_error_message(e)
-            self.logger.warning(f"Failed to purge expired delivered transitions: {sanitized_e}")
+        # 1. Ensure throttled purge has been evaluated
+        if self._should_purge():
+            self.purge_expired_records()
 
         # 2. Retrieve eligible pending transitions
         try:
@@ -576,13 +643,21 @@ class DeliveryManager:
         self,
         timeout: float = 0.0,
         lock_already_acquired: bool = False,
-        raise_on_lock_failure: bool = False
+        raise_on_lock_failure: bool = False,
+        force_purge: bool = False,
+        force_vacuum: bool = False
     ):
         """
         Coordinates execution of detection and transition outbox processing under
         process-level and cross-process mutual exclusion.
         Avoids nested lock acquisition if the current thread already holds the lock.
+        Supports forced purge and threshold-driven/forced SQLite compaction.
         """
+        if force_purge:
+            self.purge_expired_records(force=True)
+        if force_vacuum:
+            self.maybe_compact(force=True)
+
         if not self.allow_unlocked_for_testing and self._lock is not None:
             if lock_already_acquired or self._lock.is_held_by_current_thread():
                 self._process_detection_outbox()
