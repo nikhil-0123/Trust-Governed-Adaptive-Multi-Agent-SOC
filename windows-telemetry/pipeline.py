@@ -50,12 +50,16 @@ class WindowsDetectionPipeline:
                 logger, log_name=config.windows_sysmon_log_name, agent_id=self.identity.agent_id
             )
 
+        mode_str = getattr(config, "outbox_auto_vacuum_mode", "NONE")
+        auto_vac_mode_int = 1 if mode_str == "FULL" else (2 if mode_str == "INCREMENTAL" else 0)
+
         self.outbox = Outbox(
             config.outbox_db_path,
             logger,
             busy_timeout_ms=config.outbox_busy_timeout_ms,
             synchronous_mode=config.outbox_synchronous_mode,
-            wal_autocheckpoint=config.outbox_wal_autocheckpoint
+            wal_autocheckpoint=config.outbox_wal_autocheckpoint,
+            initial_auto_vacuum_mode=auto_vac_mode_int
         )
         self.transition_outbox = TransitionOutbox(
             config.outbox_db_path,
@@ -64,6 +68,9 @@ class WindowsDetectionPipeline:
             synchronous_mode=config.outbox_synchronous_mode,
             wal_autocheckpoint=config.outbox_wal_autocheckpoint
         )
+        self.backpressure_enabled = getattr(config, "outbox_backpressure_enabled", True)
+        self.max_pending_records = getattr(config, "outbox_max_pending_records", 50000)
+        self.disk_watermark_mb = getattr(config, "outbox_disk_watermark_mb", 500)
         self.client = TransportClient(config.soc_api_url, config.soc_api_token, logger)
         self.transition_client = None
         if getattr(config, "soc_agent_api_token", None):
@@ -82,6 +89,11 @@ class WindowsDetectionPipeline:
             self.outbox,
             self.client,
             logger,
+            retention_hours=config.outbox_retention_hours,
+            purge_interval_seconds=config.outbox_purge_interval_seconds,
+            vacuum_freelist_threshold=config.outbox_vacuum_freelist_threshold,
+            vacuum_min_interval_seconds=config.outbox_vacuum_min_interval_seconds,
+            vacuum_enabled=config.outbox_vacuum_enabled,
             transition_outbox=self.transition_outbox,
             transition_client=self.transition_client
         )
@@ -180,6 +192,22 @@ class WindowsDetectionPipeline:
 
         for raw_event in raw_events:
             record_id = raw_event.get("record_id", -1)
+
+            # Check backpressure before ingesting into outbox if enabled
+            if self.execution_mode != "EVALUATION" and getattr(self, "backpressure_enabled", True):
+                if self.outbox and hasattr(self.outbox, "check_backpressure"):
+                    bp = self.outbox.check_backpressure(
+                        max_pending=getattr(self, "max_pending_records", 50000),
+                        disk_watermark_mb=getattr(self, "disk_watermark_mb", 500)
+                    )
+                    if bp.get("active"):
+                        self.logger.warning(
+                            f"Outbox backpressure active for {channel_name} on record {record_id} "
+                            f"(reasons: {bp.get('reasons')}, pending: {bp.get('pending_count')}, free_disk: {bp.get('free_disk_mb')}MB). "
+                            "Pausing batch ingestion; checkpoint preserved."
+                        )
+                        break
+
             try:
                 # 1. Normalize with authoritative channel epoch and log_name
                 event_epoch = raw_event.get("epoch") or current_epoch

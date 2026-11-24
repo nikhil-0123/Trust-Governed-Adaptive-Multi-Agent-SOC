@@ -75,6 +75,9 @@ class DeliveryWorker(threading.Thread):
                 )
                 return
 
+            if hasattr(self.delivery_manager, "_active_lock"):
+                self.delivery_manager._active_lock = self._lock
+
         # Determine invocation arguments for delivery_manager.process_outbox
         process_outbox_kwargs = {}
         target_fn = getattr(self.delivery_manager, "process_outbox", None)
@@ -108,6 +111,8 @@ class DeliveryWorker(threading.Thread):
                 # Wait for the poll interval or until stop is requested
                 self._stop_event.wait(self.poll_interval)
         finally:
+            if hasattr(self.delivery_manager, "_active_lock"):
+                self.delivery_manager._active_lock = None
             try:
                 outbox_inst = getattr(self.delivery_manager, "outbox", None)
                 if outbox_inst is not None and hasattr(outbox_inst, "checkpoint"):
