@@ -1,9 +1,8 @@
 import os
-os.environ["DISABLE_STARTUP_WORKERS"] = "1"
-os.environ["SOC_ADMIN_API_TOKEN"] = "dev-admin-secret-token"
+import json
+AGENT_API_TOKEN = "dev-token-agt-win-01"
 
 import unittest
-import json
 import sqlite3
 import tempfile
 import uuid
@@ -24,6 +23,8 @@ from app.main import (
     API_TOKEN,
     verify_token,
     verify_admin_token,
+    extract_bearer_token,
+    derive_authenticated_agent,
     ingest_event_transactional,
     process_channel_transition,
     resolve_epoch_gap,
@@ -100,6 +101,13 @@ class DirectApiClient:
             except Exception as e:
                 return MockResponse(400, {"detail": f"Invalid JSON: {e}"})
 
+            from app.main import ChannelTransitionRequest
+            try:
+                model = ChannelTransitionRequest(**payload)
+                payload = model.model_dump() if hasattr(model, "model_dump") else model.dict()
+            except Exception as ve:
+                return MockResponse(422, {"detail": f"Validation error: {ve}"})
+
             ttype = payload.get("transition_type", "EPOCH_ADVANCE")
             from app.response_bridge import AUTHORIZED_RECOVERY_TRANSITION_TYPES
             authenticated_actor = None
@@ -109,10 +117,17 @@ class DirectApiClient:
                 except HTTPException as he:
                     return MockResponse(he.status_code, {"detail": he.detail})
             else:
+                claimed_agent_id = payload.get("agent_id")
+                if not claimed_agent_id:
+                    return MockResponse(422, {"detail": "Missing required field 'agent_id'"})
                 try:
-                    verify_token(auth)
+                    auth_agent, token = derive_authenticated_agent(auth)
                 except HTTPException as he:
                     return MockResponse(he.status_code, {"detail": he.detail})
+
+                if auth_agent != claimed_agent_id:
+                    return MockResponse(403, {"detail": f"Authenticated endpoint identity '{auth_agent}' does not match transition agent '{claimed_agent_id}'"})
+                authenticated_actor = auth_agent
 
             conn = self._get_conn()
             try:
@@ -123,12 +138,26 @@ class DirectApiClient:
 
         # /api/v1/agents/{agent_id}/channels/{channel}/allocate_epoch
         if len(parts) == 7 and parts[0] == "api" and parts[1] == "v1" and parts[2] == "agents" and parts[4] == "channels" and parts[6] == "allocate_epoch":
-            try:
-                verify_token(auth)
-            except HTTPException as he:
-                return MockResponse(he.status_code, {"detail": he.detail})
             agent_id = parts[3]
             channel = parts[5]
+
+            admin_tok = os.getenv("SOC_ADMIN_API_TOKEN") or os.getenv("SOC_ADMIN_TOKEN")
+            is_admin = False
+            try:
+                tok = extract_bearer_token(auth)
+                if admin_tok and tok == admin_tok.strip():
+                    is_admin = True
+            except Exception:
+                pass
+
+            if not is_admin:
+                try:
+                    auth_agent, token = derive_authenticated_agent(auth)
+                except HTTPException as he:
+                    return MockResponse(he.status_code, {"detail": he.detail})
+                if auth_agent != agent_id:
+                    return MockResponse(403, {"detail": f"Authenticated endpoint identity '{auth_agent}' does not match path agent '{agent_id}'"})
+
             conn = self._get_conn()
             try:
                 payload = json.loads(body_bytes.decode("utf-8"))
@@ -196,13 +225,37 @@ class DirectApiClient:
 
 
 class TestEpochGovernance(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls._orig_env = {
+            "DISABLE_STARTUP_WORKERS": os.environ.get("DISABLE_STARTUP_WORKERS"),
+            "SOC_ADMIN_API_TOKEN": os.environ.get("SOC_ADMIN_API_TOKEN"),
+            "SOC_API_TOKEN": os.environ.get("SOC_API_TOKEN"),
+            "SOC_AGENT_API_TOKENS": os.environ.get("SOC_AGENT_API_TOKENS"),
+        }
+        os.environ["DISABLE_STARTUP_WORKERS"] = "1"
+        os.environ["SOC_ADMIN_API_TOKEN"] = "dev-admin-secret-token"
+        os.environ["SOC_API_TOKEN"] = "dev-shared-endpoint-token"
+        os.environ["SOC_AGENT_API_TOKENS"] = json.dumps({
+            "AGT-WIN-01": AGENT_API_TOKEN,
+            "AGT-WIN-02": "dev-token-agt-win-02"
+        })
+
+    @classmethod
+    def tearDownClass(cls):
+        for k, v in cls._orig_env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
     def setUp(self):
         self.db_fd, self.db_path = tempfile.mkstemp(suffix=".db")
         database.DB_PATH = self.db_path
         init_db()
 
         self.client = DirectApiClient(self.db_path)
-        self.headers = {"Authorization": f"Bearer {API_TOKEN}"}
+        self.headers = {"Authorization": f"Bearer {AGENT_API_TOKEN}"}
 
         self.base_event = {
             "detection_event_id": "det-test-001",
@@ -232,6 +285,12 @@ class TestEpochGovernance(unittest.TestCase):
             os.unlink(self.db_path)
         except OSError:
             pass
+        os.environ["SOC_AGENT_API_TOKENS"] = json.dumps({
+            "AGT-WIN-01": AGENT_API_TOKEN,
+            "AGT-WIN-02": "dev-token-agt-win-02"
+        })
+        os.environ["SOC_ADMIN_API_TOKEN"] = ADMIN_API_TOKEN
+        os.environ["SOC_API_TOKEN"] = "dev-shared-endpoint-token"
 
     # TEST 1: Duplicate identical SOC event (idempotent, no duplicate fusion/incidents)
     def test_duplicate_identical_event_ingestion(self):
@@ -587,7 +646,7 @@ class TestEpochGovernance(unittest.TestCase):
         with get_db_connection() as conn:
             conn.execute("BEGIN IMMEDIATE")
             conn.execute("""
-                INSERT INTO event_conflicts 
+                INSERT INTO event_conflicts
                 (conflict_id, event_id, payload_a, payload_a_hash, payload_b, payload_b_hash, detected_at)
                 VALUES ('temp-conflict', 'det-test-001', 'a', 'ha', 'b', 'hb', 'now')
             """)
@@ -1065,7 +1124,7 @@ class TestEpochGovernance(unittest.TestCase):
             """, (agent_id, now_iso))
             # Seed valid recovery provenance in channel_transitions with watermark 1
             conn.execute("""
-                INSERT OR REPLACE INTO channel_transitions 
+                INSERT OR REPLACE INTO channel_transitions
                 (transition_id, agent_id, source_channel, target_channel, target_epoch, transition_type, received_at, payload)
                 VALUES ('t-valid-rel', ?, 'Security', 'Security', 3, 'ADMINISTRATIVE_GAP_RESOLUTION', ?, ?)
             """, (agent_id, now_iso, json.dumps({"source_epoch": 1, "watermark": 1, "authorized_by": "ADMIN"})))
@@ -1132,12 +1191,12 @@ class TestEpochGovernance(unittest.TestCase):
             """, (agent_id, now_iso))
             # Standard EPOCH_ADVANCE transitions only (no recovery allocation, no recovery transition)
             conn.execute("""
-                INSERT OR REPLACE INTO channel_transitions 
+                INSERT OR REPLACE INTO channel_transitions
                 (transition_id, agent_id, source_channel, target_channel, target_epoch, transition_type, received_at, payload)
                 VALUES ('trans-adv-2', ?, 'Security', 'Security', 2, 'EPOCH_ADVANCE', ?, '{}')
             """, (agent_id, now_iso))
             conn.execute("""
-                INSERT OR REPLACE INTO channel_transitions 
+                INSERT OR REPLACE INTO channel_transitions
                 (transition_id, agent_id, source_channel, target_channel, target_epoch, transition_type, received_at, payload)
                 VALUES ('trans-adv-3', ?, 'Security', 'Security', 3, 'EPOCH_ADVANCE', ?, '{}')
             """, (agent_id, now_iso))
@@ -1171,7 +1230,7 @@ class TestEpochGovernance(unittest.TestCase):
             """, (agent_id, now_iso))
             # Recovery transition has watermark threshold = 1
             conn.execute("""
-                INSERT OR REPLACE INTO channel_transitions 
+                INSERT OR REPLACE INTO channel_transitions
                 (transition_id, agent_id, source_channel, target_channel, target_epoch, transition_type, received_at, payload)
                 VALUES ('t-rec-wm', ?, 'Security', 'Security', 3, 'ADMINISTRATIVE_GAP_RESOLUTION', ?, ?)
             """, (agent_id, now_iso, json.dumps({"source_epoch": 1, "watermark": 1, "authorized_by": "ADMIN"})))
@@ -1228,7 +1287,7 @@ class TestEpochGovernance(unittest.TestCase):
             """, (now_iso,))
             # Recovery record exists ONLY for a different agent (AGT-WIN-OTHER) on Security
             conn.execute("""
-                INSERT OR REPLACE INTO epoch_allocation_ledger 
+                INSERT OR REPLACE INTO epoch_allocation_ledger
                 (recovery_request_id, agent_id, channel, recovery_reason, allocated_epoch, allocated_at)
                 VALUES ('rec-diff-agent', 'AGT-WIN-OTHER', 'Security', 'CRASH_RECOVERY', 3, ?)
             """, (now_iso,))
@@ -2707,7 +2766,7 @@ class TestEpochGovernance(unittest.TestCase):
 
     # Test 5: Caller-supplied SOC_ADMIN actor cannot override authenticated actor identity
     def test_wp1e4s_5_caller_supplied_actor_cannot_override_authenticated_identity(self):
-        agent_id = "AGT-WIN-1E4S-05"
+        agent_id = "AGT-WIN-01"
         now_iso = datetime.now(timezone.utc).isoformat()
         with get_db_connection() as conn:
             self._seed_test_endpoint(conn, agent_id)
@@ -2786,7 +2845,7 @@ class TestEpochGovernance(unittest.TestCase):
 
     # Test 7: Existing transition cannot be overwritten using same transition ID (409)
     def test_wp1e4s_7_existing_transition_cannot_be_overwritten(self):
-        agent_id = "AGT-WIN-1E4S-07"
+        agent_id = "AGT-WIN-01"
         now_iso = datetime.now(timezone.utc).isoformat()
         with get_db_connection() as conn:
             self._seed_test_endpoint(conn, agent_id)
@@ -2834,7 +2893,7 @@ class TestEpochGovernance(unittest.TestCase):
 
     # Test 8: Same transition ID with identical canonical payload is idempotent duplicate (200)
     def test_wp1e4s_8_same_id_same_payload_is_idempotent(self):
-        agent_id = "AGT-WIN-1E4S-08"
+        agent_id = "AGT-WIN-01"
         now_iso = datetime.now(timezone.utc).isoformat()
         with get_db_connection() as conn:
             self._seed_test_endpoint(conn, agent_id)
@@ -2865,7 +2924,7 @@ class TestEpochGovernance(unittest.TestCase):
 
     # Test 9: Same ID with different payload creates durable conflict
     def test_wp1e4s_9_same_id_different_payload_creates_durable_conflict(self):
-        agent_id = "AGT-WIN-1E4S-09"
+        agent_id = "AGT-WIN-01"
         now_iso = datetime.now(timezone.utc).isoformat()
         with get_db_connection() as conn:
             self._seed_test_endpoint(conn, agent_id)
@@ -3299,9 +3358,12 @@ class TestEpochGovernance(unittest.TestCase):
             "timestamp": "2026-11-19T12:00:00Z",
             "agent_id": agent_id,
             "hostname": "TEST-HOST",
+            "os": "Windows",
+            "source_event_id": "src-ch-001",
             "confidence": 0.9,
             "severity": "medium",
             "detection_type": "generic_rule",
+            "detector_name": "TestDetector",
             "evidence": {}  # No channel, no log_name, no source_manifest
         }
 
@@ -3359,7 +3421,7 @@ class TestEpochGovernance(unittest.TestCase):
         Once future-epoch gap is detected, freeze agent/channel (status='EPOCH_GAP_QUARANTINED').
         Subsequent events CANNOT become ACTIVE_VERIFIED until resolved via Path A or Path B.
         """
-        agent_id = f"AGT-GAP-FREEZE-{uuid.uuid4().hex[:6]}"
+        agent_id = "AGT-WIN-01"
         ch = "Security"
 
         # Initialize channel at Epoch 1 with an active event
@@ -3536,6 +3598,438 @@ class TestEpochGovernance(unittest.TestCase):
                 os.environ["SOC_API_TOKEN"] = orig_endpoint
             else:
                 os.environ.pop("SOC_API_TOKEN", None)
+
+    def test_transition_endpoint_identity_binding_and_cross_agent_rejection(self):
+        """
+        Task 3: Transition endpoint identity binding:
+        - When per-agent tokens are configured, legitimate transition succeeds.
+        - Mismatched agent_id / attempt by one endpoint to advance another endpoint's epoch is rejected (403).
+        - Shared endpoint token without per-agent binding is rejected (403).
+        - Invalid agent credentials rejected (401).
+        - Preserves separate administrator recovery path (200).
+        """
+        orig_agent_tokens = os.environ.get("SOC_AGENT_API_TOKENS")
+        orig_admin = os.environ.get("SOC_ADMIN_API_TOKEN")
+        orig_endpoint = os.environ.get("SOC_API_TOKEN")
+
+        try:
+            # Configure per-agent credentials for AGT-WIN-01 and AGT-WIN-02
+            os.environ["SOC_AGENT_API_TOKENS"] = json.dumps({
+                "AGT-WIN-01": "token-agent-01-secret",
+                "AGT-WIN-02": "token-agent-02-secret"
+            })
+            os.environ["SOC_API_TOKEN"] = "dev-shared-endpoint-token"
+            os.environ["SOC_ADMIN_API_TOKEN"] = "dev-admin-secret-token"
+
+            # 1. Legitimate transition: AGT-WIN-01 advances its own epoch 1 -> 2
+            t_legit = {
+                "transition_id": f"t-legit-{uuid.uuid4()}",
+                "agent_id": "AGT-WIN-01",
+                "source_channel": "Security",
+                "target_epoch": 2
+            }
+            res_legit = self.client.post(
+                "/api/v1/events/transition",
+                json_data=t_legit,
+                headers={"Authorization": "Bearer token-agent-01-secret"}
+            )
+            self.assertEqual(res_legit.status_code, 200)
+            self.assertEqual(res_legit.json()["status"], "APPLIED")
+            self.assertEqual(res_legit.json()["active_epoch"], 2)
+
+            # 2. Cross-agent attempt: AGT-WIN-01 attempts to advance AGT-WIN-02's epoch
+            t_spoof = {
+                "transition_id": f"t-spoof-{uuid.uuid4()}",
+                "agent_id": "AGT-WIN-02",
+                "source_channel": "Security",
+                "target_epoch": 2
+            }
+            res_spoof = self.client.post(
+                "/api/v1/events/transition",
+                json_data=t_spoof,
+                headers={"Authorization": "Bearer token-agent-01-secret"}
+            )
+            self.assertEqual(res_spoof.status_code, 403)
+            self.assertIn("does not match transition agent", res_spoof.json()["detail"])
+
+            # 3. Attempt using generic shared endpoint token when per-agent credentials configured
+            t_shared = {
+                "transition_id": f"t-shared-{uuid.uuid4()}",
+                "agent_id": "AGT-WIN-02",
+                "source_channel": "Security",
+                "target_epoch": 2
+            }
+            res_shared = self.client.post(
+                "/api/v1/events/transition",
+                json_data=t_shared,
+                headers={"Authorization": "Bearer dev-shared-endpoint-token"}
+            )
+            self.assertEqual(res_shared.status_code, 403)
+            self.assertIn("Shared endpoint token cannot be treated as proof of agent identity", res_shared.json()["detail"])
+
+            # 4. Attempt with completely invalid token
+            res_invalid = self.client.post(
+                "/api/v1/events/transition",
+                json_data=t_legit,
+                headers={"Authorization": "Bearer unknown-bogus-token"}
+            )
+            self.assertEqual(res_invalid.status_code, 401)
+
+            # 5. Admin recovery path is preserved and separate
+            with get_db_connection() as conn:
+                self._seed_test_endpoint(conn, "AGT-WIN-02")
+                now_iso = datetime.now(timezone.utc).isoformat()
+                conn.execute("""
+                    INSERT OR REPLACE INTO agent_channel_epochs (agent_id, channel, current_epoch, status, updated_at)
+                    VALUES ('AGT-WIN-02', 'Security', 1, 'EPOCH_GAP_QUARANTINED', ?)
+                """, (now_iso,))
+                conn.commit()
+
+            res_admin_rec = self.client.post(
+                "/api/v1/agents/AGT-WIN-02/channels/Security/resolve_gap",
+                json_data={"target_epoch": 5, "resolution_reason": "Admin recovery verified"},
+                headers={"Authorization": "Bearer dev-admin-secret-token"}
+            )
+            self.assertEqual(res_admin_rec.status_code, 200)
+            self.assertEqual(res_admin_rec.json()["status"], "RESOLVED")
+
+        finally:
+            if orig_agent_tokens is not None:
+                os.environ["SOC_AGENT_API_TOKENS"] = orig_agent_tokens
+            else:
+                os.environ.pop("SOC_AGENT_API_TOKENS", None)
+            if orig_admin is not None:
+                os.environ["SOC_ADMIN_API_TOKEN"] = orig_admin
+            else:
+                os.environ.pop("SOC_ADMIN_API_TOKEN", None)
+            if orig_endpoint is not None:
+                os.environ["SOC_API_TOKEN"] = orig_endpoint
+            else:
+                os.environ.pop("SOC_API_TOKEN", None)
+
+    # -------------------------------------------------------------
+    # REGRESSION SUITE: WP-1E STRICT ENDPOINT IDENTITY AUTHENTICATION (PROOFS A - H)
+    # -------------------------------------------------------------
+
+    def test_wp1e_proof_a_valid_per_agent_credential_advances_own_epoch(self):
+        """
+        Proof A: Valid per-agent credential for AGENT-A can advance AGENT-A.
+        """
+        os.environ["SOC_AGENT_API_TOKENS"] = json.dumps({
+            "AGENT-A": "token-agent-a-valid",
+            "AGENT-B": "token-agent-b-valid"
+        })
+        t = {
+            "transition_id": f"t-proof-a-{uuid.uuid4()}",
+            "agent_id": "AGENT-A",
+            "source_channel": "Security",
+            "target_epoch": 2,
+            "transition_type": "EPOCH_ADVANCE"
+        }
+        res = self.client.post(
+            "/api/v1/events/transition",
+            json_data=t,
+            headers={"Authorization": "Bearer token-agent-a-valid"}
+        )
+        self.assertEqual(res.status_code, 200)
+        self.assertEqual(res.json()["status"], "APPLIED")
+        self.assertEqual(res.json()["active_epoch"], 2)
+        self.assertEqual(res.json()["agent_id"], "AGENT-A")
+
+    def test_wp1e_proof_b_agent_a_cannot_advance_agent_b_using_own_credential(self):
+        """
+        Proof B: AGENT-A cannot advance AGENT-B using its own credential.
+        """
+        os.environ["SOC_AGENT_API_TOKENS"] = json.dumps({
+            "AGENT-A": "token-agent-a-valid",
+            "AGENT-B": "token-agent-b-valid"
+        })
+        t = {
+            "transition_id": f"t-proof-b-{uuid.uuid4()}",
+            "agent_id": "AGENT-B",
+            "source_channel": "Security",
+            "target_epoch": 2,
+            "transition_type": "EPOCH_ADVANCE"
+        }
+        res = self.client.post(
+            "/api/v1/events/transition",
+            json_data=t,
+            headers={"Authorization": "Bearer token-agent-a-valid"}
+        )
+        self.assertEqual(res.status_code, 403)
+        self.assertIn("Authenticated endpoint identity 'AGENT-A' does not match transition agent 'AGENT-B'", res.json()["detail"])
+
+    def test_wp1e_proof_c_shared_token_cannot_establish_identity_when_mapping_absent(self):
+        """
+        Proof C: A shared SOC_API_TOKEN cannot establish AGENT-A identity when SOC_AGENT_API_TOKENS is absent.
+        """
+        os.environ.pop("SOC_AGENT_API_TOKENS", None)
+        os.environ["SOC_API_TOKEN"] = "dev-shared-endpoint-token"
+        t = {
+            "transition_id": f"t-proof-c-{uuid.uuid4()}",
+            "agent_id": "AGENT-A",
+            "source_channel": "Security",
+            "target_epoch": 2,
+            "transition_type": "EPOCH_ADVANCE"
+        }
+        res = self.client.post(
+            "/api/v1/events/transition",
+            json_data=t,
+            headers={"Authorization": "Bearer dev-shared-endpoint-token"}
+        )
+        self.assertEqual(res.status_code, 503)
+        self.assertIn("Per-agent credential mapping (SOC_AGENT_API_TOKENS) is not configured", res.json()["detail"])
+
+    def test_wp1e_proof_d_caller_cannot_bypass_auth_by_supplying_body_agent_id(self):
+        """
+        Proof D: A caller cannot bypass authentication by supplying agent_id in the request body.
+        """
+        os.environ["SOC_AGENT_API_TOKENS"] = json.dumps({
+            "AGENT-A": "token-agent-a-secret",
+            "AGENT-B": "token-agent-b-secret"
+        })
+        t = {
+            "transition_id": f"t-proof-d-{uuid.uuid4()}",
+            "agent_id": "AGENT-A",
+            "source_channel": "Security",
+            "target_epoch": 2,
+            "transition_type": "EPOCH_ADVANCE",
+            "authorized_by": "SOC_ADMIN",
+            "status": "APPROVED"
+        }
+        # Subcase 1: No auth header
+        res_no_auth = self.client.post("/api/v1/events/transition", json_data=t, headers={})
+        self.assertEqual(res_no_auth.status_code, 401)
+
+        # Subcase 2: Invalid bearer token
+        res_invalid = self.client.post(
+            "/api/v1/events/transition",
+            json_data=t,
+            headers={"Authorization": "Bearer bogus-bearer-token"}
+        )
+        self.assertEqual(res_invalid.status_code, 401)
+
+        # Subcase 3: Wrong agent's token (AGENT-B attempting to impersonate AGENT-A)
+        res_impersonate = self.client.post(
+            "/api/v1/events/transition",
+            json_data=t,
+            headers={"Authorization": "Bearer token-agent-b-secret"}
+        )
+        self.assertEqual(res_impersonate.status_code, 403)
+
+        # Subcase 4: Shared token attempt
+        os.environ["SOC_API_TOKEN"] = "dev-shared-endpoint-token"
+        res_shared = self.client.post(
+            "/api/v1/events/transition",
+            json_data=t,
+            headers={"Authorization": "Bearer dev-shared-endpoint-token"}
+        )
+        self.assertEqual(res_shared.status_code, 403)
+
+    def test_wp1e_proof_e_unknown_per_agent_token_rejected(self):
+        """
+        Proof E: An unknown per-agent token is rejected.
+        """
+        os.environ["SOC_AGENT_API_TOKENS"] = json.dumps({
+            "AGENT-A": "token-agent-a-secret"
+        })
+        t = {
+            "transition_id": f"t-proof-e-{uuid.uuid4()}",
+            "agent_id": "AGENT-A",
+            "source_channel": "Security",
+            "target_epoch": 2,
+            "transition_type": "EPOCH_ADVANCE"
+        }
+        res = self.client.post(
+            "/api/v1/events/transition",
+            json_data=t,
+            headers={"Authorization": "Bearer unmapped-unknown-token-xyz"}
+        )
+        self.assertEqual(res.status_code, 401)
+        self.assertIn("Invalid or unmapped agent credentials", res.json()["detail"])
+
+    def test_wp1e_proof_f_missing_or_malformed_per_agent_config_fails_closed(self):
+        """
+        Proof F: Missing or malformed per-agent credential configuration fails closed.
+        """
+        t = {
+            "transition_id": f"t-proof-f-{uuid.uuid4()}",
+            "agent_id": "AGENT-A",
+            "source_channel": "Security",
+            "target_epoch": 2,
+            "transition_type": "EPOCH_ADVANCE"
+        }
+        # 1. Missing from env
+        os.environ.pop("SOC_AGENT_API_TOKENS", None)
+        res1 = self.client.post(
+            "/api/v1/events/transition",
+            json_data=t,
+            headers={"Authorization": "Bearer some-token"}
+        )
+        self.assertEqual(res1.status_code, 503)
+        self.assertIn("Per-agent credential mapping (SOC_AGENT_API_TOKENS) is not configured", res1.json()["detail"])
+
+        # 2. Empty string
+        os.environ["SOC_AGENT_API_TOKENS"] = "   "
+        res2 = self.client.post(
+            "/api/v1/events/transition",
+            json_data=t,
+            headers={"Authorization": "Bearer some-token"}
+        )
+        self.assertEqual(res2.status_code, 503)
+        self.assertIn("Per-agent credential mapping (SOC_AGENT_API_TOKENS) is not configured", res2.json()["detail"])
+
+        # 3. Malformed JSON
+        os.environ["SOC_AGENT_API_TOKENS"] = "invalid-json-content{"
+        res3 = self.client.post(
+            "/api/v1/events/transition",
+            json_data=t,
+            headers={"Authorization": "Bearer some-token"}
+        )
+        self.assertEqual(res3.status_code, 503)
+        self.assertIn("Per-agent credential mapping (SOC_AGENT_API_TOKENS) is malformed", res3.json()["detail"])
+
+        # 4. JSON is not an object / dict
+        os.environ["SOC_AGENT_API_TOKENS"] = json.dumps(["AGENT-A", "token"])
+        res4 = self.client.post(
+            "/api/v1/events/transition",
+            json_data=t,
+            headers={"Authorization": "Bearer some-token"}
+        )
+        self.assertEqual(res4.status_code, 503)
+        self.assertIn("Per-agent credential mapping (SOC_AGENT_API_TOKENS) is malformed", res4.json()["detail"])
+
+    def test_wp1e_proof_g_valid_administrator_recovery_functional_endpoint_tokens_rejected(self):
+        """
+        Proof G: Valid administrator recovery remains functional; endpoint credentials rejected from recovery.
+        """
+        os.environ["SOC_ADMIN_API_TOKEN"] = "dev-admin-secret-token"
+        os.environ["SOC_API_TOKEN"] = "dev-shared-endpoint-token"
+        os.environ["SOC_AGENT_API_TOKENS"] = json.dumps({
+            "AGENT-A": "token-agent-a-secret"
+        })
+
+        t_rec = {
+            "transition_id": f"t-rec-admin-{uuid.uuid4()}",
+            "agent_id": "AGENT-A",
+            "source_channel": "Security",
+            "target_epoch": 2,
+            "transition_type": "ADMINISTRATIVE_GAP_RESOLUTION",
+            "recovery_request_id": "rec-req-admin-001"
+        }
+
+        # 1. Endpoint per-agent token attempted on administrative recovery -> 403 Forbidden
+        res_ep_attempt = self.client.post(
+            "/api/v1/events/transition",
+            json_data=t_rec,
+            headers={"Authorization": "Bearer token-agent-a-secret"}
+        )
+        self.assertEqual(res_ep_attempt.status_code, 403)
+        self.assertIn("Endpoint credentials cannot perform administrative operations", res_ep_attempt.json()["detail"])
+
+        # 2. Shared endpoint token attempted on administrative recovery -> 403 Forbidden
+        res_shared_attempt = self.client.post(
+            "/api/v1/events/transition",
+            json_data=t_rec,
+            headers={"Authorization": "Bearer dev-shared-endpoint-token"}
+        )
+        self.assertEqual(res_shared_attempt.status_code, 403)
+        self.assertIn("Endpoint credentials cannot perform administrative operations", res_shared_attempt.json()["detail"])
+
+        # 3. Valid admin token on administrative recovery -> 200 APPLIED
+        res_admin = self.client.post(
+            "/api/v1/events/transition",
+            json_data=t_rec,
+            headers={"Authorization": "Bearer dev-admin-secret-token"}
+        )
+        self.assertEqual(res_admin.status_code, 200)
+        self.assertEqual(res_admin.json()["status"], "APPLIED")
+        self.assertEqual(res_admin.json()["active_epoch"], 2)
+
+        # 4. Valid admin token on gap resolution -> 200 RESOLVED
+        res_resolve = self.client.post(
+            "/api/v1/agents/AGENT-A/channels/Security/resolve_gap",
+            json_data={"target_epoch": 5, "resolution_reason": "Admin recovery test"},
+            headers={"Authorization": "Bearer dev-admin-secret-token"}
+        )
+        self.assertEqual(res_resolve.status_code, 200)
+        self.assertEqual(res_resolve.json()["status"], "RESOLVED")
+        self.assertEqual(res_resolve.json()["active_epoch"], 5)
+
+    def test_wp1e_proof_h_failed_authentication_does_not_modify_epoch_state_or_write_transitions(self):
+        """
+        Proof H: Failed authentication does not modify epoch state or insert transition records.
+        """
+        os.environ["SOC_ADMIN_API_TOKEN"] = "dev-admin-secret-token"
+        os.environ["SOC_API_TOKEN"] = "dev-shared-endpoint-token"
+        os.environ["SOC_AGENT_API_TOKENS"] = json.dumps({
+            "AGENT-A": "token-agent-a-secret",
+            "AGENT-B": "token-agent-b-secret"
+        })
+
+        # Seed initial epoch state for AGENT-A
+        with get_db_connection() as conn:
+            conn.execute("""
+                INSERT INTO agent_channel_epochs (agent_id, channel, current_epoch, status, updated_at)
+                VALUES ('AGENT-A', 'Security', 1, 'ACTIVE', CURRENT_TIMESTAMP)
+            """)
+            conn.commit()
+
+        # Attempt 1: Shared endpoint token
+        t1 = {
+            "transition_id": f"t-fail-1-{uuid.uuid4()}",
+            "agent_id": "AGENT-A",
+            "source_channel": "Security",
+            "target_epoch": 2,
+            "transition_type": "EPOCH_ADVANCE"
+        }
+        res1 = self.client.post(
+            "/api/v1/events/transition",
+            json_data=t1,
+            headers={"Authorization": "Bearer dev-shared-endpoint-token"}
+        )
+        self.assertEqual(res1.status_code, 403)
+
+        # Attempt 2: Cross-agent spoofing (AGENT-B attempting to advance AGENT-A)
+        t2 = {
+            "transition_id": f"t-fail-2-{uuid.uuid4()}",
+            "agent_id": "AGENT-A",
+            "source_channel": "Security",
+            "target_epoch": 2,
+            "transition_type": "EPOCH_ADVANCE"
+        }
+        res2 = self.client.post(
+            "/api/v1/events/transition",
+            json_data=t2,
+            headers={"Authorization": "Bearer token-agent-b-secret"}
+        )
+        self.assertEqual(res2.status_code, 403)
+
+        # Attempt 3: Unknown token
+        res3 = self.client.post(
+            "/api/v1/events/transition",
+            json_data=t1,
+            headers={"Authorization": "Bearer totally-unknown-token"}
+        )
+        self.assertEqual(res3.status_code, 401)
+
+        # Attempt 4: No authorization
+        res4 = self.client.post("/api/v1/events/transition", json_data=t1, headers={})
+        self.assertEqual(res4.status_code, 401)
+
+        # Verify database state was NEVER mutated
+        with get_db_connection() as conn:
+            # Epoch remains strictly 1 and ACTIVE
+            row = conn.execute(
+                "SELECT current_epoch, status FROM agent_channel_epochs WHERE agent_id = 'AGENT-A' AND channel = 'Security'"
+            ).fetchone()
+            self.assertIsNotNone(row)
+            self.assertEqual(row["current_epoch"], 1)
+            self.assertEqual(row["status"], "ACTIVE")
+
+            # Zero transition records written
+            t_count = conn.execute("SELECT COUNT(*) as cnt FROM channel_transitions").fetchone()["cnt"]
+            self.assertEqual(t_count, 0)
 
 
 if __name__ == "__main__":

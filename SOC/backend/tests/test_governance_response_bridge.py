@@ -2,6 +2,7 @@ import os
 os.environ["DISABLE_STARTUP_WORKERS"] = "1"
 
 import unittest
+from unittest.mock import patch
 import json
 import sqlite3
 import uuid
@@ -181,6 +182,176 @@ class TestGovernanceResponseBridge(unittest.TestCase):
             params = json.loads(block_row["parameters"])
             self.assertEqual(params["ip"], "192.168.1.100")
             self.assertEqual(params["incident_id"], self.incident_id)
+
+    def test_phase5_action_lease_suppresses_duplicate_physical_actions(self):
+        """
+        WP-1E Phase 5: Verify that action lease enforcement suppresses duplicate physical mitigations
+        (e.g., BLOCK_SOURCE, ISOLATE_HOST) for the same agent, incident, and action type, while allowing
+        different action types or responses for different incidents.
+        """
+        with get_db_connection() as conn:
+            recommendations = [
+                {"type": "BLOCK_SOURCE", "reason": "Brute-force source IP identified"}
+            ]
+
+            # 1. First dispatch creates the command and records an action lease
+            dispatched_1 = dispatch_governed_response(
+                conn,
+                self.incident_id,
+                recommendations,
+                approved_by="UNIT_TEST_RUNNER"
+            )
+            self.assertEqual(len(dispatched_1), 1)
+            self.assertEqual(dispatched_1[0]["command_type"], "BLOCK_SOURCE")
+
+            # Verify action lease was recorded
+            lease_row = conn.execute(
+                "SELECT * FROM action_leases WHERE agent_id = ? AND incident_id = ? AND action_type = 'BLOCK_SOURCE'",
+                (self.agent_id, self.incident_id)
+            ).fetchone()
+            self.assertIsNotNone(lease_row)
+            self.assertEqual(lease_row["command_id"], dispatched_1[0]["command_id"])
+
+            # 2. Second dispatch for the SAME incident and SAME action is suppressed by the active lease
+            dispatched_2 = dispatch_governed_response(
+                conn,
+                self.incident_id,
+                recommendations,
+                approved_by="UNIT_TEST_RUNNER"
+            )
+            self.assertEqual(len(dispatched_2), 0)
+
+            # 3. Dispatching a DIFFERENT action (KILL_PROCESS) on the same incident succeeds
+            rec_different_action = [
+                {"type": "KILL_PROCESS", "reason": "Malicious process detected"}
+            ]
+            dispatched_3 = dispatch_governed_response(
+                conn,
+                self.incident_id,
+                rec_different_action,
+                approved_by="UNIT_TEST_RUNNER"
+            )
+            self.assertEqual(len(dispatched_3), 1)
+            self.assertEqual(dispatched_3[0]["command_type"], "KILL_PROCESS")
+
+            # Verify action lease for KILL_PROCESS is also recorded
+            lease_row_2 = conn.execute(
+                "SELECT * FROM action_leases WHERE agent_id = ? AND incident_id = ? AND action_type = 'KILL_PROCESS'",
+                (self.agent_id, self.incident_id)
+            ).fetchone()
+            self.assertIsNotNone(lease_row_2)
+
+    def test_phase5_concurrent_duplicate_action_dispatch_creates_single_command(self):
+        """
+        WP-1E Phase 5: Verify that two concurrent dispatch invocations for the same
+        (agent_id, incident_id, action_type) produce exactly one command and one lease.
+        """
+        import threading
+        recommendations = [
+            {"type": "BLOCK_SOURCE", "reason": "Concurrent brute-force mitigation"}
+        ]
+
+        dispatched_results = []
+        errors = []
+
+        def dispatch_task():
+            try:
+                with get_db_connection() as conn:
+                    res = dispatch_governed_response(
+                        conn,
+                        self.incident_id,
+                        recommendations,
+                        approved_by="UNIT_TEST_RUNNER"
+                    )
+                    dispatched_results.append(res)
+            except Exception as e:
+                errors.append(e)
+
+        t1 = threading.Thread(target=dispatch_task)
+        t2 = threading.Thread(target=dispatch_task)
+        t1.start()
+        t2.start()
+        t1.join()
+        t2.join()
+
+        self.assertEqual(len(errors), 0, f"Concurrent dispatch tasks raised errors: {errors}")
+
+        with get_db_connection() as conn:
+            # Verify only 1 command created in endpoint_commands
+            cursor = conn.execute("SELECT * FROM endpoint_commands WHERE agent_id = ? AND command_type = 'BLOCK_SOURCE'", (self.agent_id,))
+            cmds = cursor.fetchall()
+            self.assertEqual(len(cmds), 1, f"Expected 1 command, found {len(cmds)}")
+
+            # Verify only 1 lease recorded in action_leases
+            cursor = conn.execute("SELECT * FROM action_leases WHERE agent_id = ? AND incident_id = ? AND action_type = 'BLOCK_SOURCE'", (self.agent_id, self.incident_id))
+            leases = cursor.fetchall()
+            self.assertEqual(len(leases), 1, f"Expected 1 lease, found {len(leases)}")
+
+    def test_phase5_new_incident_permits_new_action_lease(self):
+        """
+        WP-1E Phase 5: A different incident ID can receive a new action lease for the same agent/action.
+        """
+        with get_db_connection() as conn:
+            # 1. Dispatch for first incident
+            recs = [{"type": "ISOLATE_HOST", "reason": "Incident 1 containment"}]
+            d1 = dispatch_governed_response(conn, self.incident_id, recs, approved_by="UNIT_TEST_RUNNER")
+            self.assertEqual(len(d1), 1)
+
+            # 2. Setup second eligible incident
+            inc2_id = str(uuid.uuid4())
+            now_iso = datetime.now(timezone.utc).isoformat()
+            conn.execute("""
+                INSERT INTO incidents (incident_id, created_at, updated_at, first_seen, last_seen, max_severity, status)
+                VALUES (?, ?, ?, ?, ?, 'HIGH', 'OPEN')
+            """, (inc2_id, now_iso, now_iso, now_iso, now_iso))
+
+            # Link eligible evidence
+            ev2_id = "ev_inc2_test"
+            ev2_data = {
+                "detection_event_id": ev2_id,
+                "timestamp": now_iso,
+                "agent_id": self.agent_id,
+                "hostname": "WORKSTATION-01",
+                "os": "Windows",
+                "source_event_id": "src-inc2-test",
+                "detection_type": "rule",
+                "confidence": 1.0,
+                "severity": "HIGH",
+                "detector_name": "det",
+                "evidence": {}
+            }
+            conn.execute("INSERT INTO events (detection_event_id, data, quarantine_status, channel, channel_epoch, agent_id) VALUES (?, ?, 'ACTIVE_VERIFIED', 'Security', 1, ?)", (ev2_id, json.dumps(ev2_data), self.agent_id))
+            conn.execute("INSERT INTO incident_evidence (incident_id, detection_event_id) VALUES (?, ?)", (inc2_id, ev2_id))
+            conn.execute("INSERT INTO incident_entities (incident_id, entity_type, entity_value) VALUES (?, 'agent_id', ?)", (inc2_id, self.agent_id))
+            conn.commit()
+
+            # 3. Dispatch for second incident succeeds
+            d2 = dispatch_governed_response(conn, inc2_id, recs, approved_by="UNIT_TEST_RUNNER")
+            self.assertEqual(len(d2), 1)
+            self.assertEqual(d2[0]["command_type"], "ISOLATE_HOST")
+
+            # Verify two distinct leases exist in action_leases for these two incidents
+            leases = conn.execute("SELECT * FROM action_leases WHERE incident_id IN (?, ?) AND action_type = 'ISOLATE_HOST'", (self.incident_id, inc2_id)).fetchall()
+            self.assertEqual(len(leases), 2)
+
+    def test_phase5_transaction_rollback_leaves_no_partial_command_or_lease(self):
+        """
+        WP-1E Phase 5: An exception during dispatch triggers transaction rollback, leaving neither command nor lease.
+        """
+        with get_db_connection() as conn:
+            recs = [{"type": "KILL_PROCESS", "reason": "Process kill rollback test"}]
+            initial_cmds = len(conn.execute("SELECT * FROM endpoint_commands").fetchall())
+            initial_leases = len(conn.execute("SELECT * FROM action_leases").fetchall())
+
+            with patch("app.response_bridge.build_endpoint_command_params", side_effect=RuntimeError("Simulated error")):
+                with self.assertRaises(RuntimeError):
+                    dispatch_governed_response(conn, self.incident_id, recs, approved_by="UNIT_TEST_RUNNER")
+
+            # Verify neither new command nor new lease was committed
+            current_cmds = len(conn.execute("SELECT * FROM endpoint_commands").fetchall())
+            self.assertEqual(current_cmds, initial_cmds)
+            current_leases = len(conn.execute("SELECT * FROM action_leases").fetchall())
+            self.assertEqual(current_leases, initial_leases)
 
     def test_api_governance_approve_and_reject_flow(self):
         dec_id = str(uuid.uuid4())
