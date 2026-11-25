@@ -1,3 +1,4 @@
+import os
 import logging
 import time
 import dataclasses
@@ -40,18 +41,30 @@ class WindowsDetectionPipeline:
     Supports multichannel collection across Windows Security, System, and Sysmon operational logs
     with fair round-robin scheduling, channel-level failure isolation, and graceful recovery.
     """
-    def __init__(self, logger: logging.Logger, execution_mode: Optional[str] = None):
+    def __init__(self, logger: logging.Logger, execution_mode: Optional[str] = None, detector_version: Optional[str] = None):
         self.logger = logger
-        self.execution_mode = (execution_mode or getattr(config, "execution_mode", "PRODUCTION")).upper().strip()
+        self.execution_mode = (execution_mode or os.getenv("EXECUTION_MODE") or getattr(config, "execution_mode", "PRODUCTION")).upper().strip()
         self.identity = AgentIdentity(config.data_dir)
         self.normalizer = WindowsEventNormalizer(self.identity, logger)
-        self.engine = DetectionEngine(logger, detector_version=getattr(config, "detector_version", "1.1.0"))
+        det_ver = detector_version or os.getenv("WINDOWS_DETECTOR_VERSION") or getattr(config, "detector_version", "1.1.0")
+        self.engine = DetectionEngine(logger, detector_version=det_ver)
+
+        # Explicit Production Compatibility Policy (Task 1)
+        if self.execution_mode == "PRODUCTION" and self.engine.detector_version != "1.1.0":
+            raise ValueError(
+                f"Production pipeline requires detector version 1.1.0 or higher compatible SemVer; "
+                f"historical version {self.engine.detector_version} is incompatible with Phase 2.1 payload schema."
+            )
+
         writer_filename = "detections_eval.jsonl" if self.execution_mode == "EVALUATION" else "detections.jsonl"
         self.writer = DetectionEventWriter(config.detection_output_dir, logger, filename=writer_filename)
         
         # Primary Security Collector (retains self.collector for backward compatibility)
         self.collector = WindowsEventCollector(
-            logger, log_name=config.windows_security_log_name, agent_id=self.identity.agent_id
+            logger,
+            log_name=config.windows_security_log_name,
+            agent_id=self.identity.agent_id,
+            execution_mode=self.execution_mode,
         )
         self.security_collector = self.collector
 
@@ -59,14 +72,20 @@ class WindowsDetectionPipeline:
         self.system_collector = None
         if config.enable_system_collection:
             self.system_collector = WindowsEventCollector(
-                logger, log_name=config.windows_system_log_name, agent_id=self.identity.agent_id
+                logger,
+                log_name=config.windows_system_log_name,
+                agent_id=self.identity.agent_id,
+                execution_mode=self.execution_mode,
             )
 
         # Multichannel Sysmon Collector
         self.sysmon_collector = None
         if config.enable_sysmon_collection:
             self.sysmon_collector = WindowsEventCollector(
-                logger, log_name=config.windows_sysmon_log_name, agent_id=self.identity.agent_id
+                logger,
+                log_name=config.windows_sysmon_log_name,
+                agent_id=self.identity.agent_id,
+                execution_mode=self.execution_mode,
             )
 
         # Per-channel fair schedule states (Phase 2.2)
@@ -250,8 +269,10 @@ class WindowsDetectionPipeline:
                 f"Channel {channel_name} failure recorded ({error}); retry backoff active for {backoff_duration:.1f}s."
             )
 
-    def _record_channel_success(self, channel_name: str):
+    def _record_channel_success(self, channel_name: str, is_simulated: bool = False):
         """Resets consecutive failures and lifts backoff after successful channel collection."""
+        if is_simulated:
+            return
         sched = self.schedules.get(channel_name)
         if sched:
             sched.consecutive_failures = 0
@@ -285,9 +306,12 @@ class WindowsDetectionPipeline:
             self._record_channel_failure(channel_name, str(e))
             return
 
-        self._record_channel_success(channel_name)
         if not raw_events:
+            self._record_channel_success(channel_name, is_simulated=False)
             return
+
+        is_sim_batch = any(ev.get("is_simulated") for ev in raw_events)
+        self._record_channel_success(channel_name, is_simulated=is_sim_batch)
 
         last_successful_record_id = -1
         current_epoch = getattr(collector, "current_epoch", None)

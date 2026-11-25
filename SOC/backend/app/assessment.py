@@ -30,12 +30,12 @@ class AssessmentEngine:
             raise ValueError(f"Incident {incident_id} not found.")
         max_severity = inc_row["max_severity"]
         
-        # 2. Fetch event stats for Trust
+        # 2. Fetch event stats for Trust (exclude historical re-evaluations to ensure score invariance)
         cursor = conn.execute("""
             SELECT e.data
             FROM events e
             JOIN incident_evidence ie ON e.detection_event_id = ie.detection_event_id
-            WHERE ie.incident_id = ?
+            WHERE ie.incident_id = ? AND (ie.classification IS NULL OR ie.classification = 'PRIMARY_DETECTION')
         """, (incident_id,))
         event_rows = cursor.fetchall()
         event_count = len(event_rows)

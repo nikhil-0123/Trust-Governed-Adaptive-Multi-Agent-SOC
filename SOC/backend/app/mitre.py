@@ -17,6 +17,7 @@ class MitreEngine:
         self.catalog_path = catalog_path
         self.mitre_version = ""
         self.rules_by_type: Dict[str, Dict[str, Any]] = {}
+        self.rules_by_tech: Dict[str, Dict[str, Any]] = {}
         self._load_and_validate_catalog()
 
     def _load_and_validate_catalog(self):
@@ -67,6 +68,7 @@ class MitreEngine:
                 # The requirement says "detection_type -> exactly one technique".
                 
             self.rules_by_type[det_type] = rule
+            self.rules_by_tech[tech_id] = rule
 
     def process_event(self, conn, detection_event_id: str) -> str:
         # 1. Fetch detection type from events
@@ -78,14 +80,42 @@ class MitreEngine:
         try:
             event_data = json.loads(row["data"])
             det_type = event_data.get("detection_type")
+            evidence = event_data.get("evidence") or {}
         except Exception as e:
             raise ValueError(f"Failed to parse event data: {e}")
 
-        # 2. Check catalog
-        if not det_type or det_type not in self.rules_by_type:
+        # 2. Check catalog: validate explicit mitre_technique_id override against base detection_type
+        default_rule = self.rules_by_type.get(det_type) if det_type else None
+        tech_id_override = evidence.get("mitre_technique_id") if isinstance(evidence, dict) else None
+        rule = None
+
+        if tech_id_override and isinstance(tech_id_override, str):
+            candidate_rule = self.rules_by_tech.get(tech_id_override)
+            if candidate_rule:
+                if default_rule:
+                    # Validate tactic consistency between technique override and detection_type
+                    if candidate_rule["tactic"] == default_rule["tactic"]:
+                        rule = candidate_rule
+                    else:
+                        logger.warning(
+                            f"Technique override '{tech_id_override}' (tactic: {candidate_rule['tactic']}) "
+                            f"is incompatible with detection_type '{det_type}' (tactic: {default_rule['tactic']}). "
+                            f"Falling back to catalog default rule '{default_rule['mapping_rule_id']}'."
+                        )
+                        rule = default_rule
+                else:
+                    rule = candidate_rule
+            else:
+                logger.warning(
+                    f"Unknown technique_id override '{tech_id_override}' for detection_type '{det_type}'. "
+                    f"Falling back to catalog default."
+                )
+                rule = default_rule
+        else:
+            rule = default_rule
+
+        if not rule:
             return "UNMAPPED"
-            
-        rule = self.rules_by_type[det_type]
         
         # 3. Find incident_id
         cursor = conn.execute("SELECT incident_id FROM incident_evidence WHERE detection_event_id = ?", (detection_event_id,))

@@ -138,6 +138,26 @@ class TestShannonEntropyAndDNSFeatures(unittest.TestCase):
         self.assertTrue(res["dns_query_length"] > 0)
         self.assertTrue(res["dns_query_entropy"] > 0.0)
 
+    def test_dns_live_sysmon_event22_query_deterministic_features(self):
+        # Actual live Sysmon Event 22 query observed on host (Record ID 142362)
+        live_query = "8.9.f.f.b.6.f.e.2.7.0.0.e.9.2.f.b.d.2.7.5.e.a.9.0.0.7.4.6.0.6.2.ip6.arpa."
+        res = extract_dns_features(live_query)
+        self.assertEqual(res["dns_query_length"], 72)
+        self.assertEqual(res["dns_label_count"], 34)
+        self.assertEqual(res["dns_max_label_length"], 4)
+        self.assertEqual(res["dns_query_entropy"], 3.0436)
+        self.assertEqual(res["dns_max_label_entropy"], 1.585)
+
+    def test_dns_reconstructed_21_zeros_query_deterministic_features(self):
+        # Abbreviated reverse DNS query reconstructed with 21 zeros
+        abbrev_query = "8.9.f.f.b.6.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.8.e.f.ip6.arpa."
+        res = extract_dns_features(abbrev_query)
+        self.assertEqual(res["dns_query_length"], 68)
+        self.assertEqual(res["dns_label_count"], 32)
+        self.assertEqual(res["dns_max_label_length"], 4)
+        self.assertEqual(res["dns_query_entropy"], 2.2849)
+        self.assertEqual(res["dns_max_label_entropy"], 1.585)
+
 
 class TestIPAddressCanonicalization(unittest.TestCase):
     def test_valid_ipv4(self):

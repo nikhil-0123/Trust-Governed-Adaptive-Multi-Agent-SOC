@@ -1,0 +1,40 @@
+<!--
+  TGAM-SOC Sysmon Configuration v1.1.0
+  ====================================
+  Authoritative Sysmon configuration for Trust-Governed Adaptive Multi-Agent SOC
+  Specification: Microsoft Sysinternals Sysmon Schema 4.90
+  Monitored Events:
+    - Event ID 1:  ProcessCreate (MITRE T1059, T1082, T1087, T1033, T1105)
+    - Event ID 3:  NetworkConnect (MITRE T1071, T1105)
+    - Event ID 22: DnsQuery (MITRE T1071.004)
+  Hashing:
+    - SHA256 process hash extraction for deterministic feature enrichment
+-->
+<Sysmon schemaversion="4.90">
+  <!-- Hash Algorithms: Enable SHA256 for deterministic process evidence extraction -->
+  <HashAlgorithms>SHA256</HashAlgorithms>
+  <CheckRevocation/>
+
+  <EventFiltering>
+    <!-- Event ID 1: Process Creation -->
+    <RuleGroup name="ProcessCreate_Rules" groupRelation="or">
+      <ProcessCreate onmatch="exclude">
+        <!-- Empty exclude captures all process creation events -->
+      </ProcessCreate>
+    </RuleGroup>
+
+    <!-- Event ID 3: Network Connection Detected -->
+    <RuleGroup name="NetworkConnect_Rules" groupRelation="or">
+      <NetworkConnect onmatch="exclude">
+        <!-- Empty exclude captures all network connections -->
+      </NetworkConnect>
+    </RuleGroup>
+
+    <!-- Event ID 22: DNS Query -->
+    <RuleGroup name="DnsQuery_Rules" groupRelation="or">
+      <DnsQuery onmatch="exclude">
+        <!-- Empty exclude captures all DNS queries for Shannon entropy & tunneling detection -->
+      </DnsQuery>
+    </RuleGroup>
+  </EventFiltering>
+</Sysmon>

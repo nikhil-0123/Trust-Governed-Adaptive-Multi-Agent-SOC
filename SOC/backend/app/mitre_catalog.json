@@ -80,6 +80,13 @@
       "tactic": "Discovery"
     },
     {
+      "mapping_rule_id": "rule_user_discovery_windows",
+      "detection_type": "windows_user_discovery",
+      "technique_id": "T1033",
+      "technique_name": "System Owner/User Discovery",
+      "tactic": "Discovery"
+    },
+    {
       "mapping_rule_id": "rule_evasion_windows",
       "detection_type": "windows_defense_evasion",
       "technique_id": "T1562.001",

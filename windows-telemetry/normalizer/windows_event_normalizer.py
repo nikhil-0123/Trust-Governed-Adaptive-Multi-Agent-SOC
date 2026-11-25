@@ -71,6 +71,8 @@ class WindowsEventNormalizer:
             "task": raw_event.get("task"),
             "keywords": raw_event.get("keywords")
         }
+        if raw_event.get("is_simulated"):
+            evidence["is_simulated"] = True
 
         # WP-1E.1: Versioned Source Identity Generation
         if epoch is not None:

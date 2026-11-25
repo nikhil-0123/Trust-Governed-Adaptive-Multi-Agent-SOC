@@ -219,6 +219,104 @@ class TestMitreEngineDB(unittest.TestCase):
             self.assertIn("T1059.001", tech_ids)
             self.assertIn("T1105", tech_ids)
 
+    def test_unknown_technique_override_falls_back_to_default(self):
+        with get_db_connection() as conn:
+            data = {
+                "detection_type": "windows_reconnaissance",
+                "evidence": {"mitre_technique_id": "T9999"}
+            }
+            conn.execute("INSERT INTO events (detection_event_id, data) VALUES (?, ?)", ("e_unk", json.dumps(data)))
+            conn.execute("INSERT INTO incidents (incident_id, created_at, updated_at, first_seen, last_seen, max_severity, status) VALUES (?, datetime('now'), datetime('now'), datetime('now'), datetime('now'), 'high', 'OPEN')", ("inc-unk",))
+            conn.execute("INSERT INTO incident_evidence (incident_id, detection_event_id) VALUES (?, ?)", ("inc-unk", "e_unk"))
+            conn.commit()
+
+            res = self.engine.process_event(conn, "e_unk")
+            self.assertEqual(res, "MAPPED")
+            conn.commit()
+
+            cursor = conn.execute("SELECT * FROM threat_context WHERE incident_id = 'inc-unk'")
+            row = cursor.fetchone()
+            self.assertIsNotNone(row)
+            self.assertEqual(row["technique_id"], "T1082")  # Fell back to default for windows_reconnaissance
+
+    def test_unrelated_technique_override_rejected_and_falls_back(self):
+        with get_db_connection() as conn:
+            # T1486 is Ransomware (tactic Impact), but detection_type is windows_reconnaissance (tactic Discovery)
+            data = {
+                "detection_type": "windows_reconnaissance",
+                "evidence": {"mitre_technique_id": "T1486"}
+            }
+            conn.execute("INSERT INTO events (detection_event_id, data) VALUES (?, ?)", ("e_unrel", json.dumps(data)))
+            conn.execute("INSERT INTO incidents (incident_id, created_at, updated_at, first_seen, last_seen, max_severity, status) VALUES (?, datetime('now'), datetime('now'), datetime('now'), datetime('now'), 'high', 'OPEN')", ("inc-unrel",))
+            conn.execute("INSERT INTO incident_evidence (incident_id, detection_event_id) VALUES (?, ?)", ("inc-unrel", "e_unrel"))
+            conn.commit()
+
+            res = self.engine.process_event(conn, "e_unrel")
+            self.assertEqual(res, "MAPPED")
+            conn.commit()
+
+            cursor = conn.execute("SELECT * FROM threat_context WHERE incident_id = 'inc-unrel'")
+            row = cursor.fetchone()
+            self.assertIsNotNone(row)
+            self.assertEqual(row["technique_id"], "T1082")  # T1486 rejected due to tactic mismatch; fell back to T1082
+
+    def test_compatible_technique_override_accepted(self):
+        with get_db_connection() as conn:
+            # T1033 is User Discovery (tactic Discovery), matching windows_reconnaissance (Discovery)
+            data = {
+                "detection_type": "windows_reconnaissance",
+                "evidence": {"mitre_technique_id": "T1033"}
+            }
+            conn.execute("INSERT INTO events (detection_event_id, data) VALUES (?, ?)", ("e_comp", json.dumps(data)))
+            conn.execute("INSERT INTO incidents (incident_id, created_at, updated_at, first_seen, last_seen, max_severity, status) VALUES (?, datetime('now'), datetime('now'), datetime('now'), datetime('now'), 'high', 'OPEN')", ("inc-comp",))
+            conn.execute("INSERT INTO incident_evidence (incident_id, detection_event_id) VALUES (?, ?)", ("inc-comp", "e_comp"))
+            conn.commit()
+
+            res = self.engine.process_event(conn, "e_comp")
+            self.assertEqual(res, "MAPPED")
+            conn.commit()
+
+            cursor = conn.execute("SELECT * FROM threat_context WHERE incident_id = 'inc-comp'")
+            row = cursor.fetchone()
+            self.assertIsNotNone(row)
+            self.assertEqual(row["technique_id"], "T1033")  # Compatible tactic override accepted
+
+    def test_malformed_evidence_handled_gracefully(self):
+        with get_db_connection() as conn:
+            # Non-dict evidence string
+            data = {
+                "detection_type": "windows_reconnaissance",
+                "evidence": "invalid-non-dict-evidence"
+            }
+            conn.execute("INSERT INTO events (detection_event_id, data) VALUES (?, ?)", ("e_mal", json.dumps(data)))
+            conn.execute("INSERT INTO incidents (incident_id, created_at, updated_at, first_seen, last_seen, max_severity, status) VALUES (?, datetime('now'), datetime('now'), datetime('now'), datetime('now'), 'high', 'OPEN')", ("inc-mal",))
+            conn.execute("INSERT INTO incident_evidence (incident_id, detection_event_id) VALUES (?, ?)", ("inc-mal", "e_mal"))
+            conn.commit()
+
+            res = self.engine.process_event(conn, "e_mal")
+            self.assertEqual(res, "MAPPED")
+            conn.commit()
+
+            cursor = conn.execute("SELECT * FROM threat_context WHERE incident_id = 'inc-mal'")
+            row = cursor.fetchone()
+            self.assertIsNotNone(row)
+            self.assertEqual(row["technique_id"], "T1082")
+
+    def test_unknown_detection_type_and_unknown_override_unmapped(self):
+        with get_db_connection() as conn:
+            data = {
+                "detection_type": "completely_unknown_attack_type",
+                "evidence": {"mitre_technique_id": "T9999"}
+            }
+            conn.execute("INSERT INTO events (detection_event_id, data) VALUES (?, ?)", ("e_unk2", json.dumps(data)))
+            conn.execute("INSERT INTO incidents (incident_id, created_at, updated_at, first_seen, last_seen, max_severity, status) VALUES (?, datetime('now'), datetime('now'), datetime('now'), datetime('now'), 'high', 'OPEN')", ("inc-unk2",))
+            conn.execute("INSERT INTO incident_evidence (incident_id, detection_event_id) VALUES (?, ?)", ("inc-unk2", "e_unk2"))
+            conn.commit()
+
+            res = self.engine.process_event(conn, "e_unk2")
+            self.assertEqual(res, "UNMAPPED")
+            conn.commit()
+
 
 
 class TestMitreWorkerIntegration(unittest.TestCase):

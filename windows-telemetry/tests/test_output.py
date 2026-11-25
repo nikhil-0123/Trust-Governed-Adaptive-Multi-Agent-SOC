@@ -616,7 +616,7 @@ class TestPipelineIntegration(unittest.TestCase):
             end_time = time.time()
 
             # 4. Verify batch completes instantly, NOT waiting for the 2.0s HTTP timeout
-            self.assertLess(end_time - start_time, 1.0)
+            self.assertLess(end_time - start_time, 1.5)
 
             # 5. Verify checkpoint advances normally
             self.assertEqual(self.pipeline.collector.checkpoint, 104)

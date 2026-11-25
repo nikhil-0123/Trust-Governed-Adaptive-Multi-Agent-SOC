@@ -149,6 +149,61 @@ class TestAssessmentEngineDB(unittest.TestCase):
         inc_fail = self.conn.execute("SELECT latest_assessment_id FROM incidents WHERE incident_id = ?", (inc_id,)).fetchone()
         self.assertEqual(inc_fail["latest_assessment_id"], second_id)
 
+    def test_historical_reevaluation_invariance_and_corroborating_increase(self):
+        """Verify that historical re-evaluations do not inflate trust/risk scores, while genuine primary detections do."""
+        inc_id = "inc_invar_test"
+        self._setup_incident(inc_id, "HIGH")
+
+        # 1. Primary detection event
+        self._add_event(inc_id, "ev_prim_1", severity="HIGH", confidence=0.8)
+        self.conn.execute("UPDATE incident_evidence SET classification = 'PRIMARY_DETECTION' WHERE incident_id = ? AND detection_event_id = ?", (inc_id, "ev_prim_1"))
+        self.conn.commit()
+
+        # Initial assessment
+        res1 = self.engine.process_incident(self.conn, inc_id)
+        self.assertEqual(res1, "COMPLETED")
+        row1 = self.conn.execute("SELECT trust_score, risk_score FROM assessments WHERE incident_id = ? ORDER BY created_at DESC", (inc_id,)).fetchone()
+        trust1, risk1 = row1["trust_score"], row1["risk_score"]
+
+        # 2. Add historical re-evaluation detection event
+        data_reval = {
+            "detection_event_id": "ev_reval_1",
+            "timestamp": "2026-10-04T12:05:00Z",
+            "hostname": "h1",
+            "severity": "HIGH",
+            "confidence": 0.95,
+            "agent_id": "a1",
+            "detection_type": "type1"
+        }
+        self.conn.execute("INSERT INTO events (detection_event_id, data, classification) VALUES (?, ?, 'HISTORICAL_RE_EVALUATION')", ("ev_reval_1", json.dumps(data_reval)))
+        self.conn.execute("INSERT INTO incident_evidence (incident_id, detection_event_id, classification) VALUES (?, ?, 'HISTORICAL_RE_EVALUATION')", (inc_id, "ev_reval_1"))
+        self.conn.commit()
+
+        # Re-assessment with historical re-evaluation attached
+        res2 = self.engine.process_incident(self.conn, inc_id)
+        self.assertEqual(res2, "COMPLETED")
+        row2 = self.conn.execute("SELECT trust_score, risk_score FROM assessments WHERE incident_id = ? ORDER BY created_at DESC", (inc_id,)).fetchone()
+        trust2, risk2 = row2["trust_score"], row2["risk_score"]
+
+        # Scores must be strictly invariant
+        self.assertEqual(trust1, trust2)
+        self.assertEqual(risk1, risk2)
+
+        # 3. Add a second independent primary detection
+        self._add_event(inc_id, "ev_prim_2", severity="HIGH", confidence=0.8)
+        self.conn.execute("UPDATE incident_evidence SET classification = 'PRIMARY_DETECTION' WHERE incident_id = ? AND detection_event_id = ?", (inc_id, "ev_prim_2"))
+        self.conn.commit()
+
+        # Assessment with 2 primary detections
+        res3 = self.engine.process_incident(self.conn, inc_id)
+        self.assertEqual(res3, "COMPLETED")
+        row3 = self.conn.execute("SELECT trust_score, risk_score FROM assessments WHERE incident_id = ? ORDER BY created_at DESC", (inc_id,)).fetchone()
+        trust3 = row3["trust_score"]
+
+        # Second primary detection increases event count (E_vol), updating the trust score
+        self.assertNotEqual(trust1, trust3)
+        self.assertGreater(trust3, trust1)
+
     def test_malformed_config(self):
         with tempfile.NamedTemporaryFile(mode='w', delete=False) as f:
             f.write('{"bad": "json"}')

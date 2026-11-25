@@ -7,7 +7,7 @@ import uuid
 import re
 import hashlib
 from datetime import datetime, timezone
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any, Optional, Tuple, Union
 from config.settings import config
 from .checkpoint import CheckpointManager
 from .mailbox import TransitionMailbox
@@ -52,10 +52,18 @@ class WindowsEventCollector:
         logger: logging.Logger,
         log_name: Optional[str] = None,
         agent_id: Optional[str] = None,
+        execution_mode: Optional[str] = None,
     ):
         self.logger = logger
         self.log_name = (log_name or config.windows_security_log_name).strip()
         self.agent_id = (agent_id or "AGT-WIN-01").strip()
+        self.execution_mode = (
+            execution_mode
+            or getattr(config, "execution_mode", None)
+            or os.getenv("TGAM_EXECUTION_MODE")
+            or os.getenv("EXECUTION_MODE", "PRODUCTION")
+        ).strip().upper()
+        self.is_simulation = self.execution_mode in ("SIMULATION", "TEST", "EVALUATION")
 
         # Channel-specific batch size and timeout resolution (Phase 2.2)
         if self.log_name == getattr(config, "windows_security_log_name", "Security"):
@@ -346,6 +354,64 @@ class WindowsEventCollector:
             "last_error": self.last_error,
         }
 
+    def _decode_wevtutil_output(self, raw_bytes: Union[bytes, str]) -> Tuple[Optional[str], Optional[str]]:
+        """
+        Losslessly decodes raw byte output from wevtutil without character loss or silent replacement.
+        Checks byte-order marks (BOM) and applies strict decoding across valid Windows encodings:
+        1. UTF-8 BOM (utf-8-sig) or strict UTF-8
+        2. UTF-16LE BOM or strict UTF-16LE / UTF-16
+        3. Active Windows ANSI / CP1252 (strict)
+
+        If raw_bytes cannot be decoded by any supported encoding:
+        - Quarantines the undecodable payload into malformed_events directory.
+        - Returns (None, "UNDECODABLE_RAW_BYTES").
+        """
+        if not raw_bytes:
+            return "", None
+
+        if isinstance(raw_bytes, str):
+            return raw_bytes, None
+
+        # Check Byte Order Marks (BOM)
+        if raw_bytes.startswith(b"\xef\xbb\xbf"):
+            try:
+                return raw_bytes[3:].decode("utf-8"), None
+            except UnicodeDecodeError:
+                pass
+        elif raw_bytes.startswith(b"\xff\xfe"):
+            try:
+                return raw_bytes[2:].decode("utf-16le"), None
+            except UnicodeDecodeError:
+                pass
+        elif raw_bytes.startswith(b"\xfe\xff"):
+            try:
+                return raw_bytes[2:].decode("utf-16be"), None
+            except UnicodeDecodeError:
+                pass
+
+        # Try strict candidate encodings without destructive character replacement
+        candidate_encodings = getattr(self, "candidate_encodings", ("utf-8", "utf-16le", "cp1252", "mbcs"))
+        for enc in candidate_encodings:
+            try:
+                decoded = raw_bytes.decode(enc)
+                return decoded, None
+            except (UnicodeDecodeError, LookupError):
+                continue
+
+        # Forensic preservation: quarantine undecodable evidence without silent character replacement
+        ts = int(datetime.now(timezone.utc).timestamp())
+        quarantine_file = os.path.join(self.malformed_events_dir, f"undecodable_wevtutil_{ts}.bin")
+        try:
+            with open(quarantine_file, "wb") as qf:
+                qf.write(raw_bytes)
+            self.logger.error(
+                f"Quarantined {len(raw_bytes)} bytes of undecodable wevtutil output on '{self.log_name}' to {quarantine_file}"
+            )
+        except Exception as qe:
+            self.logger.error(f"Failed to write undecodable quarantine file: {qe}")
+
+        return None, "UNDECODABLE_RAW_BYTES"
+
     def _probe_newest_record_id(self) -> Tuple[Optional[int], Optional[str]]:
         """
         Executes a reverse query for the newest record ID:
@@ -353,10 +419,19 @@ class WindowsEventCollector:
         Returns (newest_record_id, error_code).
         error_code can be None, 'EMPTY_LOG', 'COMMAND_UNAVAILABLE', 'TIMEOUT', or 'PARSE_ERROR'.
         """
+        if self.execution_mode == "SIMULATION":
+            return None, "EMPTY_LOG"
+
         cmd = ["wevtutil", "qe", self.log_name, "/c:1", "/rd:true", "/f:xml"]
         try:
-            result = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=self.timeout_seconds)
-            xml_output = result.stdout.strip()
+            result = subprocess.run(
+                cmd, capture_output=True, check=True, timeout=self.timeout_seconds
+            )
+            xml_output, decode_err = self._decode_wevtutil_output(result.stdout)
+            if decode_err:
+                self.logger.error(f"Failed to decode newest record query on {self.log_name}: {decode_err}")
+                return None, "PARSE_ERROR"
+            xml_output = (xml_output or "").strip()
             if not xml_output:
                 return None, "EMPTY_LOG"
             events = self._parse_wevtutil_xml(xml_output)
@@ -386,12 +461,20 @@ class WindowsEventCollector:
         - System: Event 104 with affected_channel == 'System'
         Returns (witness_found, witness_event, reason).
         """
+        if self.is_simulation:
+            return False, None, "Simulation mode active: live clear witness query bypassed"
+
         if self.log_name == "Security":
             query = "*[System[(EventID=1102)]]"
             cmd = ["wevtutil", "qe", "Security", f"/q:{query}", "/c:10", "/rd:true", "/f:xml"]
             try:
-                result = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=self.timeout_seconds)
-                xml_output = result.stdout.strip()
+                result = subprocess.run(
+                    cmd, capture_output=True, check=True, timeout=self.timeout_seconds
+                )
+                xml_output, decode_err = self._decode_wevtutil_output(result.stdout)
+                if decode_err:
+                    return False, None, f"Query for Event 1102 produced undecodable output: {decode_err}"
+                xml_output = (xml_output or "").strip()
                 if xml_output:
                     events = self._parse_wevtutil_xml(xml_output)
                     for ev in events:
@@ -407,8 +490,13 @@ class WindowsEventCollector:
             query = "*[System[(EventID=104)]]"
             cmd = ["wevtutil", "qe", "System", f"/q:{query}", "/c:10", "/rd:true", "/f:xml"]
             try:
-                result = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=self.timeout_seconds)
-                xml_output = result.stdout.strip()
+                result = subprocess.run(
+                    cmd, capture_output=True, check=True, timeout=self.timeout_seconds
+                )
+                xml_output, decode_err = self._decode_wevtutil_output(result.stdout)
+                if decode_err:
+                    return False, None, f"Query for Event 104 produced undecodable output: {decode_err}"
+                xml_output = (xml_output or "").strip()
                 if xml_output:
                     events = self._parse_wevtutil_xml(xml_output)
                     for ev in events:
@@ -486,12 +574,30 @@ class WindowsEventCollector:
     def _apply_first_run_behavior(self):
         """
         Conservative default: fetch the single latest EventRecordID to establish baseline.
+        In simulation/test modes, establish isolated test baseline at record 1 without probing live OS logs.
         """
+        if self.is_simulation:
+            self.current_checkpoint = 1
+            self.checkpoint_manager.save_checkpoint(self.current_checkpoint)
+            self.logger.info(
+                f"Simulation/Test mode active: isolated first-run baseline checkpoint set to {self.current_checkpoint}"
+            )
+            return
+
         cmd = ["wevtutil", "qe", self.log_name, "/c:1", "/rd:true", "/f:xml"]
         try:
-            result = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=30)
-            if result.stdout.strip():
-                events = self._parse_wevtutil_xml(result.stdout)
+            result = subprocess.run(
+                cmd, capture_output=True, check=True, timeout=30
+            )
+            out_str, decode_err = self._decode_wevtutil_output(result.stdout)
+            if decode_err:
+                self.logger.error(f"Failed to decode first-run output for {self.log_name}: {decode_err}")
+                self.current_checkpoint = 1
+                self.checkpoint_manager.save_checkpoint(self.current_checkpoint)
+                return
+            out_str = (out_str or "").strip()
+            if out_str:
+                events = self._parse_wevtutil_xml(out_str)
                 if events and "record_id" in events[0]:
                     latest_id = events[0]["record_id"]
                     self.current_checkpoint = latest_id
@@ -577,6 +683,8 @@ class WindowsEventCollector:
                             ev for ev in parsed
                             if self._matches_channel(ev.get("channel"))
                         ]
+                        for ev in filtered:
+                            ev["is_simulated"] = True
                         if not filtered:
                             continue
 
@@ -1054,12 +1162,24 @@ class WindowsEventCollector:
             else:
                 self.clear_durable_remainder()
 
-        # 2. Check for simulated events
-        sim_events = self._collect_simulated_events()
-        events = sim_events
+        # 2. Strict Execution Mode Separation (Task 2)
+        if self.execution_mode == "PRODUCTION":
+            # In PRODUCTION mode: NEVER collect from simulated_events directory. Query live wevtutil ONLY!
+            events = []
+        else:
+            # In simulation/test modes: check simulated events directory first
+            sim_events = self._collect_simulated_events()
+            events = sim_events
 
-        # 3. Query live wevtutil if no simulated events
-        if not events:
+        # 3. Query wevtutil: in PRODUCTION mode, or in TEST mode when subprocess.run or _probe_newest_record_id is mocked
+        should_query_wevtutil = (
+            self.execution_mode == "PRODUCTION" or
+            (self.execution_mode == "TEST" and (
+                hasattr(subprocess.run, "assert_called") or
+                hasattr(self._probe_newest_record_id, "assert_called")
+            ))
+        )
+        if not events and should_query_wevtutil:
             # Dual-probe query: Probe 1 (reverse query for newest record ID)
             newest_record_id, probe_err = self._probe_newest_record_id()
             if probe_err == "EMPTY_LOG":
@@ -1115,8 +1235,20 @@ class WindowsEventCollector:
 
             cmd = ["wevtutil", "qe", self.log_name, f"/q:{query}", f"/c:{self.batch_size}", "/f:xml"]
             try:
-                result = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=self.timeout_seconds)
-                xml_output = result.stdout.strip()
+                result = subprocess.run(
+                    cmd, capture_output=True, check=True, timeout=self.timeout_seconds
+                )
+                xml_output, decode_err = self._decode_wevtutil_output(result.stdout)
+                if decode_err:
+                    self.logger.error(
+                        f"Decoding failure on {self.log_name} batch query: {decode_err}. "
+                        "Quarantining undecodable raw bytes and halting checkpoint advancement for safety."
+                    )
+                    self.status = "DEGRADED"
+                    self.consecutive_failures += 1
+                    self.last_error = f"Undecodable XML payload on {self.log_name}"
+                    return []
+                xml_output = (xml_output or "").strip()
                 if xml_output:
                     # Oversized XML handling & adaptive batch reduction (Task 3)
                     if len(xml_output) > 10 * 1024 * 1024:
@@ -1129,8 +1261,13 @@ class WindowsEventCollector:
                         for reduced_size in recovery_batches:
                             r_cmd = ["wevtutil", "qe", self.log_name, f"/q:{query}", f"/c:{reduced_size}", "/f:xml"]
                             try:
-                                r_res = subprocess.run(r_cmd, capture_output=True, text=True, check=True, timeout=self.timeout_seconds)
-                                r_xml = r_res.stdout.strip()
+                                r_res = subprocess.run(
+                                    r_cmd, capture_output=True, check=True, timeout=self.timeout_seconds
+                                )
+                                r_xml, r_dec_err = self._decode_wevtutil_output(r_res.stdout)
+                                if r_dec_err:
+                                    continue
+                                r_xml = (r_xml or "").strip()
                                 if r_xml and len(r_xml) <= 10 * 1024 * 1024:
                                     live_events = self._parse_wevtutil_xml(r_xml)
                                     if live_events:

@@ -11,15 +11,30 @@ from .rules import (
 )
 from .xgboost_detector import XGBoostDetector, ModelNotAvailableError
 
+import re
+
 class DetectionEngine:
     def __init__(self, logger: logging.Logger, detector_version: Optional[str] = None):
         self.logger = logger
-        if detector_version is not None and str(detector_version).strip():
-            self.detector_version = str(detector_version).strip()
-        elif "WINDOWS_DETECTOR_VERSION" in os.environ and os.environ["WINDOWS_DETECTOR_VERSION"].strip():
-            self.detector_version = os.environ["WINDOWS_DETECTOR_VERSION"].strip()
+        if detector_version is not None:
+            stripped = str(detector_version).strip()
+            if not stripped:
+                raise ValueError("detector_version cannot be empty or whitespace-only.")
+            if not re.match(r"^\d+\.\d+\.\d+$", stripped):
+                raise ValueError(f"detector_version must be valid SemVer 'X.Y.Z', got '{detector_version}'")
+            self.detector_version = stripped
+        elif "WINDOWS_DETECTOR_VERSION" in os.environ:
+            raw_env = os.environ["WINDOWS_DETECTOR_VERSION"].strip()
+            if not raw_env:
+                raise ValueError("WINDOWS_DETECTOR_VERSION cannot be empty or whitespace-only.")
+            if not re.match(r"^\d+\.\d+\.\d+$", raw_env):
+                raise ValueError(f"WINDOWS_DETECTOR_VERSION must be valid SemVer 'X.Y.Z', got '{raw_env}'")
+            self.detector_version = raw_env
         else:
             self.detector_version = "1.0.0"
+
+        if self.detector_version == "1.0.0":
+            logger.warning("Stale detector version 1.0.0 detected; this version is deprecated and incompatible with Phase 2.1 production payloads.")
 
         # Rules and models initialized here
         self.rules = [

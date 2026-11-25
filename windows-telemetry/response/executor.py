@@ -34,16 +34,25 @@ class WindowsResponseExecutor:
         soc_base_url: str = "",
         logger: Optional[logging.Logger] = None,
         agent_id: str = "",
-        hostname: str = ""
+        hostname: str = "",
+        simulation_mode: bool = False
     ):
         self.soc_base_url = soc_base_url
         self.logger = logger or logging.getLogger("WindowsResponseExecutor")
         self.agent_id = str(agent_id).strip()
         self.hostname = str(hostname).strip()
+        self.simulation_mode = (
+            simulation_mode
+            or os.getenv("SIMULATION_MODE") == "1"
+            or os.getenv("TGAM_SIMULATION_MODE") == "1"
+            or os.getenv("EXECUTION_MODE") == "EVALUATION"
+        )
 
     def execute(self, command_type: str, parameters: Dict[str, Any]) -> Dict[str, Any]:
         """Dispatches mitigation command to specific handler."""
         norm_type = command_type.upper()
+        if self.simulation_mode or parameters.get("is_simulated"):
+            parameters["simulate"] = True
         self.logger.info(f"Executing mitigation: {norm_type} with parameters: {parameters}")
 
         if norm_type in ("BLOCK_SOURCE", "BLOCK_SOURCE_IP"):

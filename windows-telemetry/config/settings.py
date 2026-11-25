@@ -1,5 +1,6 @@
 import os
 import math
+import re
 
 def _load_env_file():
     candidates = [
@@ -30,6 +31,7 @@ class Settings:
         self.app_name = os.getenv("APP_NAME", "TGAM-SOC Windows Telemetry")
         self.version = os.getenv("APP_VERSION", "0.1.0")
         self.environment = os.getenv("ENVIRONMENT", "development")
+        self.execution_mode = os.getenv("TGAM_EXECUTION_MODE", os.getenv("EXECUTION_MODE", "PRODUCTION")).strip().upper()
         self.log_level = os.getenv("LOG_LEVEL", "INFO")
 
         # Step 2: Collector Configuration
@@ -106,8 +108,17 @@ class Settings:
         self._outbox_db_path = os.getenv("OUTBOX_DB_PATH")
 
         # Step 4: Detection Engine Configuration (Phase 1 & Phase 2)
-        raw_det_ver = os.getenv("WINDOWS_DETECTOR_VERSION", "1.1.0").strip()
-        self.detector_version = raw_det_ver if raw_det_ver else "1.1.0"
+        raw_det_ver = os.getenv("WINDOWS_DETECTOR_VERSION")
+        if raw_det_ver is not None:
+            stripped = raw_det_ver.strip()
+            if not stripped:
+                self.detector_version = "1.1.0"
+            elif not re.match(r"^\d+\.\d+\.\d+$", stripped):
+                raise ValueError(f"WINDOWS_DETECTOR_VERSION must be valid SemVer 'X.Y.Z', got '{raw_det_ver}'")
+            else:
+                self.detector_version = stripped
+        else:
+            self.detector_version = "1.1.0"
         val_max_keys = int(os.getenv("WINDOWS_DETECTION_MAX_STATE_KEYS", "10000"))
         if val_max_keys < 2:
             raise ValueError(f"WINDOWS_DETECTION_MAX_STATE_KEYS must be an integer >= 2, got {val_max_keys}")
