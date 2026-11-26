@@ -55,3 +55,7 @@ test_*.js
 .coverage
 htmlcov/
 .tox/
+scratch/
+tests/
+ubuntu-telemetry/tests/
+*.xml
