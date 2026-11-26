@@ -3,9 +3,14 @@ import logging
 import os
 import re
 import uuid
-from typing import Dict, Any
+from typing import Dict, Any, Set
 
 logger = logging.getLogger(__name__)
+
+ALLOWED_TECHNIQUES_BY_DETECTION_TYPE: Dict[str, Set[str]] = {
+    "windows_reconnaissance": {"T1082", "T1033"},
+    "windows_user_discovery": {"T1033", "T1082"},
+}
 
 class MitreCatalogError(Exception):
     pass
@@ -91,9 +96,11 @@ class MitreEngine:
 
         if tech_id_override and isinstance(tech_id_override, str):
             candidate_rule = self.rules_by_tech.get(tech_id_override)
-            if candidate_rule:
-                if default_rule:
-                    # Validate tactic consistency between technique override and detection_type
+            if default_rule:
+                allowed_techniques = ALLOWED_TECHNIQUES_BY_DETECTION_TYPE.get(
+                    det_type, {default_rule["technique_id"]}
+                )
+                if tech_id_override in allowed_techniques and candidate_rule:
                     if candidate_rule["tactic"] == default_rule["tactic"]:
                         rule = candidate_rule
                     else:
@@ -104,13 +111,16 @@ class MitreEngine:
                         )
                         rule = default_rule
                 else:
-                    rule = candidate_rule
+                    logger.warning(
+                        f"Technique override '{tech_id_override}' is not in allowed techniques {allowed_techniques} "
+                        f"for detection_type '{det_type}'. Falling back to catalog default rule '{default_rule['mapping_rule_id']}'."
+                    )
+                    rule = default_rule
             else:
                 logger.warning(
-                    f"Unknown technique_id override '{tech_id_override}' for detection_type '{det_type}'. "
-                    f"Falling back to catalog default."
+                    f"Rejecting arbitrary technique override '{tech_id_override}' for unknown detection_type '{det_type}'."
                 )
-                rule = default_rule
+                rule = None
         else:
             rule = default_rule
 

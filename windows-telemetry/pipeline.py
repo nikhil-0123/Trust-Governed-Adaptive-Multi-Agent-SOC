@@ -52,7 +52,7 @@ class WindowsDetectionPipeline:
         # Explicit Production Compatibility Policy (Task 1)
         if self.execution_mode == "PRODUCTION" and self.engine.detector_version != "1.1.0":
             raise ValueError(
-                f"Production pipeline requires detector version 1.1.0 or higher compatible SemVer; "
+                f"Production pipeline requires detector version 1.1.0; "
                 f"historical version {self.engine.detector_version} is incompatible with Phase 2.1 payload schema."
             )
 

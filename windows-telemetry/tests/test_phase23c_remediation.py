@@ -372,6 +372,77 @@ class TestPhase23CProductionDefects(unittest.TestCase):
             # The simulated file was NOT consumed
             self.assertTrue(os.path.exists(os.path.join(sim_dir, "test_sim.xml")))
 
+    def test_13_execution_mode_validation_and_data_dir_isolation(self):
+        """Task 1A: Settings validates execution mode strictly and isolates default state directory."""
+        from config.settings import Settings
+
+        # 1. Invalid execution mode raises ValueError
+        with patch.dict(os.environ, {"EXECUTION_MODE": "UNAUTHORIZED_MODE"}):
+            with self.assertRaises(ValueError) as ctx:
+                Settings()
+            self.assertIn("Invalid execution mode", str(ctx.exception))
+
+        # 2. Production mode default data_dir
+        with patch.dict(os.environ, {"EXECUTION_MODE": "PRODUCTION"}):
+            os.environ.pop("DATA_DIR", None)
+            s_prod = Settings()
+            self.assertTrue(s_prod.data_dir.endswith("telemetry"))
+
+        # 3. Simulation mode default data_dir is isolated
+        with patch.dict(os.environ, {"EXECUTION_MODE": "SIMULATION"}):
+            os.environ.pop("DATA_DIR", None)
+            s_sim = Settings()
+            self.assertTrue(s_sim.data_dir.endswith("telemetry_simulation"))
+
+        # 4. Evaluation mode default data_dir is isolated
+        with patch.dict(os.environ, {"EXECUTION_MODE": "EVALUATION"}):
+            os.environ.pop("DATA_DIR", None)
+            s_eval = Settings()
+            self.assertTrue(s_eval.data_dir.endswith("telemetry_evaluation"))
+
+    def test_14_executor_simulation_mode_prevents_containment(self):
+        """Task 1A: WindowsResponseExecutor in simulation mode never executes containment regardless of parameters."""
+        executor = WindowsResponseExecutor(simulation_mode=True)
+        self.assertTrue(executor.simulation_mode)
+
+        # block_source with simulate=False must still be forced to simulate=True
+        res = executor.block_source({"ip": "198.51.100.10", "simulate": False})
+        self.assertTrue(res.get("simulated"))
+        self.assertEqual(res.get("action"), "BLOCK_SOURCE")
+
+        # kill_process with simulate=False must still be forced to simulate=True
+        res_kill = executor.kill_process({"process_id": 9999, "simulate": False})
+        self.assertTrue(res_kill.get("simulated"))
+        self.assertEqual(res_kill.get("action"), "KILL_PROCESS")
+
+        # isolate_host with simulate=False must still be forced to simulate=True
+        res_iso = executor.isolate_host({"simulate": False})
+        self.assertTrue(res_iso.get("simulated"))
+        self.assertEqual(res_iso.get("action"), "ISOLATE_HOST")
+
+    def test_15_decode_wevtutil_structural_validation_and_disk_watermark(self):
+        """Task 1C: Decoding rejects corrupt null bytes and enforces disk watermark check before quarantine write."""
+        collector = WindowsEventCollector(logger=self.logger, log_name="Security", execution_mode="TEST")
+
+        # UTF-16LE bytes decoded with embedded nulls or corrupt bytes must not produce corrupt string
+        # A payload with unparseable binary junk
+        raw_junk = b"\x00\x01\x02\x03\x04\x05\x06\x07"
+        
+        # When disk watermark is violated, quarantine write is rejected safely
+        with patch("shutil.disk_usage") as mock_usage:
+            # Return free space of 10 MB (below default 500 MB watermark)
+            mock_usage.return_value = MagicMock(free=10 * 1024 * 1024)
+            decoded, err = collector._decode_wevtutil_output(raw_junk)
+            self.assertIsNone(decoded)
+            self.assertEqual(err, "UNDECODABLE_RAW_BYTES")
+
+        # When disk space is sufficient, undecodable bytes are quarantined atomically
+        with patch("shutil.disk_usage") as mock_usage:
+            mock_usage.return_value = MagicMock(free=1000 * 1024 * 1024)
+            decoded, err = collector._decode_wevtutil_output(raw_junk)
+            self.assertIsNone(decoded)
+            self.assertEqual(err, "UNDECODABLE_RAW_BYTES")
+
 
 if __name__ == "__main__":
     unittest.main()

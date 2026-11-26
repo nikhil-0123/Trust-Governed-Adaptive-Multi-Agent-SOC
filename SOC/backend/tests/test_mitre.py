@@ -317,6 +317,74 @@ class TestMitreEngineDB(unittest.TestCase):
             self.assertEqual(res, "UNMAPPED")
             conn.commit()
 
+    def test_unknown_detection_type_with_valid_catalog_override_rejected(self):
+        with get_db_connection() as conn:
+            # Detection type unknown, but override is a real technique (T1110 Brute Force)
+            data = {
+                "detection_type": "unknown_custom_attack",
+                "evidence": {"mitre_technique_id": "T1110"}
+            }
+            conn.execute("INSERT INTO events (detection_event_id, data) VALUES (?, ?)", ("e_unk_override", json.dumps(data)))
+            conn.execute("INSERT INTO incidents (incident_id, created_at, updated_at, first_seen, last_seen, max_severity, status) VALUES (?, datetime('now'), datetime('now'), datetime('now'), datetime('now'), 'high', 'OPEN')", ("inc-unk-ov",))
+            conn.execute("INSERT INTO incident_evidence (incident_id, detection_event_id) VALUES (?, ?)", ("inc-unk-ov", "e_unk_override"))
+            conn.commit()
+
+            # Must reject arbitrary override on unknown detection type
+            res = self.engine.process_event(conn, "e_unk_override")
+            self.assertEqual(res, "UNMAPPED")
+            conn.commit()
+
+    def test_unauthorized_technique_override_for_reconnaissance_falls_back(self):
+        with get_db_connection() as conn:
+            # T1105 is Ingress Tool Transfer (C2), unauthorized for windows_reconnaissance
+            data = {
+                "detection_type": "windows_reconnaissance",
+                "evidence": {"mitre_technique_id": "T1105"}
+            }
+            conn.execute("INSERT INTO events (detection_event_id, data) VALUES (?, ?)", ("e_unauth_recon", json.dumps(data)))
+            conn.execute("INSERT INTO incidents (incident_id, created_at, updated_at, first_seen, last_seen, max_severity, status) VALUES (?, datetime('now'), datetime('now'), datetime('now'), datetime('now'), 'high', 'OPEN')", ("inc-unauth-recon",))
+            conn.execute("INSERT INTO incident_evidence (incident_id, detection_event_id) VALUES (?, ?)", ("inc-unauth-recon", "e_unauth_recon"))
+            conn.commit()
+
+            res = self.engine.process_event(conn, "e_unauth_recon")
+            self.assertEqual(res, "MAPPED")
+            conn.commit()
+
+            cursor = conn.execute("SELECT * FROM threat_context WHERE incident_id = 'inc-unauth-recon'")
+            row = cursor.fetchone()
+            self.assertIsNotNone(row)
+            self.assertEqual(row["technique_id"], "T1082")  # Falls back to allowed default
+
+    def test_allowed_technique_t1082_and_t1033_interchangeable_for_discovery(self):
+        with get_db_connection() as conn:
+            # windows_user_discovery overriding with T1082 (System Information Discovery)
+            data1 = {
+                "detection_type": "windows_user_discovery",
+                "evidence": {"mitre_technique_id": "T1082"}
+            }
+            conn.execute("INSERT INTO events (detection_event_id, data) VALUES (?, ?)", ("e_user_to_sys", json.dumps(data1)))
+            conn.execute("INSERT INTO incidents (incident_id, created_at, updated_at, first_seen, last_seen, max_severity, status) VALUES (?, datetime('now'), datetime('now'), datetime('now'), datetime('now'), 'high', 'OPEN')", ("inc-user-sys",))
+            conn.execute("INSERT INTO incident_evidence (incident_id, detection_event_id) VALUES (?, ?)", ("inc-user-sys", "e_user_to_sys"))
+
+            # windows_reconnaissance overriding with T1033 (User Discovery)
+            data2 = {
+                "detection_type": "windows_reconnaissance",
+                "evidence": {"mitre_technique_id": "T1033"}
+            }
+            conn.execute("INSERT INTO events (detection_event_id, data) VALUES (?, ?)", ("e_sys_to_user", json.dumps(data2)))
+            conn.execute("INSERT INTO incidents (incident_id, created_at, updated_at, first_seen, last_seen, max_severity, status) VALUES (?, datetime('now'), datetime('now'), datetime('now'), datetime('now'), 'high', 'OPEN')", ("inc-sys-user",))
+            conn.execute("INSERT INTO incident_evidence (incident_id, detection_event_id) VALUES (?, ?)", ("inc-sys-user", "e_sys_to_user"))
+            conn.commit()
+
+            self.assertEqual(self.engine.process_event(conn, "e_user_to_sys"), "MAPPED")
+            self.assertEqual(self.engine.process_event(conn, "e_sys_to_user"), "MAPPED")
+            conn.commit()
+
+            row1 = conn.execute("SELECT technique_id FROM threat_context WHERE incident_id = 'inc-user-sys'").fetchone()
+            row2 = conn.execute("SELECT technique_id FROM threat_context WHERE incident_id = 'inc-sys-user'").fetchone()
+            self.assertEqual(row1["technique_id"], "T1082")
+            self.assertEqual(row2["technique_id"], "T1033")
+
 
 
 class TestMitreWorkerIntegration(unittest.TestCase):

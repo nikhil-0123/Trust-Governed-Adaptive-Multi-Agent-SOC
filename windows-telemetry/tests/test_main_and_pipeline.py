@@ -28,17 +28,20 @@ class TestWindowsMainAndPipeline(unittest.TestCase):
         self.orig_outbox = config.outbox_db_path
         self.orig_checkpoint = config.checkpoint_dir
         self.orig_detection = config.detection_output_dir
+        self.orig_watermark = getattr(config, "outbox_disk_watermark_mb", 500)
 
         config.data_dir = self.test_dir
         config.outbox_db_path = self.db_path
         config.checkpoint_dir = self.state_dir
         config.detection_output_dir = self.det_dir
+        config.outbox_disk_watermark_mb = 10
 
     def tearDown(self):
         config.data_dir = self.orig_data_dir
         config.outbox_db_path = self.orig_outbox
         config.checkpoint_dir = self.orig_checkpoint
         config.detection_output_dir = self.orig_detection
+        config.outbox_disk_watermark_mb = self.orig_watermark
         shutil.rmtree(self.test_dir, ignore_errors=True)
 
     def test_pipeline_shutdown_is_safe_without_collector_shutdown_attribute(self):

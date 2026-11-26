@@ -45,7 +45,7 @@ class WindowsResponseExecutor:
             simulation_mode
             or os.getenv("SIMULATION_MODE") == "1"
             or os.getenv("TGAM_SIMULATION_MODE") == "1"
-            or os.getenv("EXECUTION_MODE") == "EVALUATION"
+            or os.getenv("EXECUTION_MODE") in ("SIMULATION", "EVALUATION")
         )
 
     def execute(self, command_type: str, parameters: Dict[str, Any]) -> Dict[str, Any]:
@@ -84,7 +84,7 @@ class WindowsResponseExecutor:
 
         ip_str = str(ip_obj)
         rule_name = f"TGAM-SOC-Block-{ip_str}"
-        simulate = parameters.get("simulate", False)
+        simulate = self.simulation_mode or bool(parameters.get("simulate", False))
 
         cmd = [
             "netsh", "advfirewall", "firewall", "add", "rule",
@@ -137,7 +137,7 @@ class WindowsResponseExecutor:
 
         ip_str = str(ipaddress.ip_address(raw_ip.strip()))
         rule_name = f"TGAM-SOC-Block-{ip_str}"
-        simulate = parameters.get("simulate", False)
+        simulate = self.simulation_mode or bool(parameters.get("simulate", False))
 
         cmd = [
             "netsh", "advfirewall", "firewall", "delete", "rule",
@@ -172,7 +172,7 @@ class WindowsResponseExecutor:
         """
         raw_pid = parameters.get("process_id") if parameters.get("process_id") is not None else parameters.get("pid")
         process_name = parameters.get("process_name")
-        simulate = parameters.get("simulate", False)
+        simulate = self.simulation_mode or bool(parameters.get("simulate", False))
 
         if raw_pid is None and not process_name:
             raise ValueError("Either 'process_id' or 'process_name' is required for KILL_PROCESS")
@@ -235,7 +235,7 @@ class WindowsResponseExecutor:
         """
         Isolates the Windows host from the network while preserving SOC connectivity.
         """
-        simulate = parameters.get("simulate", False)
+        simulate = self.simulation_mode or bool(parameters.get("simulate", False))
         preserve_soc = parameters.get("preserve_soc_communication", True)
 
         # Determine Central SOC IP
@@ -288,7 +288,7 @@ class WindowsResponseExecutor:
         """
         Reverts host isolation by deleting isolation firewall rules.
         """
-        simulate = parameters.get("simulate", False)
+        simulate = self.simulation_mode or bool(parameters.get("simulate", False))
         cmds = [
             ["netsh", "advfirewall", "firewall", "delete", "rule", "name=TGAM-SOC-Isolate-AllowSOC"],
             ["netsh", "advfirewall", "firewall", "delete", "rule", "name=TGAM-SOC-Isolate-BlockOut"]
@@ -377,7 +377,7 @@ class WindowsResponseExecutor:
         if username.lower() in PROTECTED_WINDOWS_ACCOUNTS:
             raise PermissionError(f"Account '{username}' is protected and cannot be disabled.")
 
-        simulate = parameters.get("simulate", False)
+        simulate = self.simulation_mode or bool(parameters.get("simulate", False))
         cmd = ["net", "user", username, "/active:no"]
 
         if simulate:

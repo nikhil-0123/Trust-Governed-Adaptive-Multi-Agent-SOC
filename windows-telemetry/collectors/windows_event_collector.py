@@ -357,13 +357,16 @@ class WindowsEventCollector:
     def _decode_wevtutil_output(self, raw_bytes: Union[bytes, str]) -> Tuple[Optional[str], Optional[str]]:
         """
         Losslessly decodes raw byte output from wevtutil without character loss or silent replacement.
-        Checks byte-order marks (BOM) and applies strict decoding across valid Windows encodings:
-        1. UTF-8 BOM (utf-8-sig) or strict UTF-8
-        2. UTF-16LE BOM or strict UTF-16LE / UTF-16
-        3. Active Windows ANSI / CP1252 (strict)
-
+        Checks XML declarations, byte-order marks (BOM), and applies strict decoding across valid Windows encodings:
+        1. Declared encoding in XML header (if present)
+        2. UTF-8 BOM (utf-8-sig) or strict UTF-8
+        3. UTF-16LE BOM or strict UTF-16LE / UTF-16
+        4. Active Windows ANSI / CP1252 / MBCS (strict)
+        
+        Performs structural integrity checks (no embedded null bytes, valid XML structure).
         If raw_bytes cannot be decoded by any supported encoding:
-        - Quarantines the undecodable payload into malformed_events directory.
+        - Checks available disk space against configured watermark before writing.
+        - Quarantines the undecodable payload into malformed_events directory atomically.
         - Returns (None, "UNDECODABLE_RAW_BYTES").
         """
         if not raw_bytes:
@@ -372,7 +375,25 @@ class WindowsEventCollector:
         if isinstance(raw_bytes, str):
             return raw_bytes, None
 
-        # Check Byte Order Marks (BOM)
+        candidates = []
+
+        # 1. Inspect XML declaration if present
+        if raw_bytes.startswith(b"<?xml"):
+            decl_end = raw_bytes.find(b"?>")
+            if decl_end != -1:
+                decl_header = raw_bytes[:decl_end].decode("ascii", errors="ignore")
+                m = re.search(r'encoding=["\']([^"\']+)["\']', decl_header, re.IGNORECASE)
+                if m:
+                    candidates.append(m.group(1).lower().strip())
+        elif raw_bytes.startswith(b"<\x00?\x00x\x00m\x00l"):
+            decl_end = raw_bytes.find(b"?\x00>\x00")
+            if decl_end != -1:
+                decl_header = raw_bytes[:decl_end + 2].decode("utf-16le", errors="ignore")
+                m = re.search(r'encoding=["\']([^"\']+)["\']', decl_header, re.IGNORECASE)
+                if m:
+                    candidates.append(m.group(1).lower().strip())
+
+        # 2. Check Byte Order Marks (BOM) - strip BOM and decode strictly
         if raw_bytes.startswith(b"\xef\xbb\xbf"):
             try:
                 return raw_bytes[3:].decode("utf-8"), None
@@ -389,26 +410,65 @@ class WindowsEventCollector:
             except UnicodeDecodeError:
                 pass
 
-        # Try strict candidate encodings without destructive character replacement
-        candidate_encodings = getattr(self, "candidate_encodings", ("utf-8", "utf-16le", "cp1252", "mbcs"))
-        for enc in candidate_encodings:
+        # 3. Add standard fallback candidate encodings
+        configured_candidates = getattr(self, "candidate_encodings", ("utf-8", "utf-16le", "cp1252", "mbcs"))
+        for enc in configured_candidates:
+            if enc not in candidates:
+                candidates.append(enc)
+
+        # 4. Attempt strict decode and validate structural integrity
+        for enc in candidates:
             try:
                 decoded = raw_bytes.decode(enc)
-                return decoded, None
             except (UnicodeDecodeError, LookupError):
                 continue
 
-        # Forensic preservation: quarantine undecodable evidence without silent character replacement
-        ts = int(datetime.now(timezone.utc).timestamp())
-        quarantine_file = os.path.join(self.malformed_events_dir, f"undecodable_wevtutil_{ts}.bin")
+            # Reject encodings that produce corrupt null bytes (e.g. UTF-16 decoded as CP1252)
+            if "\x00" in decoded:
+                continue
+
+            # Structural validation: wevtutil output must be valid XML or empty
+            stripped = decoded.strip()
+            if stripped and not (stripped.startswith("<") or "<Event" in stripped):
+                continue
+
+            return decoded, None
+
+        # 5. Forensic preservation: check disk watermark then quarantine undecodable evidence atomically
+        import shutil
+        os.makedirs(self.malformed_events_dir, exist_ok=True)
+        watermark_mb = getattr(config, "outbox_disk_watermark_mb", 500)
         try:
-            with open(quarantine_file, "wb") as qf:
+            usage = shutil.disk_usage(self.malformed_events_dir)
+            free_mb = usage.free / (1024 * 1024)
+            if free_mb < watermark_mb:
+                self.logger.error(
+                    f"Undecodable quarantine write rejected on {self.log_name}: "
+                    f"free disk space ({free_mb:.1f}MB) is below watermark ({watermark_mb}MB)."
+                )
+                return None, "UNDECODABLE_RAW_BYTES"
+        except OSError as e:
+            self.logger.warning(f"Could not determine disk usage for quarantine: {e}")
+
+        token = hashlib.sha256(raw_bytes).hexdigest()[:16]
+        target_file = os.path.join(self.malformed_events_dir, f"undecodable_wevtutil_{token}.bin")
+        tmp_file = f"{target_file}.tmp.{os.getpid()}"
+        try:
+            with open(tmp_file, "wb") as qf:
                 qf.write(raw_bytes)
+                qf.flush()
+                os.fsync(qf.fileno())
+            os.replace(tmp_file, target_file)
             self.logger.error(
-                f"Quarantined {len(raw_bytes)} bytes of undecodable wevtutil output on '{self.log_name}' to {quarantine_file}"
+                f"Quarantined {len(raw_bytes)} bytes of undecodable wevtutil output on '{self.log_name}' to {target_file}"
             )
         except Exception as qe:
             self.logger.error(f"Failed to write undecodable quarantine file: {qe}")
+            if os.path.exists(tmp_file):
+                try:
+                    os.unlink(tmp_file)
+                except OSError:
+                    pass
 
         return None, "UNDECODABLE_RAW_BYTES"
 

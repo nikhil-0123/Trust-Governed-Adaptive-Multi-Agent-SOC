@@ -31,7 +31,11 @@ class Settings:
         self.app_name = os.getenv("APP_NAME", "TGAM-SOC Windows Telemetry")
         self.version = os.getenv("APP_VERSION", "0.1.0")
         self.environment = os.getenv("ENVIRONMENT", "development")
-        self.execution_mode = os.getenv("TGAM_EXECUTION_MODE", os.getenv("EXECUTION_MODE", "PRODUCTION")).strip().upper()
+        raw_mode = os.getenv("EXECUTION_MODE") or os.getenv("TGAM_EXECUTION_MODE") or "PRODUCTION"
+        self.execution_mode = raw_mode.strip().upper()
+        valid_modes = {"PRODUCTION", "SIMULATION", "TEST", "EVALUATION"}
+        if self.execution_mode not in valid_modes:
+            raise ValueError(f"Invalid execution mode '{self.execution_mode}'. Allowed modes: {sorted(valid_modes)}")
         self.log_level = os.getenv("LOG_LEVEL", "INFO")
 
         # Step 2: Collector Configuration
@@ -98,8 +102,12 @@ class Settings:
             raise ValueError(f"CHANNEL_RETRY_BACKOFF_MAX_SECONDS must be finite, between 1.0 and 300.0, and >= base ({val_backoff_base}), got {val_backoff_max}")
         self.channel_retry_backoff_max_seconds = val_backoff_max
 
-        # Default data directory to local user profile if not explicitly set
-        default_data_dir = os.path.join(os.path.expanduser("~"), ".tgam_soc", "telemetry")
+        # Default data directory to local user profile if not explicitly set (isolated per execution mode)
+        default_data_dir = os.path.join(
+            os.path.expanduser("~"),
+            ".tgam_soc",
+            "telemetry" if self.execution_mode == "PRODUCTION" else f"telemetry_{self.execution_mode.lower()}"
+        )
         self.data_dir = os.getenv("DATA_DIR", default_data_dir)
 
         # Internal backing attributes for dynamically resolved directory paths
