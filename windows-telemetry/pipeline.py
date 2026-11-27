@@ -337,7 +337,7 @@ class WindowsDetectionPipeline:
 
             try:
                 # 1. Normalize with authoritative channel epoch and log_name
-                event_epoch = raw_event.get("epoch") or current_epoch
+                event_epoch = raw_event["epoch"] if "epoch" in raw_event else current_epoch
                 normalized_event = self.normalizer.normalize(
                     raw_event, log_name=channel_log_name, epoch=event_epoch
                 )

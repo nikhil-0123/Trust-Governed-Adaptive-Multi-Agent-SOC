@@ -159,7 +159,23 @@ class TransitionMailbox:
                 json.dump(envelope, f, indent=2)
                 f.flush()
                 os.fsync(f.fileno())
-            os.replace(temp_file, target_file)
+            try:
+                os.link(temp_file, target_file)
+            except FileExistsError:
+                try:
+                    with open(target_file, "r", encoding="utf-8") as existing:
+                        existing_payload = json.load(existing)
+                    if existing_payload != envelope:
+                        dst = os.path.join(self.quarantined_dir, f"{transition_id}.json")
+                        os.replace(temp_file, dst)
+                        raise ValueError(f"Conflicting transition envelope already exists for {transition_id}")
+                except json.JSONDecodeError:
+                    dst = os.path.join(self.quarantined_dir, f"{transition_id}.json")
+                    os.replace(temp_file, dst)
+                    raise ValueError(f"Invalid existing transition envelope for {transition_id}")
+                os.remove(temp_file)
+            else:
+                os.remove(temp_file)
             self.logger.info(f"Published transition envelope {transition_id} to {target_file}")
             return transition_id
         except Exception as e:
@@ -304,10 +320,6 @@ class TransitionMailbox:
                 self.logger.debug(f"Acknowledged transition {transition_id}")
             except Exception as e:
                 self.logger.error(f"Failed to move acknowledged transition {transition_id}: {e}")
-                try:
-                    os.remove(src)
-                except OSError:
-                    pass
 
     def quarantine_transition(self, transition_id: str, reason: str = ""):
         """

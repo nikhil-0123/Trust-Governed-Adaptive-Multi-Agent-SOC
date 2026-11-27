@@ -103,7 +103,7 @@ class DetectionEventBuilder:
             "schema_version",
             "identity_type",
         ):
-            if id_field in norm_evidence and id_field not in evidence:
+            if id_field in norm_evidence:
                 evidence[id_field] = norm_evidence[id_field]
 
         if "username" in normalized_event and "username" not in evidence:

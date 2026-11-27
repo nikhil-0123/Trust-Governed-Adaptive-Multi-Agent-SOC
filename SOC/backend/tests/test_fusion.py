@@ -349,7 +349,6 @@ class TestFusionEngine(unittest.TestCase):
 
     def test_worker_processing(self):
         self._insert_event("e1", "2026-10-03T10:00:00Z", "host1", "LOW")
-
         worker = FusionWorker()
         worker.process_batch()
 

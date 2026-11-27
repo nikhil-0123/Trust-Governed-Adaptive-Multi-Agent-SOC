@@ -655,7 +655,7 @@ class CheckpointManager:
                 - "DUPLICATE": Position is equal and transition_id matches.
                 - "CONFLICT": Position is equal but transition_id differs (quarantine).
         """
-        agent = (source_agent_id or "AGT-WIN-01").strip()
+        agent = str(source_agent_id or "").strip()
         channel = str(source_channel).strip()
         if not agent or not channel:
             return "CONFLICT", f"Invalid source identity: agent='{agent}', channel='{channel}'"
