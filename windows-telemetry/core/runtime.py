@@ -12,7 +12,6 @@ from .health import HealthMonitor
 class TelemetryRuntime:
     def __init__(self, logger: Optional[logging.Logger] = None):
         self.start_time = time.time()
-        self._owns_logger = logger is None
         self.logger = logger or setup_logger(config.app_name, config.log_level, config.data_dir)
         self.identity: Optional[AgentIdentity] = None
         self.health: Optional[HealthMonitor] = None
@@ -44,9 +43,7 @@ class TelemetryRuntime:
         # Future shutdown hooks for collectors will go here
         self.logger.info("Shutdown complete.")
 
-        # Only close handlers owned by a logger created by this runtime.
-        if not self._owns_logger:
-            return
+        # Safely flush and close handlers attached to this runtime's logger
         for handler in list(self.logger.handlers):
             try:
                 handler.flush()
