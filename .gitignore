@@ -59,3 +59,12 @@ htmlcov/
 /tests/
 /ubuntu-telemetry/tests/
 *.xml
+
+# Offline ML Datasets & Model Artifacts
+/ml/data/
+/ml/artifacts/
+*.evtx
+*.parquet
+*.xgb
+*.model
+*.joblib

@@ -1,0 +1,329 @@
+{
+  "registry_version": "1.1.0",
+  "phase": "3B-P2",
+  "generated_utc": "2026-11-28T07:50:00Z",
+  "storage_layout": {
+    "external_research_root": "D:\\TGAM-SOC-Datasets",
+    "verified_drive_capacity_gb": {
+      "C": {"free_gb": 99.99, "total_gb": 334.71},
+      "D": {"free_gb": 39.25, "total_gb": 120.47},
+      "P": {"free_gb": 14.37, "total_gb": 19.53}
+    },
+    "policy": "Keep all multi-GB raw public corpora, extracted block slices, processed Zstd Parquet partitions, and future XGBoost artifacts outside tracked Git storage; never decompress full auth.txt.gz (73.41 GB uncompressed) onto D: or P:."
+  },
+  "datasets": [
+    {
+      "id": "lanl_cyber1",
+      "official_name": "Comprehensive, Multi-Source Cyber-Security Events (LANL Cyber1)",
+      "publisher": "Los Alamos National Laboratory (Alexander D. Kent)",
+      "release_version": "LA-UR-15-23810 (2015/2016 release)",
+      "doi": "10.17021/1179829",
+      "official_url": "https://csr.lanl.gov/data/cyber1/",
+      "mirror_source": {
+        "repo_id": "Taqui/lanl-cyber-datasets",
+        "repo_url": "https://huggingface.co/datasets/Taqui/lanl-cyber-datasets",
+        "pinned_revision_sha": "b0a7c62188277218cec435d492ebc3d9b3cadbef",
+        "commit_date_utc": "2026-11-27T06:08:36.000Z",
+        "notes": "auth.txt.gz matches LFS oid and passes full 58-day gzip EOF/CRC integrity (1,051,430,459 rows); note separate uncompressed lanl-2015/auth.txt entry on mirror is only 31,666,995,200 B (incomplete) vs 73,413,019,178 B uncompressed inside auth.txt.gz."
+      },
+      "license": "CC0 1.0 Public Domain Dedication",
+      "acquisition_status": "ACQUIRED_AND_QUALIFIED_SUBSET",
+      "acquisition_blocker": "Full 1.05B-row JSONL materialization exceeds local capacity (projected 1,468.66 GB JSONL / 14.04 GB Zstd Parquet / 25.9h Python pipeline); qualified via bounded 11,039,825-row chronological 3-block Zstd Parquet subset (170,719,210 B) on D:\\TGAM-SOC-Datasets\\lanl_cyber1\\processed\\.",
+      "file_inventory": [
+        {"name": "auth.txt.gz", "bytes": 7626505158, "uncompressed_bytes": 73413019178, "rows": 1051430459, "source": "Taqui/lanl-cyber-datasets@b0a7c62188277218cec435d492ebc3d9b3cadbef"},
+        {"name": "redteam.txt.gz", "bytes": 4846, "rows": 749, "source": "Official LANL website (exact SHA-256 match to HF LFS)"}
+      ],
+      "published_checksums": {
+        "official_lanl_portal": "Not published on https://csr.lanl.gov/data/cyber1/",
+        "hf_lfs_auth_txt_gz_sha256": "9c6b0cc261b0edd19324f6fd1839743224938a7f644ed202ca70bd70a89bf672",
+        "hf_lfs_redteam_txt_gz_sha256": "606635837c684ad11e464075ecf97bc5df325ff7d7f64614d2d8c8af18051669"
+      },
+      "local_verified_checksums": {
+        "auth.txt.gz_sha256": "9c6b0cc261b0edd19324f6fd1839743224938a7f644ed202ca70bd70a89bf672",
+        "auth_txt_uncompressed_stream_sha256": "2c74a10affa0dafa336b6a5b0eebd6f6d8748b3136d10302fff41e7061023480",
+        "redteam.txt.gz_sha256": "606635837c684ad11e464075ecf97bc5df325ff7d7f64614d2d8c8af18051669",
+        "train_day8_h211_214_v1.0.0.parquet": "be051227134e4b83187618fbfbe1d72d3b800912d344022dd82010f3771fe67c",
+        "val_day13_h323_327_v1.0.0.parquet": "5bf832b9b2ee609f8a126d05ea84e401ba7a99ebf39beae87371ff6bd0bbb45f",
+        "test_day29_h708_710_v1.0.0.parquet": "3ff7c87664929b12ebe4674691397cd815f1a38249316f97d600057aea0ae65f"
+      },
+      "telemetry_domain": "Enterprise deidentified authentication stream (verified 1,051,430,459 rows over 58 days t=1..5,011,199, 99,968 user strings, 17,666 computer strings, 1,038,590,151 Success / 12,840,308 Fail, 0 malformed rows, 0 out-of-order steps).",
+      "schema_compatibility": {
+        "native_contract": "auth_anomaly_features_v1",
+        "research_contract": "lanl_auth_features_v1",
+        "native_compatible": false,
+        "notes": "No Windows Event ID 4624/4625 column, no source IP address, relative 1-second integers (no wall-clock timezone). Compatible strictly through separate ml/lanl_benchmark/ (`lanl_auth_features_v1`)."
+      },
+      "label_provenance": "749 redteam annotations (715 unique keys, 34 duplicate lines). Full-corpus exact join matched 701/715 unique keys across 702 auth events (701 Success, 1 Fail, 100% NTLM Network LogOn via destination_user); 14 unique keys unmatched (same-second alternate dst host in auth); 1 one-to-many key collision (2552687 U9263@DOM1 C17693->C828 Fail+Success).",
+      "known_limitations": [
+        "Failed auth bias: fails recorded only for users with >=1 success in corpus; 701/702 (99.86%) matched positives are Success events.",
+        "4 source hosts total (C17693=701/749 annotations); chronological splits cannot avoid source-host overlap across Train/Val/Test.",
+        "Context shortcut risk: 100% of matched positives are NTLM Network LogOn.",
+        "Unmatched events mean unannotated enterprise background, not verified benign traffic.",
+        "lanl_rel_hour_mod24 is not true local wall clock and requires ablation.",
+        "Does not evaluate native Windows Event 4624/4625 or F1-F5 IP-keyed features."
+      ],
+      "intended_role": "Offline external public-benchmark research experiments (`lanl_auth_features_v1`) over qualified Parquet subset under D:\\TGAM-SOC-Datasets\\lanl_cyber1\\processed\\.",
+      "qualification_verdict": "PARTIAL_PASS_BENCHMARK_READY",
+      "qualification_rationale": "Full stream integrity, join semantics, O(1) causal extraction, and chunked 11,039,825-row Parquet partitions with >=4.5-day/15.8-day separations are verified and reproducible; approved strictly for bounded offline Phase 3C benchmark experiments with explicit source-host/context shortcut and hour-ablation controls, while native Windows deployment remains BLOCKED."
+    },
+    {
+      "id": "windows_apt_2025_v4",
+      "official_name": "Windows-APT 2025: A Dataset for APT-Inspired Attack Scenarios on Windows Systems",
+      "publisher": "Maryam Mozaffari, Abbas Yazdinejad, Ali Dehghantanha (University of Guelph / Mendeley Data)",
+      "release_version": "Version 4 (published 2026-07-03T15:06:54.054Z)",
+      "doi": "10.17632/b8fmtzvpy8.4",
+      "paper_doi": "10.1016/j.dib.2026.112569",
+      "official_url": "https://data.mendeley.com/datasets/b8fmtzvpy8/4",
+      "license": "CC BY 4.0",
+      "acquisition_status": "BLOCKED_BY_ENDPOINT_PROTECTION",
+      "acquisition_blocker": {
+        "file": "combined.csv",
+        "expected_bytes": 247934817,
+        "quarantined_at_bytes": 65732608,
+        "defender_event_id": 1117,
+        "defender_timestamp": "2026-11-27T16:37:38.6360000Z",
+        "defender_threat_name": "Trojan:VBS/Boxter.HAB!MTB",
+        "defender_threat_id": "2147938472",
+        "defender_action": "Quarantine",
+        "policy_status": "Real-Time Protection kept enabled; zero exclusions/restores permitted."
+      },
+      "file_inventory": [
+        {"name": "README.md", "bytes": 9214, "status": "LOCAL_VERIFIED"},
+        {"name": "checksums.sha256", "bytes": 1762, "status": "LOCAL_VERIFIED"},
+        {"name": "scenario_manifest.csv", "bytes": 28317, "status": "LOCAL_VERIFIED"},
+        {"name": "validation_summary.csv", "bytes": 7318, "status": "LOCAL_VERIFIED"},
+        {"name": "combined.csv", "bytes": 247934817, "status": "BLOCKED_BY_ENDPOINT_PROTECTION"},
+        {"name": "scenario_mapping_supplement/log_to_scenario_mapping.csv", "bytes": null, "status": "UNAVAILABLE_VIA_API_404"},
+        {"name": "16 period CSVs (via checksums.sha256 / Mendeley root 20 entries total 480,859,935 B)", "bytes": null, "status": "NOT_DOWNLOADED_POLICY_BLOCK"}
+      ],
+      "published_checksums": {
+        "checksums.sha256": "checksums.sha256 file fetched from Mendeley API",
+        "README.md": "02d192e575851bcf342a7abfb617b5bc219d8bb0f825e47a7ee4a0e97835822b",
+        "scenario_manifest.csv": "77b881e662b2b912fa466a2510fb65597342b3869d0113118f49558dbb1fa81f",
+        "validation_summary.csv": "61afe9da2c7ea32f6ab58a700163c0bbb23c0b8b70e5142580d4a3113d731781",
+        "combined.csv": "0f7eaa4027482c81cae56a5b759e7058e9e9df225ae060933c7015f6f16e8465",
+        "scenario_mapping_supplement/log_to_scenario_mapping.csv": "A2B7751838CA973992427835D7EAB4DEE269E14CD0D2FCFB4ECC5CCF7E637E98"
+      },
+      "local_verified_checksums": {
+        "checksums.sha256": "d9401239cc2c1b692edf480fb66dc561ac17be69e157e2789af13338be86aa17",
+        "README.md": "02d192e575851bcf342a7abfb617b5bc219d8bb0f825e47a7ee4a0e97835822b",
+        "scenario_manifest.csv": "77b881e662b2b912fa466a2510fb65597342b3869d0113118f49558dbb1fa81f",
+        "validation_summary.csv": "61afe9da2c7ea32f6ab58a700163c0bbb23c0b8b70e5142580d4a3113d731781"
+      },
+      "telemetry_domain": "Consolidated Wazuh 4.x SIEM alert export (`_source.agent.name`, `_source.rule.level`, Sysmon + Wazuh alerts) across 36 Caldera APT scenarios (`S01`-`S36`).",
+      "schema_compatibility": {
+        "native_contract": "auth_anomaly_features_v1",
+        "native_compatible": false,
+        "notes": "Inspected header confirms Elasticsearch/Wazuh alert-export CSV (`_index`, `_source.rule.*`, manager `Maryam`), not raw normalized Windows Security Event 4624/4625 logs."
+      },
+      "label_provenance": "Publisher v4 README confirms no deterministic per-event attack ground truth; v4 added soft IDF-weighted `log_to_scenario_mapping.csv` covering 102,011 rows where `UNIQUE-MATCH + NARROWED` represents only 6.2% of rows and alerts include Wazuh manager host `Maryam`.",
+      "known_limitations": [
+        "blocked plaintext CSV contains unescaped adversary script payloads triggering Defender (`Trojan:VBS/Boxter.HAB!MTB`).",
+        "No sanitized/feature-only non-payload export exposed via Mendeley v4 root API.",
+        "Only 6.2% narrow scenario attribution precision; alert-rule output creates rule-circularity risk.",
+        "Primary focus is post-compromise Caldera TTPs rather than raw Event 4624/4625 brute-force sequences."
+      ],
+      "intended_role": "Scenario-design documentation reference only (`scenario_manifest.csv`, `validation_summary.csv`, `README.md`).",
+      "qualification_verdict": "BLOCKED",
+      "qualification_rationale": "combined.csv is BLOCKED_BY_ENDPOINT_PROTECTION; even on unblocked metadata/documentation, missing balanced per-event labels (6.2% narrowed attribution) and Wazuh-alert format preclude training approval."
+    },
+    {
+      "id": "otrf_security_datasets",
+      "official_name": "OTRF Security-Datasets (Atomic Windows Captures)",
+      "publisher": "Open Threat Research Forge (Roberto Rodriguez @Cyb3rWard0g et al.)",
+      "release_version": "master commit d9d40ef123d2c87d5d3df28c96bcab4f0faccc87 (2023-09-20T14:42:56Z)",
+      "doi": null,
+      "official_url": "https://github.com/OTRF/Security-Datasets",
+      "license": "MIT License (Copyright (c) 2021 Open Threat Research Forge)",
+      "acquisition_status": "ACQUIRED_AND_AUDITED_PASSIVELY",
+      "file_inventory": [
+        {
+          "capture_id": "SDWIN-201022042947",
+          "title": "PurpleSharp Active Directory Playbook I",
+          "zip_file": "purplesharp_ad_playbook_I.zip",
+          "zip_bytes": 1362498,
+          "zip_sha256": "2a2d80e7b8d8ee6821a1754118f3ab908b4bac84cf4ed3d018e281f631bd2870",
+          "yaml_sha256": "a872ce818c81de308ae1e49a608efd0b76e2d8c669aee820bfdd69c4bf271685",
+          "audited_counts": {
+            "total_events": 25993,
+            "event_4624": 49,
+            "event_4625": 7,
+            "non_loopback_ip_count": 13,
+            "loopback_ip_count": 1,
+            "missing_ip_count": 42,
+            "dup_raw": 0,
+            "dup_channel_host_record_id": 0,
+            "span_utc": "2020-10-22T08:29:48.785Z .. 2020-10-22T08:30:42.832Z"
+          }
+        },
+        {
+          "capture_id": "SDWIN-190518211456",
+          "title": "Empire Invoke PSRemoting",
+          "zip_file": "empire_psremoting_stager.zip",
+          "zip_bytes": 409741,
+          "zip_sha256": "214355730c8cf903f4423c96aa7459fed7b74258e2a6766b794ba316e9d3a46e",
+          "yaml_sha256": "b0f5d29337692a42cde187667f8f5ab1d2ff06bf87c023757dbd192df0ca6f01",
+          "audited_counts": {
+            "total_events": 2744,
+            "event_4624": 8,
+            "event_4625": 0,
+            "non_loopback_ip_count": 3,
+            "loopback_ip_count": 2,
+            "missing_ip_count": 3,
+            "dup_raw": 0,
+            "dup_channel_host_record_id": 0,
+            "span_utc": "2020-09-20T21:08:28.399Z .. 2020-09-20T21:10:07.970Z"
+          }
+        },
+        {
+          "capture_id": "SDWIN-190319131123",
+          "title": "Empire Over-Pass-The-Hash",
+          "zip_file": "empire_over_pth_patch_lsass.zip",
+          "zip_bytes": 829257,
+          "zip_sha256": "daee42bbd9f7c6265e5614ce468ec868a399ee03877456dd01ec34e3e06479e7",
+          "yaml_sha256": "8a8e7950d4534ca250f29e4a89455bcdf523ccb3e1ff075d138d0bcd3e5b23ff",
+          "audited_counts": {
+            "total_events": 10271,
+            "event_4624": 8,
+            "event_4625": 0,
+            "non_loopback_ip_count": 4,
+            "loopback_ip_count": 4,
+            "missing_ip_count": 0,
+            "dup_raw": 0,
+            "dup_channel_host_record_id": 0,
+            "span_utc": "2020-09-22T02:13:37.997Z .. 2020-09-22T02:15:19.728Z"
+          }
+        }
+      ],
+      "published_checksums": "Not published by OTRF upstream",
+      "local_verified_checksums": {
+        "purplesharp_ad_playbook_I.zip": "2a2d80e7b8d8ee6821a1754118f3ab908b4bac84cf4ed3d018e281f631bd2870",
+        "empire_psremoting_stager.zip": "214355730c8cf903f4423c96aa7459fed7b74258e2a6766b794ba316e9d3a46e",
+        "empire_over_pth_patch_lsass.zip": "daee42bbd9f7c6265e5614ce468ec868a399ee03877456dd01ec34e3e06479e7"
+      },
+      "telemetry_domain": "Short (~54-102s) Mordor Winlogbeat/NXLog JSON captures from a 4-host Windows AD lab (MORDORDC, WORKSTATION5/6/7) containing Security (4624/4625/4672/4769/4776), Sysmon, PowerShell, and System events.",
+      "schema_compatibility": {
+        "native_contract": "auth_anomaly_features_v1",
+        "research_adapter": "otrf_mordor_audit_v1 (ml/public_datasets/otrf_adapter.py)",
+        "native_compatible": false,
+        "adapter_compatible": true,
+        "notes": "Uses flat JSON (`RecordNumber` instead of `EventRecordID`, lowercase `security` alongside `Security`, string `LogonType`, mixed short/FQDN `Hostname`). Parsed safely for schema/rule validation without fabricating missing values."
+      },
+      "label_provenance": "Only scenario YAML adversary console transcripts exist; every JSON record has tags=['mordorDataset'] and NO independent per-event benign/malicious label. Benign AD machine logons (e.g., MORDORDC$, WEC$) coexist with attack events.",
+      "known_limitations": [
+        "Too few auth samples (65 total 4624 and only 7 total 4625 across the 3 captures; <2 min windows prevent 5m/15m history warmup).",
+        "No independent per-event ground-truth labels.",
+        "Mixed Channel capitalization (`security` vs `Security`) and mixed hostnames."
+      ],
+      "intended_role": "Schema parsing, normalization fidelity, and deterministic rule/regression fixture validation only.",
+      "qualification_verdict": "APPROVED_FOR_SCHEMA_RULE_TESTING_ONLY",
+      "qualification_rationale": "Genuine Windows Security 4624/4625 + Sysmon JSON telemetry under clear MIT license, verified passive schema edge cases, but strictly insufficient duration/sample count and no per-event labels for ML training."
+    },
+    {
+      "id": "lanl_2017_unified",
+      "official_name": "Unified Host and Network Data Set (LANL 2017)",
+      "publisher": "Los Alamos National Laboratory (Melissa J. M. Turcotte, Alexander D. Kent, Curtis Hash)",
+      "release_version": "LA-UR-17-20763 (2017/2018 release)",
+      "doi": "10.1142/9781786345646_001",
+      "official_url": "https://csr.lanl.gov/data/2017/",
+      "license": "CC0 1.0 Public Domain Dedication",
+      "acquisition_status": "PENDING_MANUAL_OWNER_FORM_NOT_PRIORITIZED",
+      "acquisition_blocker": "Requires manual LANL #fence usage disclosure; LACKS red-team or attack ground-truth label files.",
+      "file_inventory": [
+        {"name": "netflow_day-02.bz2 .. netflow_day-90.bz2", "format": "CSV"},
+        {"name": "wls_day-01.bz2 .. wls_day-90.bz2", "format": "Daily JSON Windows host logs (EventID 4624/4625/4672/4688/4768/4769/4776 etc.)"}
+      ],
+      "published_checksums": "Not published on https://csr.lanl.gov/data/2017/",
+      "local_verified_checksums": {},
+      "telemetry_domain": "~90 days of anonymized enterprise NetFlow + Windows host JSON event logs.",
+      "schema_compatibility": {
+        "native_contract": "auth_anomaly_features_v1",
+        "native_compatible": false,
+        "notes": "Deidentified host/user strings (`User380010`, `Comp966305`), relative epoch `Time`, and documented sample 4624 JSON omits client `IpAddress`, blocking F4 unique-users-per-IP features."
+      },
+      "label_provenance": "No adversary or compromise ground-truth label file provided in official documentation.",
+      "known_limitations": [
+        "No supervised attack ground truth (unlike LANL Cyber1 redteam.txt.gz).",
+        "No client IP address in Event 4624 JSON sample (`wls_day-*.bz2`), blocking IP-based aggregation."
+      ],
+      "intended_role": "Future unsupervised/background distribution research only; excluded from supervised Phase 3C training.",
+      "qualification_verdict": "REJECTED",
+      "qualification_rationale": "Rejected for supervised Phase 3C authentication anomaly training due to absence of attack ground truth."
+    },
+    {
+      "id": "uwf_zeekdata24",
+      "official_name": "UWF-ZeekData24",
+      "publisher": "University of West Florida (Marshall Elam, Dustin Mink, Sikha S. Bagui, Russell Plenkers, Subhash C. Bagui)",
+      "release_version": "2025 MDPI Data 10(5):59",
+      "doi": "10.3390/data10050059",
+      "official_url": "https://datasets.uwf.edu/",
+      "license": "CC BY 4.0",
+      "acquisition_status": "NOT_ACQUIRED_DOMAIN_MISMATCH",
+      "acquisition_blocker": "Network Zeek connection telemetry only; zero Windows endpoint Security Event 4624/4625 coverage.",
+      "file_inventory": ["Zeek conn/network flow CSV and Parquet exports (documented via official paper/portal)"],
+      "published_checksums": "Not verified locally",
+      "local_verified_checksums": {},
+      "telemetry_domain": "Network-layer Zeek flow records annotated by MITRE ATT&CK tactic.",
+      "schema_compatibility": {
+        "native_contract": "auth_anomaly_features_v1",
+        "native_compatible": false,
+        "notes": "Zero endpoint host logon logs (`EventID 4624/4625`, `LogonType`, `TargetUserName`, `TargetDomainName`)."
+      },
+      "label_provenance": "MITRE ATT&CK tactic-labeled network flows per published MDPI *Data* paper.",
+      "known_limitations": [
+        "Complete domain mismatch with Windows endpoint host authentication anomaly detection."
+      ],
+      "intended_role": "Excluded for endpoint auth detection (potential future network-NIDS telemetry only).",
+      "qualification_verdict": "REJECTED",
+      "qualification_rationale": "Rejected for Phase 3C Windows host authentication modeling due to absence of host OS authentication events."
+    },
+    {
+      "id": "tgam_soc_native_lab",
+      "official_name": "TGAM-SOC Native Windows Deployment Pilot Dataset",
+      "publisher": "TGAM-SOC Project (Internal Lab Baseline Pilot)",
+      "release_version": "1.0.0",
+      "doi": null,
+      "official_url": "local: ml/data/pilot_read_only/processed/host_pilot_auth_baseline_v1.0.0.jsonl",
+      "license": "Internal project artifact (gitignored / non-redistributable telemetry metadata)",
+      "acquisition_status": "LOCAL_BASELINE_COLLECTED_INCOMPLETE_FOR_TRAINING",
+      "file_inventory": [
+        {
+          "name": "host_pilot_auth_baseline_v1.0.0.jsonl",
+          "sha256": "1f2e8afed870b77cedf1c8f69e70d77dc135bb08c674c948fe92866653ddb4ac",
+          "records": 1153
+        },
+        {
+          "name": "security_auth_host_baseline_01.jsonl",
+          "sha256": "506fe0fd1f91432a04c33e283b1daa2607a0aa34c89dd9c4739e86f0e30841e1",
+          "records": 1153
+        }
+      ],
+      "published_checksums": "Internal manifest SHA-256",
+      "local_verified_checksums": {
+        "host_pilot_auth_baseline_v1.0.0.jsonl": "1f2e8afed870b77cedf1c8f69e70d77dc135bb08c674c948fe92866653ddb4ac",
+        "security_auth_host_baseline_01.jsonl": "506fe0fd1f91432a04c33e283b1daa2607a0aa34c89dd9c4739e86f0e30841e1"
+      },
+      "telemetry_domain": "Genuine local Windows Security telemetry collected offline by frozen Phase 2 collection rules under `auth_anomaly_features_v1`.",
+      "schema_compatibility": {
+        "native_contract": "auth_anomaly_features_v1",
+        "native_compatible": true,
+        "notes": "100% schema-aligned, HMAC-SHA256 pseudonymized, strict causal `[t-W, t)` replay."
+      },
+      "label_provenance": "Explicit `LabelAssignment` manifests separating `genuine_windows` background baseline (`label=0`) from authorized lab scenario intervals (`label=1`). Currently contains only baseline `label=0` rows.",
+      "known_limitations": [
+        "Zero Event 4625 records (`4624=1153`, `4625=0`).",
+        "Zero valid non-loopback `IpAddress` observations -> `f1`-`f5` availability rates are `0.0` (only `f6`/`f7` = `1.0`).",
+        "Zero `label=1` attack rows and single workstation host."
+      ],
+      "intended_role": "Primary deployment-faithful training and evaluation dataset once authorized multi-host + remote-source benign/attack collection populates Event 4625 and non-loopback IP telemetry.",
+      "qualification_verdict": "CONDITIONAL",
+      "qualification_rationale": "Exact runtime feature contract `auth_anomaly_features_v1`, but training is blocked until authorized lab collection gathers failed remote auth (4625 + valid remote IPs) and independent time/host attack partitions."
+    }
+  ],
+  "category_verdicts": {
+    "lanl_public_authentication_benchmark": "PARTIAL_PASS",
+    "windows_apt_endpoint_research_corpus": "BLOCKED",
+    "otrf_authentication_and_endpoint_captures": "APPROVED_FOR_SCHEMA_RULE_TESTING_ONLY",
+    "native_windows_deployment_dataset": "BLOCKED"
+  }
+}

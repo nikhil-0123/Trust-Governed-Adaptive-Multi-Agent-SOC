@@ -1,0 +1,10 @@
+# TGAM-SOC Offline Machine Learning & Dataset Pipeline Dependencies (Phase 3A/3B)
+# Strictly isolated from frozen runtime windows-telemetry/requirements.txt.
+numpy==1.26.4
+pandas==2.2.3
+scikit-learn==1.8.0
+xgboost==3.1.3
+pyarrow==22.0.0
+scipy==1.16.2
+joblib==1.5.3
+pytest==8.2.0
